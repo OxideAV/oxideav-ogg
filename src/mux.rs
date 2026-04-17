@@ -158,14 +158,45 @@ impl Muxer for OggMuxer {
             return Err(Error::other("Ogg muxer: write_header called twice"));
         }
         self.header_written = true;
-        // Reconstruct codec setup packets from each stream's extradata and
-        // emit them. Each is written via the normal write_packet path so the
-        // header_packet bookkeeping (one packet per page, granule = 0, BOS
-        // flag for the first) kicks in automatically.
+        // RFC 3533 §6: every logical bitstream's BOS page must precede any
+        // non-BOS page. We emit BOS pages directly here (bypassing the
+        // per-stream pending-bytes mechanism used for EOS) so BOS pages for
+        // all streams land at the very front of the output.
         let stream_clone = self.streams.clone();
+        let mut header_queues: Vec<(u32, oxideav_core::TimeBase, Vec<Vec<u8>>)> =
+            Vec::with_capacity(stream_clone.len());
         for s in &stream_clone {
-            for hp in extract_codec_headers(&s.params.codec_id, &s.params.extradata) {
-                let pkt = Packet::new(s.index, s.time_base, hp);
+            let packets = extract_codec_headers(&s.params.codec_id, &s.params.extradata);
+            header_queues.push((s.index, s.time_base, packets));
+        }
+        // Pass 1: BOS page per stream, written immediately.
+        for (idx, _tb, packets) in &header_queues {
+            let Some(first) = packets.first() else {
+                continue;
+            };
+            let writer = self.writer_for(*idx)?;
+            if writer.headers_remaining == 0 {
+                continue;
+            }
+            let lacing = lace(first.len());
+            let page = Page {
+                flags: flags::FIRST_PAGE,
+                granule_position: 0,
+                serial: writer.serial,
+                seq_no: writer.seq_no,
+                lacing,
+                data: first.clone(),
+            };
+            writer.seq_no = writer.seq_no.wrapping_add(1);
+            writer.bos_emitted = true;
+            writer.headers_remaining -= 1;
+            let bytes = page.to_bytes();
+            self.output.write_all(&bytes)?;
+        }
+        // Pass 2: remaining header packets — normal write_packet flow.
+        for (idx, tb, packets) in &header_queues {
+            for hp in packets.iter().skip(1) {
+                let pkt = Packet::new(*idx, *tb, hp.clone());
                 self.write_packet(&pkt)?;
             }
         }
