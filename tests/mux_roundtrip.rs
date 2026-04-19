@@ -150,7 +150,8 @@ fn mux_then_demux_vorbis_restores_metadata() {
 
     // Re-open via the demuxer and check round-trip.
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut demux = oxideav_ogg::demux::open(reader).expect("demux muxed output");
+    let mut demux = oxideav_ogg::demux::open(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux muxed output");
     let streams = demux.streams();
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].params.codec_id.as_str(), "vorbis");
@@ -248,7 +249,8 @@ fn mux_multi_stream_bos_pages_come_first() {
 
     // Demux and check both streams reappear with the right codec IDs.
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let demux = oxideav_ogg::demux::open(reader).expect("demux multi-stream");
+    let demux = oxideav_ogg::demux::open(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux multi-stream");
     let streams = demux.streams();
     assert_eq!(streams.len(), 2);
     let codecs: Vec<&str> = streams.iter().map(|s| s.params.codec_id.as_str()).collect();

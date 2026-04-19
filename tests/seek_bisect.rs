@@ -111,7 +111,8 @@ fn build_synthetic_ogg() -> Vec<u8> {
 fn seek_to_bisects_to_page_with_granule_le_target() {
     let blob = build_synthetic_ogg();
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(blob.clone()));
-    let mut demux = oxideav_ogg::demux::open(reader).expect("open synthetic ogg");
+    let mut demux = oxideav_ogg::demux::open(reader, &oxideav_core::NullCodecResolver)
+        .expect("open synthetic ogg");
     let streams = demux.streams();
     assert_eq!(streams.len(), 1, "synthetic file has one stream");
     assert_eq!(streams[0].params.codec_id.as_str(), "vorbis");
@@ -160,7 +161,7 @@ fn seek_to_bisects_to_page_with_granule_le_target() {
 fn seek_to_granule_at_midpoint_is_close_to_target() {
     let blob = build_synthetic_ogg();
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(blob));
-    let mut demux = oxideav_ogg::demux::open(reader).unwrap();
+    let mut demux = oxideav_ogg::demux::open(reader, &oxideav_core::NullCodecResolver).unwrap();
 
     // Data pages have granules 960, 1920, ... 19200 (step 960). A target
     // between two pages should land on the lower one; the delta must be
@@ -178,7 +179,7 @@ fn seek_to_granule_at_midpoint_is_close_to_target() {
 fn seek_to_unknown_stream_is_out_of_range() {
     let blob = build_synthetic_ogg();
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(blob));
-    let mut demux = oxideav_ogg::demux::open(reader).unwrap();
+    let mut demux = oxideav_ogg::demux::open(reader, &oxideav_core::NullCodecResolver).unwrap();
 
     let err = demux.seek_to(99, 0).unwrap_err();
     match err {

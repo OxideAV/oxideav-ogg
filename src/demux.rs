@@ -5,14 +5,14 @@ use std::io::Read;
 
 use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, Result, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, StreamInfo, TimeBase,
 };
 
 use crate::codec_id;
 use crate::page::{self, Page};
 
 /// Open an Ogg bitstream.
-pub fn open(input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+pub fn open(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     let mut state = OggDemuxer::new(input);
     state.read_bos_section()?;
     state.read_until_headers_collected()?;
