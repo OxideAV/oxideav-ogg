@@ -4,8 +4,8 @@
 
 use std::io::Cursor;
 
-use oxideav_container::{ReadSeek, WriteSeek};
 use oxideav_core::{CodecId, CodecParameters, Packet, StreamInfo, TimeBase};
+use oxideav_core::{ReadSeek, WriteSeek};
 
 /// Minimal valid Vorbis identification packet (30 bytes).
 fn vorbis_id_packet(channels: u8, sample_rate: u32) -> Vec<u8> {
@@ -113,7 +113,7 @@ impl std::io::Seek for SharedBuf {
 /// Helper that muxes a fresh stream and returns the complete byte blob.
 fn mux_to_bytes<F>(streams: Vec<StreamInfo>, feed: F) -> Vec<u8>
 where
-    F: FnOnce(&mut dyn oxideav_container::Muxer),
+    F: FnOnce(&mut dyn oxideav_core::Muxer),
 {
     let shared = SharedBuf::default();
     let writer: Box<dyn WriteSeek> = Box::new(shared.clone());

@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use oxideav_container::{Muxer, WriteSeek};
 use oxideav_core::{CodecId, Error, Packet, Result, StreamInfo};
+use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
 use crate::page::{self, flags, lace, Page};

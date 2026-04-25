@@ -12,7 +12,7 @@ pub mod demux;
 pub mod mux;
 pub mod page;
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 
 /// Register the Ogg demuxer/muxer with a [`ContainerRegistry`].
 pub fn register(reg: &mut ContainerRegistry) {
@@ -26,7 +26,7 @@ pub fn register(reg: &mut ContainerRegistry) {
 }
 
 /// `OggS` capture pattern (RFC 3533 §6) at offset 0.
-fn probe(p: &oxideav_container::ProbeData) -> u8 {
+fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() >= 4 && &p.buf[0..4] == b"OggS" {
         100
     } else {

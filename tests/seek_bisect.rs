@@ -7,7 +7,7 @@
 
 use std::io::Cursor;
 
-use oxideav_container::ReadSeek;
+use oxideav_core::ReadSeek;
 use oxideav_ogg::page::{self, flags, lace, Page};
 
 /// Minimal valid Vorbis identification packet (30 bytes).

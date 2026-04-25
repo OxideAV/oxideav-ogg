@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, StreamInfo, TimeBase,
 };
+use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_id;
 use crate::page::{self, Page};
