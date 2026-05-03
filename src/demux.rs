@@ -437,8 +437,17 @@ impl OggDemuxer {
     }
 
     fn process_page(&mut self, page: Page) -> Result<()> {
+        // RFC 3533 §4 + Vorbis I §A.2: chained Ogg streams concatenate
+        // independent logical bitstreams back-to-back, each with its own
+        // BOS page. A BOS-flagged page for an unknown serial therefore
+        // signals a NEW logical stream beginning mid-file — register it
+        // before processing the page's packets so its identification
+        // header is captured as a header packet, not delivered as data.
+        if page.is_first() && !self.state_by_serial.contains_key(&page.serial) {
+            self.register_stream(&page)?;
+        }
         let Some(stream) = self.state_by_serial.get_mut(&page.serial) else {
-            // Unknown serial — skip silently.
+            // Unknown serial that isn't a BOS — skip silently.
             return Ok(());
         };
         let public_index = stream.public_index;
@@ -466,10 +475,14 @@ impl OggDemuxer {
         }
 
         let last_idx = completed.len().checked_sub(1);
+        let mut headers_just_completed = false;
         for (i, data) in completed.into_iter().enumerate() {
             if stream.headers_remaining > 0 {
                 stream.header_packets.push(data);
                 stream.headers_remaining -= 1;
+                if stream.headers_remaining == 0 {
+                    headers_just_completed = true;
+                }
                 continue;
             }
             let is_last = Some(i) == last_idx;
@@ -495,7 +508,67 @@ impl OggDemuxer {
         if page.granule_position >= 0 {
             stream.granule_seen = page.granule_position;
         }
+
+        // For chained streams whose headers complete after the initial
+        // open() phase, rebuild extradata + metadata now so downstream
+        // codec decoders see the same payload they would for a non-chained
+        // stream. (`populate_extradata`/`populate_metadata` only run once
+        // at open time and would otherwise leave the new stream with just
+        // its identification packet in `extradata`.)
+        if headers_just_completed {
+            self.populate_extradata_for(public_index);
+            self.populate_metadata_for(public_index);
+        }
         Ok(())
+    }
+
+    /// Rebuild `params.extradata` for a single stream from its accumulated
+    /// header packets. Used both during initial open and when a chained
+    /// stream's headers complete mid-file.
+    fn populate_extradata_for(&mut self, public_index: usize) {
+        let codec_id = self.streams[public_index].params.codec_id.clone();
+        let header_packets: Vec<Vec<u8>> = match self
+            .state_by_serial
+            .values()
+            .find(|s| s.public_index == public_index)
+        {
+            Some(s) => s.header_packets.clone(),
+            None => return,
+        };
+        let extra = build_codec_private(&codec_id, &header_packets);
+        if !extra.is_empty() {
+            self.streams[public_index].params.extradata = extra;
+        }
+    }
+
+    /// Pull Vorbis-comment metadata out of the second header packet for the
+    /// given stream and append it to the demuxer's metadata list.
+    fn populate_metadata_for(&mut self, public_index: usize) {
+        let codec_id = self.streams[public_index].params.codec_id.clone();
+        let second_packet: Option<Vec<u8>> = self
+            .state_by_serial
+            .values()
+            .find(|s| s.public_index == public_index)
+            .and_then(|s| s.header_packets.get(1).cloned());
+        let Some(p) = second_packet else { return };
+        match codec_id.as_str() {
+            "vorbis" => {
+                if p.len() > 7 && &p[1..7] == b"vorbis" {
+                    parse_vorbis_comment(&p[7..], &mut self.metadata);
+                }
+            }
+            "opus" => {
+                if p.len() > 8 && &p[..8] == b"OpusTags" {
+                    parse_vorbis_comment(&p[8..], &mut self.metadata);
+                }
+            }
+            "theora" => {
+                if p.len() > 7 && &p[1..7] == b"theora" {
+                    parse_vorbis_comment(&p[7..], &mut self.metadata);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
