@@ -175,10 +175,8 @@ fn chained_streams_register_both_links() {
 
     // Both markers must have appeared — i.e. data from BOTH links was
     // returned, not just the first one.
-    let markers: std::collections::HashSet<u8> = by_serial
-        .values()
-        .map(|pkts| pkts[0].data[0])
-        .collect();
+    let markers: std::collections::HashSet<u8> =
+        by_serial.values().map(|pkts| pkts[0].data[0]).collect();
     assert!(
         markers.contains(&0xAA) && markers.contains(&0xBB),
         "both link payloads (0xAA + 0xBB) must be delivered"
