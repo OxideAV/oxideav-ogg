@@ -552,20 +552,14 @@ impl OggDemuxer {
             .and_then(|s| s.header_packets.get(1).cloned());
         let Some(p) = second_packet else { return };
         match codec_id.as_str() {
-            "vorbis" => {
-                if p.len() > 7 && &p[1..7] == b"vorbis" {
-                    parse_vorbis_comment(&p[7..], &mut self.metadata);
-                }
+            "vorbis" if p.len() > 7 && &p[1..7] == b"vorbis" => {
+                parse_vorbis_comment(&p[7..], &mut self.metadata);
             }
-            "opus" => {
-                if p.len() > 8 && &p[..8] == b"OpusTags" {
-                    parse_vorbis_comment(&p[8..], &mut self.metadata);
-                }
+            "opus" if p.len() > 8 && &p[..8] == b"OpusTags" => {
+                parse_vorbis_comment(&p[8..], &mut self.metadata);
             }
-            "theora" => {
-                if p.len() > 7 && &p[1..7] == b"theora" {
-                    parse_vorbis_comment(&p[7..], &mut self.metadata);
-                }
+            "theora" if p.len() > 7 && &p[1..7] == b"theora" => {
+                parse_vorbis_comment(&p[7..], &mut self.metadata);
             }
             _ => {}
         }

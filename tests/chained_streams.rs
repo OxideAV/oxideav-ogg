@@ -61,8 +61,8 @@ fn build_page(flags_byte: u8, granule: i64, serial: u32, seq: u32, packet: &[u8]
     page.to_bytes()
 }
 
-/// Build one logical Vorbis-in-Ogg link: BOS + comment + setup + N data pages
-/// + an EOS-flagged final page. `data_pages` data pages each carry one
+/// Build one logical Vorbis-in-Ogg link: BOS + comment + setup + N data pages,
+/// plus an EOS-flagged final page. `data_pages` data pages each carry one
 /// `payload`-sized packet; granule increments by 960 per page.
 fn build_link(serial: u32, payload_byte: u8, data_pages: usize) -> Vec<u8> {
     let mut out = Vec::new();
@@ -162,7 +162,7 @@ fn chained_streams_register_both_links() {
 
     // Sanity-check payloads: each link's data packets begin with its
     // marker byte (0xAA or 0xBB).
-    for (_idx, packets) in &by_serial {
+    for packets in by_serial.values() {
         let marker = packets[0].data[0];
         assert!(
             marker == 0xAA || marker == 0xBB,
