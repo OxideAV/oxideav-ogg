@@ -15,7 +15,7 @@ pub mod page;
 use oxideav_core::ContainerRegistry;
 
 /// Register the Ogg demuxer/muxer with a [`ContainerRegistry`].
-pub fn register(reg: &mut ContainerRegistry) {
+pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_demuxer("ogg", demux::open);
     reg.register_muxer("ogg", mux::open);
     reg.register_extension("ogg", "ogg");
@@ -25,11 +25,33 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_probe("ogg", probe);
 }
 
+/// Install the Ogg container into a [`oxideav_core::RuntimeContext`].
+///
+/// Convenience wrapper around [`register_containers`] that matches the
+/// uniform `register(&mut RuntimeContext)` entry point every sibling
+/// crate exposes.
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_containers(&mut ctx.containers);
+}
+
 /// `OggS` capture pattern (RFC 3533 §6) at offset 0.
 fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() >= 4 && &p.buf[0..4] == b"OggS" {
         100
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_container() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        assert_eq!(ctx.containers.container_for_extension("ogg"), Some("ogg"));
+        assert_eq!(ctx.containers.container_for_extension("opus"), Some("ogg"));
     }
 }
