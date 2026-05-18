@@ -22,6 +22,37 @@ pub fn open(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     Ok(Box::new(state))
 }
 
+/// Open an Ogg bitstream and pre-build the page-level seek index by
+/// scanning every page header in the file once. The index makes
+/// subsequent [`Demuxer::seek_to`] calls O(log n) lookup + a single seek
+/// instead of a log-n bisection that re-reads the file each time. Pages
+/// with granule `-1` (no packet boundary) are skipped per RFC 3533 §6.
+///
+/// Returns the same boxed [`Demuxer`] as [`open`]; the index lives
+/// inside the concrete type and accelerates seek_to transparently.
+pub fn open_indexed(
+    input: Box<dyn ReadSeek>,
+    codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    let mut state = open_concrete(input, codecs)?;
+    state.build_seek_index()?;
+    Ok(Box::new(state))
+}
+
+/// Open an Ogg bitstream and return the concrete [`OggDemuxer`] type
+/// (rather than a boxed trait object). Useful for callers that want to
+/// invoke [`OggDemuxer::build_seek_index`] / [`OggDemuxer::seek_index_len`]
+/// on demand without going through trait downcasts.
+pub fn open_concrete(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<OggDemuxer> {
+    let mut state = OggDemuxer::new(input);
+    state.read_bos_section()?;
+    state.read_until_headers_collected()?;
+    state.populate_extradata();
+    state.populate_metadata();
+    state.populate_duration();
+    Ok(state)
+}
+
 struct LogicalStream {
     /// Index into the public `streams` vec.
     public_index: usize,
@@ -37,7 +68,11 @@ struct LogicalStream {
     granule_seen: i64,
 }
 
-struct OggDemuxer {
+/// Concrete Ogg demuxer state. Most callers should use the boxed
+/// [`Demuxer`] returned by [`open`] / [`open_indexed`]; this type is
+/// public so consumers who want the inherent [`build_seek_index`] /
+/// [`seek_index_len`] API can hold it directly.
+pub struct OggDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     state_by_serial: HashMap<u32, LogicalStream>,
@@ -49,6 +84,16 @@ struct OggDemuxer {
     eof_reached: bool,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
+    /// Per-serial sorted page-level seek index. Each value is a list of
+    /// `(granule, page_offset)` ordered by `granule`. Pages with granule
+    /// `-1` (no packet terminates on the page) are NOT indexed because
+    /// they carry no usable seek timestamp. Built lazily as pages flow
+    /// through the demuxer, and may be densely pre-populated by
+    /// [`OggDemuxer::build_seek_index`].
+    seek_index: HashMap<u32, Vec<(i64, u64)>>,
+    /// True once `build_seek_index` has run successfully, so we don't
+    /// repeat the full-file scan on later calls.
+    seek_index_built: bool,
 }
 
 impl OggDemuxer {
@@ -62,7 +107,159 @@ impl OggDemuxer {
             eof_reached: false,
             metadata: Vec::new(),
             duration_micros: 0,
+            seek_index: HashMap::new(),
+            seek_index_built: false,
         }
+    }
+
+    /// Record a page's `(granule, byte_offset)` into the per-serial seek
+    /// index, keeping each serial's list sorted by granule. Pages whose
+    /// granule is `-1` (RFC 3533 §6: "no packets finish on this page")
+    /// carry no seek-target information and are skipped. Duplicate
+    /// inserts (same offset already present at the same granule) are
+    /// suppressed so re-scans are idempotent.
+    fn index_record(&mut self, serial: u32, granule: i64, offset: u64) {
+        if granule < 0 {
+            return;
+        }
+        let entries = self.seek_index.entry(serial).or_default();
+        match entries.binary_search_by(|(g, o)| g.cmp(&granule).then_with(|| o.cmp(&offset))) {
+            Ok(_) => {} // already present
+            Err(pos) => entries.insert(pos, (granule, offset)),
+        }
+    }
+
+    /// Look up the seek index for the largest entry on `serial` whose
+    /// granule is `<= target`. Returns `(granule, page_offset)` if any
+    /// such entry exists.
+    fn index_floor(&self, serial: u32, target: i64) -> Option<(i64, u64)> {
+        let entries = self.seek_index.get(&serial)?;
+        if entries.is_empty() {
+            return None;
+        }
+        // Find the rightmost entry with granule <= target.
+        let idx = match entries.binary_search_by(|(g, _)| g.cmp(&target)) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        Some(entries[idx])
+    }
+
+    /// Walk every page header in the file once, recording
+    /// `(serial, granule, page_offset)` into the seek index. Only the
+    /// 27-byte page header + N-byte segment table are read; payload is
+    /// skipped over with a single relative seek per page, so cost is
+    /// O(pages) seeks, not O(bytes).
+    ///
+    /// After this returns, [`seek_to`] becomes O(log n) lookup + one
+    /// seek for any covered timestamp on any logical stream. Pages
+    /// whose granule is `-1` (no packet boundary, RFC 3533 §6) are
+    /// skipped because they carry no seek-target information.
+    ///
+    /// On error the index is left partially populated — subsequent
+    /// `seek_to` calls remain correct (they fall back to bisection for
+    /// uncovered targets); only the speedup is incomplete.
+    pub fn build_seek_index(&mut self) -> Result<()> {
+        use std::io::SeekFrom;
+
+        let saved_pos = self.input.stream_position()?;
+        let end = self.input.seek(SeekFrom::End(0))?;
+        if end == 0 {
+            self.input.seek(SeekFrom::Start(saved_pos))?;
+            self.seek_index_built = true;
+            return Ok(());
+        }
+
+        // Scan from byte 0 — every Ogg page starts with `OggS`.
+        let mut cursor: u64 = 0;
+        // Re-use a chunk buffer to find `OggS` captures cheaply.
+        const CHUNK: u64 = 64 * 1024;
+        while cursor < end {
+            self.input.seek(SeekFrom::Start(cursor))?;
+            let want = CHUNK.min(end - cursor) as usize;
+            let mut buf = vec![0u8; want];
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                match self.input.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            buf.truncate(filled);
+            if buf.is_empty() {
+                break;
+            }
+
+            // Find the first OggS capture in the chunk.
+            let mut i = 0usize;
+            let mut advanced = false;
+            while i + 4 <= buf.len() {
+                if &buf[i..i + 4] != b"OggS" {
+                    i += 1;
+                    continue;
+                }
+                let page_off = cursor + i as u64;
+
+                // Re-seek to the candidate, read header + segment table.
+                self.input.seek(SeekFrom::Start(page_off))?;
+                let mut hdr = [0u8; 27];
+                if self.input.read(&mut hdr)? != 27 {
+                    // Truncated tail — we're done.
+                    self.input.seek(SeekFrom::Start(saved_pos))?;
+                    self.seek_index_built = true;
+                    return Ok(());
+                }
+                if hdr[0..4] != page::CAPTURE_PATTERN {
+                    // False positive inside some payload byte stream
+                    // (rare, but possible). Skip past this byte and
+                    // keep scanning.
+                    i += 1;
+                    continue;
+                }
+                let granule = i64::from_le_bytes([
+                    hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13],
+                ]);
+                let serial = u32::from_le_bytes([hdr[14], hdr[15], hdr[16], hdr[17]]);
+                let n_segs = hdr[26] as usize;
+                let mut lacing = vec![0u8; n_segs];
+                if self.input.read(&mut lacing)? != n_segs {
+                    self.input.seek(SeekFrom::Start(saved_pos))?;
+                    self.seek_index_built = true;
+                    return Ok(());
+                }
+                let data_len: u64 = lacing.iter().map(|&v| v as u64).sum();
+                self.index_record(serial, granule, page_off);
+
+                // Jump cursor past the entire page body and resume
+                // chunked OggS-hunting from there.
+                cursor = page_off + 27 + n_segs as u64 + data_len;
+                advanced = true;
+                break;
+            }
+            if !advanced {
+                // No OggS found in this chunk — advance past it (minus
+                // a 3-byte tail to catch captures straddling the
+                // boundary).
+                if buf.len() < 4 {
+                    break;
+                }
+                cursor += buf.len() as u64 - 3;
+            }
+        }
+
+        self.input.seek(SeekFrom::Start(saved_pos))?;
+        self.seek_index_built = true;
+        Ok(())
+    }
+
+    /// Total number of indexed pages across all logical streams. Useful
+    /// for tests and external profiling. Excludes pages whose granule
+    /// position is `-1`.
+    pub fn seek_index_len(&self) -> usize {
+        self.seek_index.values().map(|v| v.len()).sum()
     }
 
     /// Read pages until we leave the Beginning-Of-Stream section, registering
@@ -144,6 +341,7 @@ impl OggDemuxer {
         // Read a page header (27 bytes), then enough to read the segment table
         // and data. We detect EOF by getting 0 bytes back from the very first
         // read; partial-page data is treated as truncation.
+        let page_off = self.input.stream_position().unwrap_or(0);
         let mut hdr = [0u8; 27];
         if !read_exact_or_eof(&mut self.input, &mut hdr)? {
             return Ok(None);
@@ -165,6 +363,11 @@ impl OggDemuxer {
         full.extend_from_slice(&data);
         let (page, consumed) = Page::parse(&full)?;
         debug_assert_eq!(consumed, full.len());
+        // Opportunistically populate the seek index from any page we read
+        // during normal demux flow — costs O(log n) per page and means a
+        // subsequent seek can skip bisection if the target falls inside
+        // the already-scanned range.
+        self.index_record(page.serial, page.granule_position, page_off);
         Ok(Some(page))
     }
 
@@ -383,8 +586,14 @@ impl OggDemuxer {
                 let n_segs = hdr[26] as usize;
 
                 if serial == wanted_serial && granule >= 0 {
+                    self.index_record(serial, granule, page_off);
                     return Ok(Some((page_off, granule)));
                 }
+
+                // Even when the page isn't a match, record its
+                // `(granule, page_off)` in the index — it costs nothing
+                // and accelerates future seeks that DO target that serial.
+                self.index_record(serial, granule, page_off);
 
                 // Not our stream (or an "indeterminate" granule = -1).
                 // Skip past this page's body to find the next one.
@@ -630,6 +839,34 @@ impl Demuxer for OggDemuxer {
         };
         if file_size == 0 {
             return Err(Error::unsupported("Ogg: empty input"));
+        }
+
+        // Fast path: if the seek index already has a `(granule, offset)`
+        // entry with granule <= target_granule, jump to it directly.
+        // The remaining linear-tail scan below still runs to tighten the
+        // landing point against any indexed entries that were inserted
+        // between the floor and the target — that scan reuses the index
+        // too because `find_next_page_for_serial` records as it goes.
+        if let Some((g, off)) = self.index_floor(wanted_serial, target_granule) {
+            self.input.seek(SeekFrom::Start(off))?;
+            self.page_queue.clear();
+            self.out_queue.clear();
+            for state in self.state_by_serial.values_mut() {
+                state.pending.clear();
+                state.granule_seen = 0;
+            }
+            self.eof_reached = false;
+            // If `build_seek_index` ran, the index is dense and we know
+            // there's no better page between `off` and the target —
+            // return immediately. Otherwise (sparse index from incidental
+            // scans), fall through to the bisection below to tighten.
+            if self.seek_index_built {
+                return Ok(g);
+            }
+            // Sparse case: seed the bisection so it can only improve the
+            // landing point, never regress past `off`.
+            // (Handled by falling through; the bisection's `landed`
+            // tracker takes max() of each successful candidate.)
         }
 
         // Bisection state.

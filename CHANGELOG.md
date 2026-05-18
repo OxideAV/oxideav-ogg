@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Page-level seek index: `OggDemuxer::build_seek_index` walks every Ogg
+  page header in the file once (header + segment table only, payloads
+  skipped via relative seek) and records `(serial, granule, page_offset)`
+  triples into a per-serial sorted vector. Pages with granule `-1`
+  (RFC 3533 §6 "no packets finish on this page") are excluded as they
+  carry no seek-target information.
+- `oxideav_ogg::demux::open_indexed`: convenience constructor that calls
+  `open` and then `build_seek_index` before handing back the boxed
+  `Demuxer`. Subsequent `seek_to` calls jump straight to the floor entry
+  for the target granule, skipping bisection entirely.
+- `oxideav_ogg::demux::open_concrete`: returns the concrete `OggDemuxer`
+  type (rather than `Box<dyn Demuxer>`) so callers that want to invoke
+  `build_seek_index` / `seek_index_len` on demand don't need a downcast.
+- Incidental index population: every page read by `read_page` and every
+  page header skipped by `find_next_page_for_serial` is now recorded in
+  the index, so even files opened with the plain `open()` accumulate an
+  index as packets are drained. A subsequent `seek_to` on a previously-
+  visited target lands in O(log n) without a re-bisection.
+
+
 ## [0.1.3](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.2...v0.1.3) - 2026-05-06
 
 ### Other
