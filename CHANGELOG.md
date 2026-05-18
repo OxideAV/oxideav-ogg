@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.3...v0.1.4) - 2026-05-18
+
+### Other
+
+- page-level seek index (RFC 3533) — O(log n) seek_to via cached (granule, offset)
+
 ### Added
 
 - Page-level seek index: `OggDemuxer::build_seek_index` walks every Ogg
