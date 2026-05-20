@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the index, so even files opened with the plain `open()` accumulate an
   index as packets are drained. A subsequent `seek_to` on a previously-
   visited target lands in O(log n) without a re-bisection.
+- Chained-link-aware duration: `build_seek_index` now registers
+  mid-file BOS pages it encounters (RFC 3533 §4 chained logical
+  bitstreams) by parsing each link's identification packet on the fly,
+  then recomputes `duration_micros` as the SUM of per-link durations
+  for chained files. Single-link multiplexed files keep their previous
+  MAX-over-streams behaviour. A new `link_index` field on every
+  registered stream tracks which chained link it belongs to (the
+  initial BOS section is link 0; each subsequent BOS-after-non-BOS
+  increments the counter).
 
 
 ## [0.1.3](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.2...v0.1.3) - 2026-05-06

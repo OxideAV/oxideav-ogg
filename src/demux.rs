@@ -66,6 +66,12 @@ struct LogicalStream {
     /// extradata on the stream's `CodecParameters` once they're all in.
     header_packets: Vec<Vec<u8>>,
     granule_seen: i64,
+    /// Chained-link index this stream belongs to. RFC 3533 §4: chained Ogg
+    /// is the concatenation of independent logical bitstreams; the first
+    /// link is index 0, each subsequent BOS-after-non-BOS group increments
+    /// the counter. Streams sharing a link play concurrently (multiplex);
+    /// streams in different links play sequentially.
+    link_index: u32,
 }
 
 /// Concrete Ogg demuxer state. Most callers should use the boxed
@@ -94,6 +100,15 @@ pub struct OggDemuxer {
     /// True once `build_seek_index` has run successfully, so we don't
     /// repeat the full-file scan on later calls.
     seek_index_built: bool,
+    /// Next chained-link index to assign on the next BOS-after-non-BOS.
+    /// Initialised to 0; the very first BOS section all shares link 0,
+    /// and the counter increments on each subsequent BOS that follows
+    /// at least one non-BOS page (the RFC 3533 §4 "link boundary").
+    next_link_index: u32,
+    /// True once we've seen any non-BOS page in the current link. Resets
+    /// to false when a new link begins (so its multiplexed BOS pages all
+    /// share the same link index).
+    seen_nonbos_in_current_link: bool,
 }
 
 impl OggDemuxer {
@@ -109,6 +124,8 @@ impl OggDemuxer {
             duration_micros: 0,
             seek_index: HashMap::new(),
             seek_index_built: false,
+            next_link_index: 0,
+            seen_nonbos_in_current_link: false,
         }
     }
 
@@ -219,6 +236,7 @@ impl OggDemuxer {
                     i += 1;
                     continue;
                 }
+                let flags_byte = hdr[5];
                 let granule = i64::from_le_bytes([
                     hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13],
                 ]);
@@ -232,6 +250,47 @@ impl OggDemuxer {
                 }
                 let data_len: u64 = lacing.iter().map(|&v| v as u64).sum();
                 self.index_record(serial, granule, page_off);
+
+                // Chained-link discovery (RFC 3533 §4): a BOS page for an
+                // unfamiliar serial encountered during the scan is the
+                // start of a new logical bitstream. If we've already seen
+                // any non-BOS page since the most recent link change, the
+                // new BOS opens a new chained link; otherwise it joins
+                // the current link's multiplex. Pre-registering the
+                // stream here means a post-scan duration calculation can
+                // attribute that link's last granule to a known time
+                // base, even before any packet flows through the demuxer.
+                let is_bos = flags_byte & page::flags::FIRST_PAGE != 0;
+                if is_bos && !self.state_by_serial.contains_key(&serial) {
+                    // Read the page payload so we can parse the first
+                    // packet for codec_id + sample_rate. Identification
+                    // packets must fit in a single page per the various
+                    // codec mapping RFCs, so we only need this page's
+                    // data, not any continuation.
+                    let mut data = vec![0u8; data_len as usize];
+                    if self.input.read(&mut data)? != data_len as usize {
+                        self.input.seek(SeekFrom::Start(saved_pos))?;
+                        self.seek_index_built = true;
+                        return Ok(());
+                    }
+                    let synth = Page {
+                        flags: flags_byte,
+                        granule_position: granule,
+                        serial,
+                        seq_no: u32::from_le_bytes([hdr[18], hdr[19], hdr[20], hdr[21]]),
+                        lacing: lacing.clone(),
+                        data,
+                    };
+                    if self.seen_nonbos_in_current_link {
+                        self.next_link_index = self.next_link_index.saturating_add(1);
+                        self.seen_nonbos_in_current_link = false;
+                    }
+                    // Best-effort: ignore registration failure (a malformed
+                    // BOS shouldn't abort the seek-index build).
+                    let _ = self.register_stream(&synth);
+                } else if !is_bos {
+                    self.seen_nonbos_in_current_link = true;
+                }
 
                 // Jump cursor past the entire page body and resume
                 // chunked OggS-hunting from there.
@@ -252,7 +311,50 @@ impl OggDemuxer {
 
         self.input.seek(SeekFrom::Start(saved_pos))?;
         self.seek_index_built = true;
+        // Now that every link's BOS has been registered and every page's
+        // granule is indexed, recompute total duration as the sum of
+        // per-link max granule (chained playback is sequential) rather
+        // than the max-over-streams (which only works for a single
+        // multiplexed link).
+        self.populate_duration_from_index();
         Ok(())
+    }
+
+    /// Recompute `duration_micros` from the (fully populated) seek index.
+    /// For chained Ogg files (multiple links), playback is sequential —
+    /// total duration is the SUM of each link's duration, where each
+    /// link's duration is the max-over-its-streams of last-granule
+    /// translated through that stream's time_base. For non-chained
+    /// (single-link) files, the result reduces to max-over-streams,
+    /// matching `populate_duration`'s near-tail scan.
+    fn populate_duration_from_index(&mut self) {
+        // Group serials by link_index.
+        let mut by_link: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (serial, state) in &self.state_by_serial {
+            by_link.entry(state.link_index).or_default().push(*serial);
+        }
+        let mut total_micros: i64 = 0;
+        for serials in by_link.values() {
+            let mut link_micros: i64 = 0;
+            for serial in serials {
+                let Some(entries) = self.seek_index.get(serial) else {
+                    continue;
+                };
+                let last_granule = entries.last().map(|(g, _)| *g).unwrap_or(0);
+                let Some(state) = self.state_by_serial.get(serial) else {
+                    continue;
+                };
+                let stream = &self.streams[state.public_index];
+                let us = (stream.time_base.seconds_of(last_granule) * 1_000_000.0) as i64;
+                if us > link_micros {
+                    link_micros = us;
+                }
+            }
+            total_micros = total_micros.saturating_add(link_micros);
+        }
+        if total_micros > 0 {
+            self.duration_micros = total_micros;
+        }
     }
 
     /// Total number of indexed pages across all logical streams. Useful
@@ -332,6 +434,7 @@ impl OggDemuxer {
                 headers_remaining: codec_id::header_packet_count(&codec_id),
                 header_packets: Vec::new(),
                 granule_seen: 0,
+                link_index: self.next_link_index,
             },
         );
         Ok(())
@@ -652,8 +755,21 @@ impl OggDemuxer {
         // signals a NEW logical stream beginning mid-file — register it
         // before processing the page's packets so its identification
         // header is captured as a header packet, not delivered as data.
+        //
+        // For chained-link tracking: a BOS page that arrives AFTER any
+        // non-BOS page in the current link starts a new link. BOS pages
+        // arriving while `seen_nonbos_in_current_link` is still false
+        // are part of the same link's BOS section (multiplex within one
+        // link). Either way, the registered stream inherits the link
+        // index that was current at the moment of its BOS.
         if page.is_first() && !self.state_by_serial.contains_key(&page.serial) {
+            if self.seen_nonbos_in_current_link {
+                self.next_link_index = self.next_link_index.saturating_add(1);
+                self.seen_nonbos_in_current_link = false;
+            }
             self.register_stream(&page)?;
+        } else if !page.is_first() {
+            self.seen_nonbos_in_current_link = true;
         }
         let Some(stream) = self.state_by_serial.get_mut(&page.serial) else {
             // Unknown serial that isn't a BOS — skip silently.

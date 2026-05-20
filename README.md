@@ -152,6 +152,25 @@ packet) are parsed during `open` and surfaced via
 `vendor` entry. Duration is estimated from the last page's granule
 position translated to microseconds.
 
+### Chained streams (RFC 3533 §4)
+
+A *chained* Ogg file is the back-to-back concatenation of independent
+logical bitstreams: each link starts with its own BOS page(s) and ends
+with an EOS-flagged page. The demuxer registers every mid-file BOS as
+a new logical stream (so packets from subsequent links aren't silently
+dropped) and assigns each link a sequential `link_index` (the initial
+BOS section is link 0; each subsequent BOS-after-non-BOS increments
+the counter).
+
+When `build_seek_index` runs, it parses each chained link's
+identification packet on the fly to learn the link's codec + sample
+rate, then recomputes total `duration_micros` as the **sum** of
+per-link durations. Multiplexed (single-link) files keep their
+previous max-over-streams duration semantics. So a chained file
+containing two 60 s Vorbis songs reports 120 s, while a multiplexed
+file with a 60 s Vorbis audio track + 60 s Theora video track still
+reports 60 s.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
