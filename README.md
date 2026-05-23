@@ -171,6 +171,27 @@ containing two 60 s Vorbis songs reports 120 s, while a multiplexed
 file with a 60 s Vorbis audio track + 60 s Theora video track still
 reports 60 s.
 
+### Page-loss detection (RFC 3533 §6)
+
+Every Ogg page header carries a `page_sequence_number` that "is
+increasing on each logical bitstream separately" so "the decoder can
+identify page loss" (RFC 3533 §6 field 6). The demuxer tracks each
+logical stream's expected next sequence number and detects a *hole*
+whenever a consumed page's sequence number is not exactly
+`previous + 1` (the counter is a wrapping `u32`; BOS pages legitimately
+restart it). A single discontinuity counts as one hole however many
+pages went missing.
+
+A hole is not papered over: if a packet was mid-reassembly across page
+boundaries, its buffered partial bytes are discarded, and the orphaned
+continuation fragment on the page after the gap (a packet tail whose
+head was lost) is dropped rather than spliced into a corrupt packet.
+Packets that are fully present after the hole are still delivered, so
+every packet the demuxer hands downstream stays individually
+well-formed. `OggDemuxer::hole_count()` exposes the running tally (0 for
+a clean file) for diagnostics; the count reflects pages consumed via
+`next_packet`, not the header-only `build_seek_index` scan.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

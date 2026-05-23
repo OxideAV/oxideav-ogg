@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Page-loss (hole) detection via the `page_sequence_number` field
+  (RFC 3533 §6 field 6: the per-stream sequence number increases by one
+  per page "so the decoder can identify page loss"). The demuxer tracks
+  each logical stream's expected next sequence number; a consumed page
+  whose `seq_no` is not exactly `last_seq + 1` (with wrapping) signals
+  one or more dropped pages. Each gap counts as one hole regardless of
+  how many pages went missing.
+- Spanning-packet integrity across holes: when a packet was being
+  reassembled across pages and a hole occurs, the buffered partial
+  bytes are discarded and any orphaned continuation fragment on the
+  next page (a packet tail whose head was lost) is dropped rather than
+  spliced into a corrupt packet. Packets fully present after the hole
+  are still delivered intact.
+- `OggDemuxer::hole_count`: returns the number of page-loss holes
+  detected so far across all logical streams (0 for a clean file).
+
 - Page-level seek index: `OggDemuxer::build_seek_index` walks every Ogg
   page header in the file once (header + segment table only, payloads
   skipped via relative seek) and records `(serial, granule, page_offset)`

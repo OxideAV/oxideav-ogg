@@ -72,6 +72,19 @@ struct LogicalStream {
     /// the counter. Streams sharing a link play concurrently (multiplex);
     /// streams in different links play sequentially.
     link_index: u32,
+    /// `page_sequence_number` of the last page consumed for this stream, or
+    /// `None` before the first page. RFC 3533 §6 field 6: this counter
+    /// "is increasing on each logical bitstream separately" and exists "so
+    /// the decoder can identify page loss." A consumed page whose `seq_no`
+    /// is not exactly `last_seq + 1` signals one or more dropped pages — a
+    /// "hole" — which the demuxer must not paper over by silently splicing
+    /// the broken packet halves together.
+    last_seq: Option<u32>,
+    /// True when the packet currently buffered in `pending` was left
+    /// unterminated by a page that ended with a 255-lacing segment AND that
+    /// page was not itself a continuation orphaned by a hole. Cleared once
+    /// the packet completes or a hole invalidates the partial bytes.
+    pending_valid: bool,
 }
 
 /// Concrete Ogg demuxer state. Most callers should use the boxed
@@ -109,6 +122,12 @@ pub struct OggDemuxer {
     /// to false when a new link begins (so its multiplexed BOS pages all
     /// share the same link index).
     seen_nonbos_in_current_link: bool,
+    /// Number of page-loss "holes" detected during demux. RFC 3533 §6
+    /// field 6: a logical stream's `page_sequence_number` increases by one
+    /// per page; a jump signals dropped pages. Each gap (regardless of how
+    /// many pages went missing) counts as one hole. Surfaced via
+    /// [`OggDemuxer::hole_count`] for diagnostics and tests.
+    holes: u64,
 }
 
 impl OggDemuxer {
@@ -126,6 +145,7 @@ impl OggDemuxer {
             seek_index_built: false,
             next_link_index: 0,
             seen_nonbos_in_current_link: false,
+            holes: 0,
         }
     }
 
@@ -364,6 +384,23 @@ impl OggDemuxer {
         self.seek_index.values().map(|v| v.len()).sum()
     }
 
+    /// Number of page-loss "holes" the demuxer has detected so far across
+    /// all logical streams (RFC 3533 §6 field 6: a stream's
+    /// `page_sequence_number` increments by one per page, so a jump in the
+    /// counter signals dropped pages). Each gap counts once regardless of
+    /// how many consecutive pages went missing. The count only reflects
+    /// pages actually consumed via `next_packet` (or absorbed during the
+    /// header phase) — `build_seek_index`'s header-only scan does not run
+    /// packet reassembly and therefore does not contribute.
+    ///
+    /// Zero for a clean file. A non-zero value tells a caller the byte
+    /// stream was truncated or corrupted between pages; any packet that
+    /// spanned a hole was dropped rather than spliced from mismatched
+    /// halves, so the surviving packets stay individually well-formed.
+    pub fn hole_count(&self) -> u64 {
+        self.holes
+    }
+
     /// Read pages until we leave the Beginning-Of-Stream section, registering
     /// every logical bitstream we discover. The pages we read are queued so
     /// `next_packet` can drain them in order.
@@ -435,6 +472,8 @@ impl OggDemuxer {
                 header_packets: Vec::new(),
                 granule_seen: 0,
                 link_index: self.next_link_index,
+                last_seq: None,
+                pending_valid: false,
             },
         );
         Ok(())
@@ -781,23 +820,79 @@ impl OggDemuxer {
         let segs = page.packet_segments();
         let was_continued = page.is_continued();
 
+        // RFC 3533 §6 field 6: page_sequence_number "is increasing on each
+        // logical bitstream separately" so "the decoder can identify page
+        // loss." A non-BOS page whose seq_no isn't exactly last_seq+1 means
+        // one or more pages were dropped between them — a "hole". The
+        // counter is a wrapping u32, so the only legal successor of `prev`
+        // is `prev.wrapping_add(1)`. A BOS page legitimately restarts the
+        // counter (typically at 0) and is never treated as a hole.
+        let hole = !page.is_first()
+            && match stream.last_seq {
+                Some(prev) => page.seq_no != prev.wrapping_add(1),
+                None => false,
+            };
+        if hole {
+            self.holes += 1;
+            // Any packet bytes buffered from before the gap can never be
+            // completed: the page(s) that carried the rest are gone. Drop
+            // them so we don't splice unrelated halves into one packet.
+            stream.pending.clear();
+            stream.pending_valid = false;
+        }
+
         // Collect every packet that terminates on this page; the page's
         // granule_position applies to the last such packet (per RFC 3533).
-        let mut completed: Vec<Vec<u8>> = Vec::new();
+        // `pending_valid` tracks whether the bytes accumulating in `pending`
+        // form the contiguous tail of a real packet (vs. an orphaned
+        // continuation fragment whose head was lost to a hole).
+        let mut completed: Vec<(Vec<u8>, bool)> = Vec::new();
         for (i, seg) in segs.iter().enumerate() {
             let payload = &page.data[seg.data.clone()];
             if i == 0 && was_continued {
-                stream.pending.extend_from_slice(payload);
-            } else {
-                if !stream.pending.is_empty() {
-                    stream.pending.clear(); // defensive
+                // Leading segment continues a packet from the previous page.
+                // Only append if we actually hold that packet's valid head;
+                // otherwise this fragment is the unrecoverable tail of a
+                // packet orphaned by a page-loss hole and must be discarded.
+                if stream.pending_valid {
+                    stream.pending.extend_from_slice(payload);
+                } else {
+                    // Orphaned continuation: ensure the buffer is empty and
+                    // leave it invalid so the fragment is dropped, not
+                    // emitted, when it terminates.
+                    stream.pending.clear();
                 }
+            } else {
+                // A fresh packet starts here. Any leftover bytes in
+                // `pending` at this point would be a partial packet the
+                // previous page left unterminated AND that this page does
+                // not continue (continuation bit unset, or this is not the
+                // first segment) — that's a framing inconsistency, so drop
+                // them defensively.
+                stream.pending.clear();
                 stream.pending.extend_from_slice(payload);
+                stream.pending_valid = true;
             }
             if seg.terminated {
-                completed.push(std::mem::take(&mut stream.pending));
+                let valid = stream.pending_valid;
+                completed.push((std::mem::take(&mut stream.pending), valid));
+                // The next packet (if any) on this page starts fresh.
+                stream.pending_valid = false;
             }
         }
+        // Invariant after the loop: if `pending` is non-empty it holds the
+        // unterminated tail of a packet that began on this page (or extended
+        // a valid one), so `pending_valid` is already true — the next page's
+        // leading continuation segment may safely append to it. An orphaned
+        // continuation fragment was cleared above, leaving `pending` empty
+        // and `pending_valid` false, so its missing-head tail is never
+        // mistaken for a resumable packet.
+        // Drop completed packets that were assembled from orphaned
+        // continuation fragments (head lost to a hole) — they're garbage.
+        let completed: Vec<Vec<u8>> = completed
+            .into_iter()
+            .filter_map(|(data, valid)| if valid { Some(data) } else { None })
+            .collect();
 
         let last_idx = completed.len().checked_sub(1);
         let mut headers_just_completed = false;
@@ -833,6 +928,9 @@ impl OggDemuxer {
         if page.granule_position >= 0 {
             stream.granule_seen = page.granule_position;
         }
+        // Record this page's sequence number so the next page on this stream
+        // can be checked for continuity (RFC 3533 §6 field 6 page loss).
+        stream.last_seq = Some(page.seq_no);
 
         // For chained streams whose headers complete after the initial
         // open() phase, rebuild extradata + metadata now so downstream
