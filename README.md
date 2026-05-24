@@ -277,6 +277,32 @@ already uses internally for its mandatory CRC check; the standalone
 helpers are convenient for stream-scanner tools that walk pages but
 do not need the segment table decoded into packets.
 
+### Fuzzing
+
+A cargo-fuzz harness under `fuzz/` (panic-freedom only, no oracle —
+the clean-room wall bars libogg / Xiph / ffmpeg as cross-decoders)
+hammers three surfaces with attacker bytes:
+
+- `page_parse` — `Page::parse` at every byte offset, plus the
+  standalone `crc::validate_page_crc` / `read_page_checksum` /
+  `compute_page_checksum` helpers and the `page::lace` segment-table
+  builder. Every `Ok` parse is checked against its serializer for
+  inverse-pair byte equality.
+- `demux_recapture` — `demux::open` + `Demuxer::next_packet` end to
+  end, exercising RFC 3533 §3 / §6 field 1 capture-pattern resync,
+  §6 field 3 continued-flag framing-consistency, and §6 field 6
+  page-loss detection. The `hole_count` / `framing_error_count` /
+  `resync_count` accessors are queried after the drain.
+- `granule_walk` — `demux::open_concrete` + `build_seek_index` +
+  `seek_to` at fuzz-derived granule values across every reported
+  stream, covering both the dense index lookup and the bisection
+  fallback's byte scanner.
+
+Run from `fuzz/` with `cargo +nightly fuzz run <target>`; no target
+runs as part of the per-PR CI shim (the org reusable workflow does
+not invoke `cargo fuzz`), so the harness is a long-running offline
+hardening tool rather than a gate.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

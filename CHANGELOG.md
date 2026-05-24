@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `fuzz/` cargo-fuzz crate with three libFuzzer harnesses that hammer the Ogg
+  framing surface end-to-end on attacker bytes: `page_parse` re-runs
+  `Page::parse` at every byte offset (plus the standalone `crc::*` helpers and
+  the `page::lace` segment-table builder, with a parse↔serialize inverse-pair
+  invariant on every `Ok` parse); `demux_recapture` drives `demux::open` and
+  `Demuxer::next_packet` through RFC 3533 §3 / §6 field 1 capture-pattern
+  recovery, §6 field 3 continued-flag framing-consistency, and §6 field 6
+  page-loss detection, then queries the `hole_count` / `framing_error_count` /
+  `resync_count` accessors; `granule_walk` opens via `open_concrete`, runs
+  `build_seek_index`, and probes `seek_to` at fuzz-derived granule values
+  across every reported stream. Standard `[workspace] members = ["."]` /
+  `cargo-fuzz = true` shape; `fuzz/Cargo.lock` is gitignored; no `oxideav-ogg`
+  surface added or changed, harness-only.
 - Public page-level CRC-32 validation helpers in `crc`: `validate_page_crc`,
   `compute_page_checksum`, `read_page_checksum`, and the `CRC_FIELD_OFFSET` /
   `CRC_FIELD_LEN` constants. The new API lets external tools verify page

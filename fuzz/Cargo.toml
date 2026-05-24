@@ -1,0 +1,77 @@
+[package]
+name = "oxideav-ogg-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# `oxideav-ogg` is the RFC 3533 page-framing + packet-reassembly +
+# multi-stream demuxer / muxer. Its public surface — `Page::parse`,
+# `demux::open` / `open_concrete` / `open_indexed`, the per-stream
+# `Demuxer::next_packet` drain, and granule-position `seek_to` — has
+# to be panic-free on arbitrary attacker bytes: a fuzz crash is a
+# fix, never an `#[ignore]`. This fuzz crate hammers all four entry
+# points without consulting any external library (clean-room: spec +
+# our own source only — no libogg, no Xiph reference, no ffmpeg).
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-ogg]
+path = ".."
+
+[lib]
+name = "oxideav_ogg_fuzz"
+path = "src/lib.rs"
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Target 1: page-layer parser. `Page::parse` MUST return a `Result`
+# for any byte sequence — never panic, never overflow, never index
+# out of bounds. The harness calls `parse` at every byte offset so
+# every possible (header, segment table, body) framing alignment is
+# exercised against attacker bytes.
+[[bin]]
+name = "page_parse"
+path = "fuzz_targets/page_parse.rs"
+test = false
+doc = false
+
+# Target 2: full demuxer + recapture. Drive arbitrary bytes through
+# `demux::open` and pull packets via `Demuxer::next_packet` until
+# EOF or error. This exercises the BOS-section walk, codec sniffing,
+# Xiph metadata parsing, page-loss detection, framing-flag
+# consistency check, and the RFC 3533 §3 / §6 field 1 resync /
+# capture-pattern recovery — all on attacker bytes. The counters
+# (`hole_count`, `framing_error_count`, `resync_count`) are queried
+# afterwards to exercise their accessors too.
+[[bin]]
+name = "demux_recapture"
+path = "fuzz_targets/demux_recapture.rs"
+test = false
+doc = false
+
+# Target 3: granule walk + bisection seek. Open the bytes via
+# `open_concrete`, build the dense seek index, then drive `seek_to`
+# across every stream at granule values derived from the input. The
+# index build path scans every page header in the file and the
+# bisection path falls back to byte-level scanning, so both granule
+# accounting and the byte-level scanner are fuzzed.
+[[bin]]
+name = "granule_walk"
+path = "fuzz_targets/granule_walk.rs"
+test = false
+doc = false
