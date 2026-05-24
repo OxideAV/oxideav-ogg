@@ -25,6 +25,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `OggDemuxer::hole_count`: returns the number of page-loss holes
   detected so far across all logical streams (0 for a clean file).
 
+- Continued-flag framing-consistency checking (RFC 3533 §6 field 3,
+  header_type bit 0x01: "set: page contains data of a packet continued
+  from the previous page; unset: page contains a fresh packet"). The
+  demuxer now cross-checks the `continued` bit against its own packet
+  reassembly state on every consumed page and flags a framing error when
+  the two disagree, independent of any `page_sequence_number` gap:
+  a page that sets the bit while no partial packet is buffered (orphaned
+  continuation tail), or a page that clears the bit while a partial packet
+  is still pending (the previous page promised a continuation, this page
+  abandons it). In both cases the affected fragment is dropped rather than
+  spliced, so every delivered packet stays individually well-formed. This
+  catches corruption *within* a sequence-consistent page run (e.g. a
+  damaged final segment that flipped a lacing terminator) that the
+  page-loss counter cannot see.
+- `OggDemuxer::framing_error_count`: returns the number of continued-flag
+  framing inconsistencies detected so far (0 for a clean file). A
+  discontinuity already attributed to a page-loss hole in the same page is
+  not double-counted here, so `hole_count` and `framing_error_count` are
+  disjoint tallies.
+
 - Page-level seek index: `OggDemuxer::build_seek_index` walks every Ogg
   page header in the file once (header + segment table only, payloads
   skipped via relative seek) and records `(serial, granule, page_offset)`

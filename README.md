@@ -192,6 +192,30 @@ well-formed. `OggDemuxer::hole_count()` exposes the running tally (0 for
 a clean file) for diagnostics; the count reflects pages consumed via
 `next_packet`, not the header-only `build_seek_index` scan.
 
+### Continued-flag framing consistency (RFC 3533 §6 field 3)
+
+The `header_type` byte's bit `0x01` is the `continued` flag: "set: page
+contains data of a packet continued from the previous page; unset: page
+contains a fresh packet." It is a normative declaration about reassembly,
+so the demuxer cross-checks it against its own pending-packet state on
+every page and treats a disagreement as a framing error — *independent*
+of any `page_sequence_number` gap. Two cases are caught:
+
+- the bit is **set** but no partial packet is buffered (the head either
+  never arrived or already terminated) — the leading segment is an
+  orphaned continuation tail and is dropped, not spliced;
+- the bit is **unset** but a partial packet *is* buffered (the previous
+  page ended on a 255-lacing segment, promising a continuation) — this
+  page abandons the partial by declaring a fresh packet, so the orphaned
+  head is dropped.
+
+This surfaces corruption *within* an otherwise sequence-consistent page
+run (e.g. a damaged final segment that flipped a lacing terminator) that
+the page-loss counter cannot see. `OggDemuxer::framing_error_count()`
+exposes the tally (0 for a clean file); it is disjoint from
+`hole_count()` — a discontinuity already charged to a page-loss hole on
+the same page is not double-counted as a framing error.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

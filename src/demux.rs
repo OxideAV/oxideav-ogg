@@ -128,6 +128,25 @@ pub struct OggDemuxer {
     /// many pages went missing) counts as one hole. Surfaced via
     /// [`OggDemuxer::hole_count`] for diagnostics and tests.
     holes: u64,
+    /// Number of `continued`-flag (RFC 3533 §6 field 3, header_type bit
+    /// 0x01) framing inconsistencies detected during demux. The bit is a
+    /// normative declaration about packet reassembly: "set: page contains
+    /// data of a packet continued from the previous page; unset: page
+    /// contains a fresh packet." A page whose bit disagrees with the
+    /// demuxer's own reassembly state is a framing error independent of any
+    /// `page_sequence_number` gap:
+    ///   * bit SET but no valid partial packet is buffered — the leading
+    ///     segment is an orphaned continuation tail whose head never arrived
+    ///     (or arrived but already terminated); it is dropped, not spliced.
+    ///   * bit UNSET but a partial packet IS buffered — the previous page
+    ///     promised a continuation (it ended on a 255-lacing segment) yet
+    ///     this page abandons it by declaring a fresh packet; the orphaned
+    ///     partial head is dropped.
+    ///
+    /// Discontinuities that the hole counter already accounted for in the
+    /// same page are NOT double-counted here. Surfaced via
+    /// [`OggDemuxer::framing_error_count`].
+    framing_errors: u64,
 }
 
 impl OggDemuxer {
@@ -146,6 +165,7 @@ impl OggDemuxer {
             next_link_index: 0,
             seen_nonbos_in_current_link: false,
             holes: 0,
+            framing_errors: 0,
         }
     }
 
@@ -399,6 +419,30 @@ impl OggDemuxer {
     /// halves, so the surviving packets stay individually well-formed.
     pub fn hole_count(&self) -> u64 {
         self.holes
+    }
+
+    /// Number of `continued`-flag framing inconsistencies the demuxer has
+    /// detected so far (RFC 3533 §6 field 3, header_type bit 0x01). The bit
+    /// declares whether a page's first segment continues a packet from the
+    /// previous page ("set") or begins a fresh packet ("unset"). A page
+    /// whose bit contradicts the demuxer's reassembly state — a continuation
+    /// claimed with no partial packet to resume, or a fresh-packet page that
+    /// silently abandons a partial the previous page promised to continue —
+    /// is a framing error. The offending fragment is dropped rather than
+    /// spliced, so every delivered packet stays individually well-formed.
+    ///
+    /// This is independent of [`hole_count`](Self::hole_count): a
+    /// `page_sequence_number` gap that already cleared the pending buffer in
+    /// the same page is attributed to the hole, not double-counted here. A
+    /// non-zero value with a zero hole count signals corruption *within* an
+    /// otherwise sequence-consistent page run (e.g. a damaged final segment
+    /// that flipped a lacing terminator).
+    ///
+    /// Zero for a clean file. Like `hole_count`, the tally reflects only
+    /// pages consumed via `next_packet` (or absorbed during the header
+    /// phase); the header-only `build_seek_index` scan does not contribute.
+    pub fn framing_error_count(&self) -> u64 {
+        self.framing_errors
     }
 
     /// Read pages until we leave the Beginning-Of-Stream section, registering
@@ -839,6 +883,40 @@ impl OggDemuxer {
             // them so we don't splice unrelated halves into one packet.
             stream.pending.clear();
             stream.pending_valid = false;
+        }
+
+        // RFC 3533 §6 field 3 (header_type bit 0x01): the `continued` bit is
+        // a normative declaration about reassembly — "set: page contains data
+        // of a packet continued from the previous page; unset: page contains
+        // a fresh packet." Cross-check it against our own pending state to
+        // catch framing inconsistencies the `page_sequence_number` counter
+        // can't see (e.g. a corrupted final segment that flipped a lacing
+        // terminator within an otherwise sequence-consistent run). We skip
+        // this check entirely when a hole was just detected on this page:
+        // the hole already cleared `pending` and is the more specific
+        // explanation, so the mismatch must not be double-counted.
+        //
+        // A BOS page is exempt — it always starts a stream's first packet,
+        // never continues one, and its `continued` bit is conventionally
+        // unset. (A continued+BOS page would be self-contradictory, but the
+        // BOS path registers the stream and treats its first packet as a
+        // header regardless, so there is no partial to mis-splice.)
+        if !hole && !page.is_first() {
+            let have_pending = !stream.pending.is_empty() && stream.pending_valid;
+            if was_continued && !have_pending {
+                // Page claims to continue a packet we are not holding. Its
+                // leading segment is an orphaned continuation tail (the head
+                // either never arrived or already terminated). The
+                // reassembly loop below discards it via `pending_valid`;
+                // record the inconsistency here so it is visible.
+                self.framing_errors += 1;
+            } else if !was_continued && have_pending {
+                // Previous page ended on a 255-lacing segment (promising a
+                // continuation) but this page declares a fresh packet,
+                // abandoning the partial. The reassembly loop's fresh-packet
+                // branch drops the orphaned head defensively; count it.
+                self.framing_errors += 1;
+            }
         }
 
         // Collect every packet that terminates on this page; the page's
