@@ -253,6 +253,30 @@ page-sequence number); garbage that sits *between* page boundaries
 ticks only the resync counter because no `page_sequence_number` was
 lost.
 
+### Standalone page CRC validation (RFC 3533 §6 field 7)
+
+`oxideav_ogg::crc` exposes a small byte-slice API for verifying any
+single Ogg page's stored checksum without paying for full packet
+reassembly:
+
+- `validate_page_crc(page_bytes) -> Option<bool>` — `Some(true)` if
+  the stored CRC matches, `Some(false)` if not, `None` if the slice
+  is shorter than the 26 bytes needed to even reach the CRC field.
+- `compute_page_checksum(page_bytes) -> Option<u32>` — recomputes
+  the CRC over the full page with bytes 22..26 treated as zero, per
+  RFC 3533 §6 field 7 ("a 32 bit CRC checksum of the page including
+  header with zero CRC field and page content; the generator polynomial
+  is 0x04c11db7").
+- `read_page_checksum(page_bytes) -> Option<u32>` — extracts the
+  little-endian u32 stored in the page's CRC field.
+- Constants `CRC_FIELD_OFFSET = 22` and `CRC_FIELD_LEN = 4` for callers
+  that want to inspect the field directly.
+
+This is the same polynomial and zero-field convention `Page::parse`
+already uses internally for its mandatory CRC check; the standalone
+helpers are convenient for stream-scanner tools that walk pages but
+do not need the segment table decoded into packets.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

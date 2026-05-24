@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Public page-level CRC-32 validation helpers in `crc`: `validate_page_crc`,
+  `compute_page_checksum`, `read_page_checksum`, and the `CRC_FIELD_OFFSET` /
+  `CRC_FIELD_LEN` constants. The new API lets external tools verify page
+  integrity per RFC 3533 §6 field 7 ("a 32 bit CRC checksum of the page
+  including header with zero CRC field and page content; the generator
+  polynomial is 0x04c11db7") without going through the full `Page::parse`
+  packet-reassembly path. Adds an integration test
+  (`tests/page_crc.rs`) that mux-builds a multi-page Vorbis stream, walks
+  every page, and confirms each page's stored CRC matches the recomputed
+  one — plus negative tests that flip a single byte in the payload or the
+  header and confirm the validator catches the corruption.
+
 ## [0.1.4](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.3...v0.1.4) - 2026-05-24
 
 ### Other
