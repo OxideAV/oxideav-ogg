@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.3...v0.1.4) - 2026-05-24
+
+### Other
+
+- continued-flag framing-consistency checking (RFC 3533 §6 field 3)
+- page-loss (hole) detection via page_sequence_number (RFC 3533 §6)
+- chained-link-aware duration via build_seek_index (RFC 3533 §4)
+- page-level seek index (RFC 3533) — O(log n) seek_to via cached (granule, offset)
+
 ### Added
 
 - Page-loss (hole) detection via the `page_sequence_number` field
