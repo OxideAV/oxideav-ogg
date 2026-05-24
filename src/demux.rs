@@ -1,7 +1,7 @@
 //! Ogg demuxer: page reader → per-stream packet reassembly.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, SeekFrom};
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, StreamInfo, TimeBase,
@@ -147,6 +147,19 @@ pub struct OggDemuxer {
     /// same page are NOT double-counted here. Surfaced via
     /// [`OggDemuxer::framing_error_count`].
     framing_errors: u64,
+    /// Number of times the demuxer had to *recapture* page sync after a
+    /// parsing error. RFC 3533 §3 lists "recapture after a parsing error"
+    /// as a design requirement, and §6 field 1 (capture_pattern) says the
+    /// `OggS` magic "helps a decoder to find the page boundaries and regain
+    /// synchronisation after parsing a corrupted stream. Once the capture
+    /// pattern is found, the decoder verifies page sync and integrity by
+    /// computing and comparing the checksum." When a read finds bytes that
+    /// are not a valid page (garbage spliced between pages, or a page whose
+    /// CRC fails), the demuxer scans forward byte-by-byte for the next
+    /// `OggS` whose header + body parse with a matching checksum, then
+    /// resumes there. Each such recovery — however many bytes were skipped —
+    /// counts as one resync. Surfaced via [`OggDemuxer::resync_count`].
+    resyncs: u64,
 }
 
 impl OggDemuxer {
@@ -166,6 +179,7 @@ impl OggDemuxer {
             seen_nonbos_in_current_link: false,
             holes: 0,
             framing_errors: 0,
+            resyncs: 0,
         }
     }
 
@@ -218,8 +232,6 @@ impl OggDemuxer {
     /// `seek_to` calls remain correct (they fall back to bisection for
     /// uncovered targets); only the speedup is incomplete.
     pub fn build_seek_index(&mut self) -> Result<()> {
-        use std::io::SeekFrom;
-
         let saved_pos = self.input.stream_position()?;
         let end = self.input.seek(SeekFrom::End(0))?;
         if end == 0 {
@@ -445,6 +457,30 @@ impl OggDemuxer {
         self.framing_errors
     }
 
+    /// Number of times the demuxer had to *recapture* page sync after a
+    /// parsing error. RFC 3533 §3 lists recapture as a core design
+    /// requirement and §6 field 1 describes how the `OggS` magic enables it:
+    /// "It helps a decoder to find the page boundaries and regain
+    /// synchronisation after parsing a corrupted stream. Once the capture
+    /// pattern is found, the decoder verifies page sync and integrity by
+    /// computing and comparing the checksum."
+    ///
+    /// Each recovery — whether triggered by garbage spliced between pages
+    /// (capture pattern missing at the expected offset) or by a checksum
+    /// failure (the apparent page header was valid `OggS` but the body did
+    /// not verify) — counts as one resync regardless of how many bytes had
+    /// to be skipped. This is distinct from [`hole_count`](Self::hole_count):
+    /// a sequence-number gap is a logical page-loss event, whereas a resync
+    /// is the demuxer's response to *byte-level* corruption it had to walk
+    /// past. The two can fire on the same file (the byte corruption
+    /// destroyed N pages, so the next valid page also reports a hole), in
+    /// which case both counters tick. The tally reflects pages consumed via
+    /// `next_packet` (or absorbed during the header phase); the
+    /// header-only `build_seek_index` scan does not contribute.
+    pub fn resync_count(&self) -> u64 {
+        self.resyncs
+    }
+
     /// Read pages until we leave the Beginning-Of-Stream section, registering
     /// every logical bitstream we discover. The pages we read are queued so
     /// `next_packet` can drain them in order.
@@ -533,7 +569,14 @@ impl OggDemuxer {
             return Ok(None);
         }
         if hdr[0..4] != page::CAPTURE_PATTERN {
-            return Err(Error::invalid("Ogg: lost page sync (no 'OggS')"));
+            // RFC 3533 §3 "recapture after a parsing error" / §6 field 1: the
+            // bytes here are not an `OggS` capture pattern. Rather than abort
+            // the whole stream, scan forward for the next valid page and
+            // resume there. Rewind to where this read began so the resync
+            // scanner re-examines every byte (the bad capture may overlap a
+            // genuine `OggS` that starts inside these 27 bytes).
+            self.input.seek(SeekFrom::Start(page_off))?;
+            return self.resync_to_next_page();
         }
         let n_segs = hdr[26] as usize;
         let mut lacing = vec![0u8; n_segs];
@@ -547,14 +590,129 @@ impl OggDemuxer {
         full.extend_from_slice(&hdr);
         full.extend_from_slice(&lacing);
         full.extend_from_slice(&data);
-        let (page, consumed) = Page::parse(&full)?;
-        debug_assert_eq!(consumed, full.len());
-        // Opportunistically populate the seek index from any page we read
-        // during normal demux flow — costs O(log n) per page and means a
-        // subsequent seek can skip bisection if the target falls inside
-        // the already-scanned range.
-        self.index_record(page.serial, page.granule_position, page_off);
-        Ok(Some(page))
+        match Page::parse(&full) {
+            Ok((page, consumed)) => {
+                debug_assert_eq!(consumed, full.len());
+                // Opportunistically populate the seek index from any page we
+                // read during normal demux flow — costs O(log n) per page and
+                // means a subsequent seek can skip bisection if the target
+                // falls inside the already-scanned range.
+                self.index_record(page.serial, page.granule_position, page_off);
+                Ok(Some(page))
+            }
+            Err(Error::InvalidData(_)) => {
+                // The `OggS` magic matched but the checksum did not — the page
+                // header or body is corrupt (RFC 3533 §6 field 1: "the decoder
+                // verifies page sync and integrity by computing and comparing
+                // the checksum"). A false-positive capture pattern inside an
+                // earlier page's payload reaches here too. Recapture: rewind
+                // PAST this `OggS` (one byte forward, so the scanner doesn't
+                // re-lock onto the same bad capture) and search for the next
+                // page whose checksum validates.
+                self.input.seek(SeekFrom::Start(page_off + 1))?;
+                self.resync_to_next_page()
+            }
+            // A version or other structural error from a capture-pattern-bearing
+            // header is genuine corruption we don't try to paper over here;
+            // propagate it.
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Scan forward from the current stream position for the next byte offset
+    /// at which a complete, checksum-valid Ogg page begins, leave the input
+    /// positioned just past that page, and return it.
+    ///
+    /// This is the implementation of RFC 3533 §3 "recapture after a parsing
+    /// error": when a read lands on bytes that are not a valid page (garbage
+    /// inserted between pages, or a page whose CRC fails), the demuxer walks
+    /// the input one byte at a time looking for the `OggS` capture pattern,
+    /// then attempts a full [`Page::parse`] (including CRC verification) at
+    /// that offset. The first candidate that parses cleanly is the resync
+    /// target; candidates whose checksum fails (false-positive captures sitting
+    /// inside packet payloads) are skipped and the search continues from the
+    /// byte after them. Returns `Ok(None)` at EOF if no valid page remains.
+    ///
+    /// Each successful recovery increments [`OggDemuxer::resync_count`].
+    fn resync_to_next_page(&mut self) -> Result<Option<Page>> {
+        const CHUNK: usize = 65536;
+        let mut search_off = self.input.stream_position()?;
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            self.input.seek(SeekFrom::Start(search_off))?;
+            let got = read_some(&mut self.input, &mut buf)?;
+            if got < 4 {
+                // Fewer than a capture pattern's worth of bytes remain.
+                return Ok(None);
+            }
+            let window = &buf[..got];
+            let mut i = 0usize;
+            while i + 4 <= got {
+                if &window[i..i + 4] != b"OggS" {
+                    i += 1;
+                    continue;
+                }
+                let candidate_off = search_off + i as u64;
+                // Try to parse a full page at this candidate offset.
+                self.input.seek(SeekFrom::Start(candidate_off))?;
+                match self.try_parse_page_at(candidate_off)? {
+                    Some(page) => {
+                        // `try_parse_page_at` left the input positioned just
+                        // past the page. Count the recovery and return it.
+                        self.resyncs += 1;
+                        self.index_record(page.serial, page.granule_position, candidate_off);
+                        return Ok(Some(page));
+                    }
+                    None => {
+                        // False-positive capture (bad CRC or truncated): skip
+                        // this `OggS` and keep scanning from the next byte.
+                        i += 1;
+                    }
+                }
+            }
+            // No valid page in this window. Advance, retaining a 3-byte tail so
+            // an `OggS` straddling the chunk boundary is not missed.
+            if got < CHUNK {
+                // Reached EOF without a valid page.
+                return Ok(None);
+            }
+            search_off += (got - 3) as u64;
+        }
+    }
+
+    /// Attempt to read and CRC-verify a single page whose capture pattern is
+    /// known to sit at `off`. On success the input is positioned immediately
+    /// after the page and the page is returned. On a CRC failure or truncation
+    /// the input position is left unspecified (the caller reseeks) and `None`
+    /// is returned. Used only by [`resync_to_next_page`]; it does NOT record
+    /// the seek index (the caller does, once a candidate is accepted).
+    fn try_parse_page_at(&mut self, off: u64) -> Result<Option<Page>> {
+        self.input.seek(SeekFrom::Start(off))?;
+        let mut hdr = [0u8; 27];
+        if !read_exact_or_eof(&mut self.input, &mut hdr)? {
+            return Ok(None);
+        }
+        if hdr[0..4] != page::CAPTURE_PATTERN {
+            return Ok(None);
+        }
+        let n_segs = hdr[26] as usize;
+        let mut lacing = vec![0u8; n_segs];
+        if !read_exact_or_eof(&mut self.input, &mut lacing)? {
+            return Ok(None);
+        }
+        let data_len: usize = lacing.iter().map(|&v| v as usize).sum();
+        let mut data = vec![0u8; data_len];
+        if !read_exact_or_eof(&mut self.input, &mut data)? {
+            return Ok(None);
+        }
+        let mut full = Vec::with_capacity(27 + n_segs + data_len);
+        full.extend_from_slice(&hdr);
+        full.extend_from_slice(&lacing);
+        full.extend_from_slice(&data);
+        match Page::parse(&full) {
+            Ok((page, _)) => Ok(Some(page)),
+            Err(_) => Ok(None),
+        }
     }
 
     /// After the BOS section, keep reading pages and absorbing header packets
@@ -633,7 +791,6 @@ impl OggDemuxer {
     /// audio-or-video stream to read its granule_position, which gives
     /// the total stream length in samples or video frames.
     fn populate_duration(&mut self) {
-        use std::io::SeekFrom;
         let saved_pos = match self.input.stream_position() {
             Ok(p) => p,
             Err(_) => return,
@@ -713,8 +870,6 @@ impl OggDemuxer {
         limit: u64,
         wanted_serial: u32,
     ) -> Result<Option<(u64, i64)>> {
-        use std::io::SeekFrom;
-
         if start >= limit {
             return Ok(None);
         }
@@ -1084,8 +1239,6 @@ impl Demuxer for OggDemuxer {
     }
 
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
-        use std::io::SeekFrom;
-
         if stream_index as usize >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "Ogg: stream index {stream_index} out of range"
@@ -1458,4 +1611,19 @@ fn read_exact_or_eof(r: &mut dyn Read, buf: &mut [u8]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// Read up to `buf.len()` bytes into `buf`, returning the actual count read.
+/// Unlike `read_exact_or_eof` this is satisfied by a short read short of EOF
+/// (a single `read` syscall) and is appropriate for chunked scanning where
+/// any prefix is acceptable. EOF is signalled by a return of zero. Interrupts
+/// are retried transparently.
+fn read_some(r: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
+    loop {
+        match r.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }

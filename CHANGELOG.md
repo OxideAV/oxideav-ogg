@@ -18,6 +18,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Page-sync recapture / resynchronisation after a parsing error
+  (RFC 3533 §3 "recapture after a parsing error" and §6 field 1
+  `capture_pattern`: the `OggS` magic "helps a decoder to find the page
+  boundaries and regain synchronisation after parsing a corrupted
+  stream. Once the capture pattern is found, the decoder verifies page
+  sync and integrity by computing and comparing the checksum.").
+  Previously the demuxer hard-errored with `"Ogg: lost page sync"` when
+  bytes between pages were not `OggS`, and propagated the CRC-mismatch
+  `InvalidData` when a page header was syntactically valid but its body
+  failed the checksum. Both failure modes now drive a forward scan for
+  the next `OggS` whose full page re-parses with a matching CRC; demux
+  resumes there. False-positive captures inside other pages' payloads
+  are skipped because their checksums fail; the scanner runs only
+  after a parse error, so embedded `OggS` bytes in *intact* payloads
+  are never re-examined and cannot cause spurious resyncs.
+- `OggDemuxer::resync_count`: returns the number of successful
+  recoveries the demuxer has performed (0 for a clean file). Each
+  recovery counts as one resync regardless of how many bytes had to
+  be skipped. Distinct from `hole_count()` (a `page_sequence_number`
+  gap) and `framing_error_count()` (a `continued`-flag mismatch within
+  a sequence-consistent run): byte-level corruption that destroys
+  whole pages ticks both `resync_count` and `hole_count`; garbage
+  that sits between page boundaries with no sequence-number loss
+  ticks only `resync_count`.
 - Page-loss (hole) detection via the `page_sequence_number` field
   (RFC 3533 §6 field 6: the per-stream sequence number increases by one
   per page "so the decoder can identify page loss"). The demuxer tracks

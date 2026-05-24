@@ -216,6 +216,43 @@ exposes the tally (0 for a clean file); it is disjoint from
 `hole_count()` — a discontinuity already charged to a page-loss hole on
 the same page is not double-counted as a framing error.
 
+### Page-sync recapture (RFC 3533 §3, §6 field 1)
+
+RFC 3533 §3 lists "recapture after a parsing error" as a core design
+requirement of Ogg, and §6 field 1 (`capture_pattern`) spells out how the
+`OggS` magic enables it: "It helps a decoder to find the page boundaries
+and regain synchronisation after parsing a corrupted stream. Once the
+capture pattern is found, the decoder verifies page sync and integrity
+by computing and comparing the checksum." Two failure modes trigger
+recapture rather than aborting the stream:
+
+- **Garbage spliced between pages** — the bytes at the next page
+  boundary do not start with `OggS`. The demuxer rewinds to the start
+  of the bad read and scans forward byte-by-byte for the next valid
+  page.
+- **Checksum mismatch** — the bytes start with `OggS` (so the apparent
+  page header parsed) but the CRC32 over the assembled page does not
+  verify. The demuxer steps one byte past the bad capture (so it does
+  not re-lock onto the same garbage) and resumes the same forward
+  scan. False-positive captures sitting inside other pages' payloads
+  are weeded out by their own CRC failures.
+
+The scan keeps walking until it finds an `OggS` whose full page (header
++ segment table + body) re-parses cleanly with a matching checksum, then
+resumes normal demux from there. Embedded `OggS` byte sequences inside
+intact packet payloads are never seen by the resync scanner because
+normal page-by-page reading is driven by the previous page's length —
+the scanner only runs when a parse has already failed.
+
+`OggDemuxer::resync_count()` exposes the running tally of successful
+recoveries (0 for a clean file). Each recovery counts as one resync
+regardless of how many bytes had to be skipped. The counter is distinct
+from `hole_count()`: byte-level corruption that destroys whole pages
+ticks both (the resync for the corruption, the hole for the missing
+page-sequence number); garbage that sits *between* page boundaries
+ticks only the resync counter because no `page_sequence_number` was
+lost.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
