@@ -75,3 +75,19 @@ name = "granule_walk"
 path = "fuzz_targets/granule_walk.rs"
 test = false
 doc = false
+
+# Target 4: continued-packet edge surface. Targets 1-3 feed fully
+# arbitrary bytes; most random inputs are rejected at the BOS walk and
+# never reach the per-stream reassembly machinery (continued-flag
+# cross-check, 255-lacing partial-packet buffering, `pending_valid`
+# orphan-drop, page-loss hole accounting). This target *constructs* a
+# valid Vorbis header section plus N fuzz-shaped body pages — lacing
+# pattern, payload size around the 255-segment boundary, continued bit,
+# sequence-number delta, granule delta all attacker-driven — so the
+# reassembly machinery itself gets hammered. A single-byte global
+# mutation drives CRC-failure resync on top of the structural fuzz.
+[[bin]]
+name = "continued_edge"
+path = "fuzz_targets/continued_edge.rs"
+test = false
+doc = false

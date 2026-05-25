@@ -281,7 +281,7 @@ do not need the segment table decoded into packets.
 
 A cargo-fuzz harness under `fuzz/` (panic-freedom only, no oracle —
 the clean-room wall bars libogg / Xiph / ffmpeg as cross-decoders)
-hammers three surfaces with attacker bytes:
+hammers four surfaces with attacker bytes:
 
 - `page_parse` — `Page::parse` at every byte offset, plus the
   standalone `crc::validate_page_crc` / `read_page_checksum` /
@@ -297,6 +297,20 @@ hammers three surfaces with attacker bytes:
   `seek_to` at fuzz-derived granule values across every reported
   stream, covering both the dense index lookup and the bisection
   fallback's byte scanner.
+- `continued_edge` — the per-stream packet-reassembly machinery
+  (RFC 3533 §6 field 3 continued-flag cross-check, 255-lacing
+  partial-packet buffering, `pending_valid` orphan-drop, §6 field 6
+  page-loss hole accounting) is hard to reach with totally random
+  bytes because the BOS walk rejects most of them. This target
+  **constructs** a valid Vorbis BOS + comment + setup header
+  section then synthesises N body pages with attacker-driven
+  lacing patterns (including the exact-multiple-of-255 boundary,
+  continuation-without-terminator, segment-table truncation),
+  attacker-driven `continued` / `first` / `last` flag bits,
+  attacker-driven page-sequence-number deltas (zero = duplicate,
+  large = fabricated hole), and an optional single-byte global
+  mutation that triggers CRC-failure resync. The reassembly path
+  is therefore reached on essentially every iteration.
 
 Run from `fuzz/` with `cargo +nightly fuzz run <target>`; no target
 runs as part of the per-PR CI shim (the org reusable workflow does

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fourth cargo-fuzz target `continued_edge` (`fuzz/fuzz_targets/continued_edge.rs`)
+  that targets the per-stream packet-reassembly machinery — RFC 3533 §6 field 3
+  continued-flag cross-check, 255-lacing partial-packet buffering,
+  `pending_valid` orphan-drop, §6 field 6 page-loss hole accounting — which
+  the existing arbitrary-bytes targets (`page_parse`, `demux_recapture`,
+  `granule_walk`) struggle to reach because most random buffers are rejected
+  at the BOS walk before the reassembly loop ever runs. The new harness
+  **constructs** a valid Vorbis BOS + comment + setup header section, then
+  synthesises up to 24 body pages from fuzz-derived descriptors: eight lacing
+  patterns including the exact-multiple-of-255 boundary (`[255, 255, 0]`),
+  the bare continuation `[255]` with no terminator, segment-table truncation
+  by one byte, and the empty page; attacker-driven `continued` / `first` /
+  `last` flag bits with a reserved-high-bits escape; attacker-driven
+  page-sequence-number deltas (0 = duplicate, 1 = normal, larger = fabricated
+  hole, with wrapping); and an optional single-byte global mutation at a
+  fuzz-derived offset that triggers CRC-failure resync on top of the
+  structural fuzz. The reassembly path is therefore reached on essentially
+  every iteration. Per-input allocation stays bounded (≤24 body pages × ~1 KiB)
+  so the iteration budget matches the existing three targets; harness-only,
+  no `oxideav-ogg` surface changed.
 - `fuzz/` cargo-fuzz crate with three libFuzzer harnesses that hammer the Ogg
   framing surface end-to-end on attacker bytes: `page_parse` re-runs
   `Page::parse` at every byte offset (plus the standalone `crc::*` helpers and
