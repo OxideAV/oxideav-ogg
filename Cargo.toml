@@ -15,3 +15,22 @@ categories = ["multimedia::encoding", "parser-implementations"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# Round 172 (depth-mode benchmarks): Criterion drives the
+# `framing` bench harness (page parse / serialize, CRC, lace,
+# end-to-end demux walk + seek-index build) so future optimisation
+# rounds on the framing hot paths can A/B-test their changes. Pinned
+# to the same 0.5 line the other OxideAV crates with benches
+# (cinepak, magicyuv, h264, pixfmt, tta) already track.
+criterion = "0.5"
+
+# Round 172 benches. The single harness lives at `benches/framing.rs`
+# and is self-contained — every byte fed into a measured routine is
+# synthesised in-bench (Page::to_bytes or the muxer over a synthetic
+# Vorbis stream); no `docs/` fixtures or external `.ogg` files are
+# read. Run with:
+#     cargo bench -p oxideav-ogg --bench framing
+[[bench]]
+name = "framing"
+harness = false

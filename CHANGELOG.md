@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Criterion benchmark harness at `benches/framing.rs` covering the
+  Ogg framing hot paths so future optimisation rounds can A/B-test
+  changes against fixed scenarios. The harness is self-contained:
+  every byte fed into a measured routine is synthesised in-bench
+  (via `Page::to_bytes` for raw page scenarios, via the muxer for the
+  end-to-end demux scenarios) so no `docs/` fixtures or external
+  `.ogg` files are read. Scenarios: `crc/checksum/{64,4096,65536}`
+  (raw `crc::checksum` table-lookup loop, byte-throughput);
+  `crc/validate_page_crc/{short,max}` (RFC 3533 §6 field 7 standalone
+  helper over a single-segment short page and a max-size 255×255
+  page); `page/parse/{short,multi_segment,max}` and
+  `page/to_bytes/{short,multi_segment,max}` (the parse↔serialize pair
+  at the three legal-extreme sizes); `page/lace/{short,exact_255,
+  large}` (the segment-table builder, with the exact-multiple-of-255
+  zero-terminator branch covered); `demux/walk/vorbis_12pkt` (open +
+  drain a 12-packet synthetic Vorbis stream to EOF); and
+  `demux/build_index/vorbis_12pkt` (the page-header-only scan that
+  backs O(log n) `seek_to`). Run with
+  `cargo bench -p oxideav-ogg --bench framing`. Headline numbers from
+  a `--quick` smoke (M1, debug deps cached, release bench profile):
+  CRC ~566 MiB/s on a 64-byte input and ~560 MiB/s sustained at
+  64 KiB; `Page::parse` ~411–426 MiB/s across page sizes; `Page::to_bytes`
+  ~434 MiB/s on the max page; end-to-end demux of the 12-packet
+  Vorbis blob in ~8 µs (~220 MiB/s); `build_seek_index` of the same
+  blob in ~2.8 µs (~643 MiB/s, payload-skipping). No `oxideav-ogg`
+  surface changed — harness-only.
 - Fourth cargo-fuzz target `continued_edge` (`fuzz/fuzz_targets/continued_edge.rs`)
   that targets the per-stream packet-reassembly machinery — RFC 3533 §6 field 3
   continued-flag cross-check, 255-lacing partial-packet buffering,

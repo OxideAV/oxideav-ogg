@@ -317,6 +317,34 @@ runs as part of the per-PR CI shim (the org reusable workflow does
 not invoke `cargo fuzz`), so the harness is a long-running offline
 hardening tool rather than a gate.
 
+### Benchmarks
+
+A Criterion harness at `benches/framing.rs` measures the framing
+hot paths so future optimisation rounds can A/B-test their changes.
+Everything is self-contained — every byte fed into a measured
+routine is synthesised in-bench (via `Page::to_bytes` for raw page
+scenarios, via the muxer for the end-to-end demux scenarios), so
+no `docs/` fixtures or external `.ogg` files are read. Scenarios:
+
+- `crc/checksum/{64,4096,65536}` — the raw `crc::checksum` table-
+  lookup loop with byte-throughput reporting.
+- `crc/validate_page_crc/{short,max}` — the RFC 3533 §6 field 7
+  standalone helper over a single-segment short page and the max-
+  size 255×255 page (~65 KiB).
+- `page/parse/{short,multi_segment,max}` and
+  `page/to_bytes/{short,multi_segment,max}` — the parse ↔ serialize
+  pair at the three legal-extreme sizes.
+- `page/lace/{short,exact_255,large}` — the segment-table builder,
+  with the exact-multiple-of-255 zero-terminator branch covered.
+- `demux/walk/vorbis_12pkt` — open + drain a 12-packet synthetic
+  Vorbis stream end-to-end via `next_packet`.
+- `demux/build_index/vorbis_12pkt` — the page-header-only scan
+  that powers O(log n) `seek_to`.
+
+Run with `cargo bench -p oxideav-ogg --bench framing`. Like the
+cargo-fuzz harness, this is an offline tool — the per-PR CI shim
+does not invoke `cargo bench`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
