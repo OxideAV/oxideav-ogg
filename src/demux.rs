@@ -481,6 +481,72 @@ impl OggDemuxer {
         self.resyncs
     }
 
+    /// Number of distinct chained links the demuxer has observed so far
+    /// (RFC 3533 §4). The initial BOS section is link 0, so a single-link
+    /// (multiplexed or pure-mono) file always reports `1`. A back-to-back
+    /// concatenation of two independent logical bitstreams reports `2`,
+    /// and so on.
+    ///
+    /// The tally grows as the demuxer encounters BOS-after-non-BOS pages
+    /// via `next_packet` or `build_seek_index`. Before any pages have been
+    /// processed past `open` this only counts links registered during the
+    /// initial BOS walk, which is always `1` for any file with at least
+    /// one stream. Run `build_seek_index` (or drain the file with
+    /// `next_packet`) for the file-wide total.
+    ///
+    /// Together with [`stream_link_index`](Self::stream_link_index) and
+    /// [`stream_serial`](Self::stream_serial) this lets external tooling
+    /// reconstruct the RFC 3533 §4 link partitioning of the file.
+    pub fn link_count(&self) -> u32 {
+        // `next_link_index` is the index that WOULD be assigned to the
+        // next BOS-after-non-BOS — so the number of distinct links seen
+        // so far is one greater than the highest assigned index, but
+        // only if any stream has been registered. With zero registered
+        // streams (the impossible-in-practice empty-file case), we report
+        // 0. Otherwise the count is `next_link_index + 1`, since the
+        // initial BOS section is link 0 and `next_link_index` is bumped
+        // EACH time a new link starts AFTER the first one.
+        if self.state_by_serial.is_empty() {
+            0
+        } else {
+            self.next_link_index.saturating_add(1)
+        }
+    }
+
+    /// Chained-link index assigned to the public stream at `stream_index`
+    /// (RFC 3533 §4). Streams that share a link index play concurrently
+    /// (the link multiplexes them); streams in different links play
+    /// sequentially. The initial BOS section is link 0; each subsequent
+    /// BOS-after-non-BOS increments the counter.
+    ///
+    /// Returns `None` for an out-of-range index. A non-chained
+    /// (single-link) file reports `Some(0)` for every stream.
+    pub fn stream_link_index(&self, stream_index: u32) -> Option<u32> {
+        // O(n) over registered streams — n is the count of logical
+        // bitstreams, which is small (typically 1..=4) even on multiplexed
+        // files, so we don't bother building a reverse map.
+        self.state_by_serial
+            .values()
+            .find(|s| self.streams[s.public_index].index == stream_index)
+            .map(|s| s.link_index)
+    }
+
+    /// Ogg `bitstream_serial_number` (RFC 3533 §6 field 5) of the public
+    /// stream at `stream_index`. The serial uniquely identifies a logical
+    /// bitstream within the file — every page belonging to a given stream
+    /// carries the same serial in its header.
+    ///
+    /// Returns `None` for an out-of-range index. Exposed so external
+    /// tooling can correlate `oxideav-ogg`'s `StreamInfo::index` (which is
+    /// a dense `0..N` enumeration assigned in BOS-discovery order) with
+    /// the raw on-wire serials a page-level scanner would observe.
+    pub fn stream_serial(&self, stream_index: u32) -> Option<u32> {
+        self.state_by_serial
+            .iter()
+            .find(|(_, s)| self.streams[s.public_index].index == stream_index)
+            .map(|(serial, _)| *serial)
+    }
+
     /// Read pages until we leave the Beginning-Of-Stream section, registering
     /// every logical bitstream we discover. The pages we read are queued so
     /// `next_packet` can drain them in order.

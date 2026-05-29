@@ -171,6 +171,18 @@ containing two 60 s Vorbis songs reports 120 s, while a multiplexed
 file with a 60 s Vorbis audio track + 60 s Theora video track still
 reports 60 s.
 
+For external tooling that needs to reconstruct the link partitioning
+itself, `OggDemuxer` exposes three accessors alongside the existing
+`hole_count` / `framing_error_count` / `resync_count` diagnostics:
+`link_count() -> u32` returns the number of distinct chained links
+seen so far (`1` for a single-link file, growing as new BOS-after-non-
+BOS pages are observed); `stream_link_index(stream_index) -> Option<u32>`
+returns which link a given public stream belongs to; and
+`stream_serial(stream_index) -> Option<u32>` returns the raw on-wire
+`bitstream_serial_number` (RFC 3533 §6 field 5) for callers that need
+to correlate the dense `StreamInfo::index` enumeration with the
+page-header serials a byte-level scanner observes.
+
 ### Page-loss detection (RFC 3533 §6)
 
 Every Ogg page header carries a `page_sequence_number` that "is

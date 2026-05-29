@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Public chained-link diagnostic accessors on `OggDemuxer` so external
+  tooling can reconstruct the RFC 3533 §4 link partitioning of a file
+  without re-scanning every page itself. The demuxer already tracked
+  per-stream `link_index` internally (to compute chained-link-aware
+  duration in `build_seek_index`); these accessors round-trip that
+  state through the public API alongside the existing `hole_count` /
+  `framing_error_count` / `resync_count` / `seek_index_len` observability
+  surface. New methods:
+  - `link_count() -> u32` — number of distinct chained links the demuxer
+    has observed so far. The initial BOS section is link 0, so a
+    single-link (multiplexed or pure-mono) file always reports `1`; a
+    back-to-back concatenation of two independent logical bitstreams
+    reports `2`, and so on. Grows lazily as `next_packet` /
+    `build_seek_index` walk subsequent BOS-after-non-BOS pages.
+  - `stream_link_index(stream_index: u32) -> Option<u32>` — the chained
+    link index assigned to a given public stream (returns `None` for an
+    out-of-range index). Streams that share a link play concurrently
+    (multiplex); streams in different links play sequentially.
+  - `stream_serial(stream_index: u32) -> Option<u32>` — the on-wire
+    Ogg `bitstream_serial_number` (RFC 3533 §6 field 5) of a given
+    public stream, letting callers correlate `oxideav-ogg`'s dense
+    `StreamInfo::index` enumeration with the raw page-header serial a
+    byte-level scanner would see.
+
+  Adds an integration test (`tests/chained_link_diagnostics.rs`) with
+  five cases: a multiplexed BOS section reports `link_count == 1` with
+  both streams in link 0 immediately after `open_concrete` (no drain);
+  a two-link chain reports `link_count == 1` before `build_seek_index`
+  and `link_count == 2` afterwards with the two streams split across
+  links 0 and 1; a three-link chain reports `link_count == 3` with each
+  stream in a distinct link; out-of-range indices return `None` for both
+  accessors; and a chain discovered incrementally via `next_packet`
+  grows `link_count` lazily as each new BOS is encountered. No framing
+  logic changed — accessors only — so existing diagnostics, fuzz, and
+  bench paths are untouched.
 - Criterion benchmark harness at `benches/framing.rs` covering the
   Ogg framing hot paths so future optimisation rounds can A/B-test
   changes against fixed scenarios. The harness is self-contained:
