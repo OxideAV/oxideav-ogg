@@ -183,6 +183,82 @@ returns which link a given public stream belongs to; and
 to correlate the dense `StreamInfo::index` enumeration with the
 page-header serials a byte-level scanner observes.
 
+### Skeleton metadata bitstream (Xiph Skeleton 3.0 / 4.0)
+
+Ogg files often carry an **Ogg Skeleton** logical bitstream as their
+very first BOS — a metadata stream that describes the *other* logical
+bitstreams in the same physical stream (per-track MIME type, role,
+name, granule rate, preroll, granuleshift, basetime, presentation
+time, and — in version 4.0 — a keyframe index). Skeleton itself
+carries no content packets; its packets all live in the header pages
+and its EOS empty packet closes the control section before any
+content pages appear.
+
+`oxideav_ogg::skeleton` provides decode + encode for all three packet
+types — `fishead\0` ident header, `fisbone\0` per-track secondary
+header, and (4.0 only) `index\0` keyframe-index packet — plus the
+Skeleton 4.0 variable-byte integer codec used by index deltas. The
+demuxer auto-detects a `fishead\0` BOS, parses the header, routes
+subsequent fisbone / index packets through Skeleton's reassembly path,
+and surfaces the aggregate state via `OggDemuxer::skeleton()`:
+
+```rust
+use oxideav_core::{NullCodecResolver, ReadSeek};
+
+let input: Box<dyn ReadSeek> = Box::new(
+    std::io::Cursor::new(std::fs::read("multi.ogv")?),
+);
+let codecs = NullCodecResolver;
+let dmx = oxideav_ogg::demux::open_concrete(input, &codecs)?;
+if let Some(sk) = dmx.skeleton() {
+    // Skeleton present — Vorbis/Theora/etc. tracks each have a fisbone
+    // describing them, looked up by their own on-wire serial number.
+    for bone in &sk.bones {
+        let content_type = bone.header("Content-Type").unwrap_or("?");
+        let role = bone.header("Role").unwrap_or("?");
+        println!("serial {:08x}  {}  role={}", bone.serial, content_type, role);
+    }
+    // 4.0 streams may additionally carry a per-track keyframe index.
+    for idx in &sk.indexes {
+        println!("serial {:08x}  keypoints={}", idx.serial, idx.keypoints.len());
+    }
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The Skeleton stream is **not** exposed in `Demuxer::streams()` — it
+has no content packets and exists only to describe the other streams.
+Files without Skeleton behave exactly as before: `skeleton()` returns
+`None` and no other behaviour changes.
+
+For encode-side use, every type round-trips through `to_bytes` /
+`parse`:
+
+- `FisHead::to_bytes` emits a 64-byte 3.0 layout or an 80-byte 4.0
+  layout based on `self.version` (the 4.0 additions are the
+  *Segment length in bytes* and *Content byte offset* fields at
+  bytes 64..80, used by players to validate the index and to bound
+  chained-segment seeking).
+- `FisBone::to_bytes` emits the 52-byte fixed prefix followed by
+  CRLF-delimited HTTP-style message header fields. `set_header` /
+  `header` provide case-insensitive lookup for the spec's compulsory
+  4.0 fields (`Content-Type`, `Role`, `Name`) plus the larger field
+  registry in `docs/container/ogg/ogg-skeleton-message-headers.wiki`.
+- `SkelIndex::to_bytes` re-deltifies keypoint offsets and timestamps
+  relative to the previous entry and emits each as a Skeleton 4.0
+  variable-byte integer (7 bits per byte, high bit set on the
+  terminator, little-endian). `SkelIndex::parse` reverses both layers.
+- `oxideav_ogg::skeleton::{read_vbi_u64, write_vbi_u64}` are exposed
+  publicly so callers writing seek-tooling against raw `index\0`
+  packets don't have to re-implement the encoding.
+
+Spec reference: `docs/container/ogg/ogg-skeleton-3.0.md`,
+`docs/container/ogg/ogg-skeleton-4.0.md`,
+`docs/container/ogg/ogg-skeleton-message-headers.wiki`. The 4.0 page
+recommends emitting 4.0 in preference to 3.0 when possible, and notes
+that decoders must always fall back to bisection when the index is
+absent or fails validation (length / page-boundary checks).
+
 ### Page-loss detection (RFC 3533 §6)
 
 Every Ogg page header carries a `page_sequence_number` that "is

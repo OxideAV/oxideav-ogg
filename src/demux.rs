@@ -10,6 +10,7 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_id;
 use crate::page::{self, Page};
+use crate::skeleton::{self, FisBone, FisHead, SkelIndex, Skeleton};
 
 /// Open an Ogg bitstream.
 pub fn open(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
@@ -160,6 +161,32 @@ pub struct OggDemuxer {
     /// resumes there. Each such recovery — however many bytes were skipped —
     /// counts as one resync. Surfaced via [`OggDemuxer::resync_count`].
     resyncs: u64,
+    /// Parsed Skeleton metadata (fishead + fisbones + 4.0 indexes). Set
+    /// when the demuxer sees a `fishead\0` BOS page as the very first
+    /// BOS of the file. `None` for streams without Skeleton.
+    ///
+    /// The Skeleton logical bitstream is NOT exposed via the public
+    /// `streams()` list — it has no content packets and exists purely
+    /// to describe the *other* logical bitstreams. Callers retrieve
+    /// its parsed state via [`OggDemuxer::skeleton`].
+    skeleton: Option<Skeleton>,
+    /// `bitstream_serial_number` of the Skeleton logical bitstream, if
+    /// any. Used internally to route Skeleton stream packets away from
+    /// the public stream-packet path.
+    skeleton_serial: Option<u32>,
+    /// Buffered partial-packet bytes for the Skeleton logical bitstream.
+    /// Skeleton packets typically fit in a single page, but the framing
+    /// itself does not preclude them spanning page boundaries.
+    skeleton_pending: Vec<u8>,
+    /// `last_seq` tracker for the Skeleton stream (matches the
+    /// `LogicalStream::last_seq` semantics of content streams).
+    skeleton_last_seq: Option<u32>,
+    /// Set once the demuxer consumes the Skeleton EOS page — the empty
+    /// packet that closes the control section before any content pages
+    /// appear (`ogg-skeleton-{3,4}.0.md`). The initial open() flow waits
+    /// for this so callers can read [`OggDemuxer::skeleton`] immediately
+    /// after `open` and see every fisbone / index packet.
+    skeleton_eos_seen: bool,
 }
 
 impl OggDemuxer {
@@ -180,7 +207,28 @@ impl OggDemuxer {
             holes: 0,
             framing_errors: 0,
             resyncs: 0,
+            skeleton: None,
+            skeleton_serial: None,
+            skeleton_pending: Vec::new(),
+            skeleton_last_seq: None,
+            skeleton_eos_seen: false,
         }
+    }
+
+    /// Parsed Ogg Skeleton metadata bitstream, if the file's first BOS
+    /// page was a `fishead\0` ident packet (Skeleton 3.0 / 4.0).
+    ///
+    /// Skeleton is the metadata logical bitstream that describes the
+    /// other logical bitstreams in the same physical stream — per-track
+    /// MIME type, role, name, granule rate, preroll, and (4.0 only) a
+    /// keyframe index. The Skeleton stream itself has no content
+    /// packets, so it is not exposed in [`Demuxer::streams`]; callers
+    /// read its parsed state through this accessor instead.
+    ///
+    /// Returns `None` for files without Skeleton; the demuxer otherwise
+    /// behaves identically (Skeleton is purely additive).
+    pub fn skeleton(&self) -> Option<&Skeleton> {
+        self.skeleton.as_ref()
     }
 
     /// Record a page's `(granule, byte_offset)` into the per-serial seek
@@ -584,6 +632,23 @@ impl OggDemuxer {
             return Err(Error::invalid("Ogg BOS page has no packets"));
         }
         let first = &bos_page.data[segs[0].data.clone()];
+        // Skeleton BOS — `fishead\0` ident packet, Skeleton 3.0 / 4.0
+        // (`docs/container/ogg/ogg-skeleton-{3,4}.0.md`). The Skeleton
+        // logical bitstream has no content packets and is described as
+        // ALWAYS the first BOS in the file; do not register it as a
+        // public stream. Instead, parse the fishead and stash the serial
+        // so subsequent fisbone / index packets can be routed away from
+        // the regular packet-reassembly path.
+        if skeleton::is_fishead(first) {
+            let head = FisHead::parse(first)?;
+            let mut sk = Skeleton::new();
+            sk.serial = Some(bos_page.serial);
+            sk.set_head(head);
+            self.skeleton = Some(sk);
+            self.skeleton_serial = Some(bos_page.serial);
+            self.skeleton_last_seq = Some(bos_page.seq_no);
+            return Ok(());
+        }
         let codec_id = codec_id::detect(first);
         let public_index = self.streams.len();
         let mut params = guess_params(&codec_id, first)?;
@@ -791,7 +856,16 @@ impl OggDemuxer {
                 .state_by_serial
                 .values()
                 .any(|s| s.headers_remaining > 0);
-            if !any_pending {
+            // If a Skeleton stream is present, keep reading until its
+            // EOS page has been seen too: Skeleton's fisbones / 4.0
+            // index packets are interleaved with content streams'
+            // secondary headers, so a "content streams done" exit may
+            // skip some of them. The Skeleton EOS page is guaranteed
+            // (per `ogg-skeleton-{3,4}.0.md`) to come BEFORE any content
+            // data page, so once it lands we know every fisbone /
+            // index packet is in.
+            let skeleton_pending = self.skeleton_serial.is_some() && !self.skeleton_eos_seen;
+            if !any_pending && !skeleton_pending {
                 return Ok(());
             }
             // Drain queued pages from the BOS phase first; only then read more.
@@ -1052,6 +1126,84 @@ impl OggDemuxer {
         }
     }
 
+    /// Absorb a Skeleton-stream page: reassemble packets across page
+    /// boundaries (same 255-lacing rule as content streams), dispatch
+    /// each completed packet to [`FisHead::parse`] / [`FisBone::parse`] /
+    /// [`SkelIndex::parse`] based on its leading magic, and append the
+    /// parsed result to `self.skeleton`. Empty packets (the Skeleton
+    /// EOS marker per `ogg-skeleton-{3,4}.0.md`) are ignored.
+    ///
+    /// Skeleton packets that fail to parse are silently dropped: a
+    /// malformed Skeleton must not abort the whole demux because the
+    /// content streams are still well-formed on their own.
+    fn process_skeleton_page(&mut self, page: Page) {
+        // RFC 3533 §6 field 6: detect dropped pages on the Skeleton
+        // stream too so a hole inside a partial fisbone discards the
+        // partial bytes rather than splicing them with an unrelated
+        // tail.
+        let hole = !page.is_first()
+            && matches!(
+                self.skeleton_last_seq,
+                Some(prev) if page.seq_no != prev.wrapping_add(1)
+            );
+        if hole {
+            self.holes += 1;
+            self.skeleton_pending.clear();
+        }
+        let was_continued = page.is_continued();
+        let segs = page.packet_segments();
+        let mut completed: Vec<Vec<u8>> = Vec::new();
+        for (i, seg) in segs.iter().enumerate() {
+            let payload = &page.data[seg.data.clone()];
+            if i == 0 && was_continued {
+                // Tail of a fisbone / index packet from the previous page.
+                self.skeleton_pending.extend_from_slice(payload);
+            } else {
+                // Fresh packet starts here.
+                self.skeleton_pending.clear();
+                self.skeleton_pending.extend_from_slice(payload);
+            }
+            if seg.terminated {
+                completed.push(std::mem::take(&mut self.skeleton_pending));
+            }
+        }
+        if let Some(sk) = self.skeleton.as_mut() {
+            for packet in completed {
+                if packet.is_empty() {
+                    // The Skeleton EOS marker is an empty packet per the
+                    // 3.0 / 4.0 spec (`docs/container/ogg/ogg-skeleton-3.0.md`
+                    // §"Ogg Skeleton version 3.0 Format Specification":
+                    // "Its eos page is included into the stream before any
+                    // data pages of the other logical bitstreams appear and
+                    // contains a packet of length 0."). Nothing to record.
+                    continue;
+                }
+                if skeleton::is_fisbone(&packet) {
+                    if let Ok(bone) = FisBone::parse(&packet) {
+                        sk.push_bone(bone);
+                    }
+                } else if skeleton::is_index(&packet) {
+                    if let Ok(idx) = SkelIndex::parse(&packet) {
+                        sk.push_index(idx);
+                    }
+                } else if skeleton::is_fishead(&packet) {
+                    // The BOS fishead packet was already parsed and
+                    // stashed in `register_stream`; a second fishead
+                    // would be a spec violation (one Skeleton stream
+                    // per file). Silently ignore to keep the demuxer
+                    // generous.
+                } else {
+                    // Unknown Skeleton packet — silently skip. The
+                    // I-D allows for forward-compatible extensions.
+                }
+            }
+        }
+        self.skeleton_last_seq = Some(page.seq_no);
+        if page.is_last() {
+            self.skeleton_eos_seen = true;
+        }
+    }
+
     fn process_page(&mut self, page: Page) -> Result<()> {
         // RFC 3533 §4 + Vorbis I §A.2: chained Ogg streams concatenate
         // independent logical bitstreams back-to-back, each with its own
@@ -1071,9 +1223,26 @@ impl OggDemuxer {
                 self.next_link_index = self.next_link_index.saturating_add(1);
                 self.seen_nonbos_in_current_link = false;
             }
+            // `register_stream` short-circuits for a `fishead\0` BOS,
+            // initialising `skeleton_serial` instead of pushing a
+            // public stream entry. The BOS page itself carries the
+            // fishead packet which `register_stream` already parsed
+            // and stashed, so there is nothing more to do for the
+            // Skeleton stream on its own BOS page.
             self.register_stream(&page)?;
+            if Some(page.serial) == self.skeleton_serial {
+                return Ok(());
+            }
         } else if !page.is_first() {
             self.seen_nonbos_in_current_link = true;
+        }
+        // Route subsequent Skeleton stream pages (fisbones, 4.0
+        // indexes, the EOS-empty packet) through the metadata path —
+        // they are not content packets and would otherwise hit the
+        // `Unknown serial` skip below.
+        if Some(page.serial) == self.skeleton_serial {
+            self.process_skeleton_page(page);
+            return Ok(());
         }
         let Some(stream) = self.state_by_serial.get_mut(&page.serial) else {
             // Unknown serial that isn't a BOS — skip silently.

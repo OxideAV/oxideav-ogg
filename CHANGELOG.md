@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Ogg Skeleton metadata bitstream decoding — both versions 3.0 and 4.0
+  per `docs/container/ogg/ogg-skeleton-{3,4}.0.md`. New
+  `oxideav_ogg::skeleton` module exposes:
+  - `Skeleton` — aggregate state for a Skeleton-bearing physical Ogg
+    stream (fishead + fisbones + 4.0 indexes), with `bone_for_serial`
+    and `index_for_serial` lookups by content-stream serial number.
+  - `FisHead` — the `fishead\0` BOS ident packet (Skeleton version,
+    presentation time + basetime rationals, UTC slot, and the 4.0-only
+    segment-length / content-byte-offset fields). `parse` accepts both
+    64-byte (3.0) and 80-byte (4.0) layouts; `to_bytes` emits whichever
+    layout matches `self.version`.
+  - `FisBone` — the `fisbone\0` secondary header (per-track serial,
+    granule-rate rational, basegranule, preroll, granuleshift, and the
+    HTTP-style message header fields). `set_header` /
+    `header` provide case-insensitive lookup for `Content-Type`,
+    `Role`, `Name`, plus any custom fields from the
+    `docs/container/ogg/ogg-skeleton-message-headers.wiki` registry.
+  - `SkelIndex` + `KeyPoint` — the 4.0 `index\0` keyframe-index
+    packet, with delta-decoding of per-keypoint `(offset, timestamp)`
+    on parse and delta-encoding on `to_bytes`.
+  - `Rational`, `Version` (with `V3_0` / `V4_0` constants and an
+    `at_least` ordering helper), and stream-side `is_fishead` /
+    `is_fisbone` / `is_index` magic detectors.
+  - Public `read_vbi_u64` / `write_vbi_u64` helpers for the Skeleton
+    4.0 variable-byte integer encoding (7 bits per byte, terminator
+    high-bit-set, little-endian), exercised against the
+    `ogg-skeleton-4.0.md` worked example (integer 7843 → `0x23 0xBD`).
+- `OggDemuxer::skeleton() -> Option<&Skeleton>`: the demuxer now
+  recognises a `fishead\0` BOS as the very first BOS page, parses the
+  ident header, routes subsequent fisbone / 4.0 index packets through
+  Skeleton's reassembly path, and surfaces the aggregate state via this
+  accessor. The Skeleton logical bitstream is **not** added to the
+  public `streams()` list because it has no content packets; it exists
+  purely to describe the *other* logical bitstreams. The demuxer's
+  initial open loop now waits for the Skeleton EOS page (the empty
+  packet that closes the control section before any content pages
+  appear, per `docs/container/ogg/ogg-skeleton-{3,4}.0.md`) so callers
+  can read `skeleton()` immediately after `open` and see every
+  fisbone / index packet. Files without a Skeleton stream behave
+  exactly as before — `skeleton()` returns `None`, no behaviour
+  changes — so the addition is purely additive.
+
+  Adds an integration test (`tests/skeleton.rs`) with five cases:
+  the demuxer recovers the fishead, fisbone, and index from a
+  hand-synthesised 4.0 Ogg-with-Skeleton; the lookup helpers
+  (`bone_for_serial`, `index_for_serial`, case-insensitive
+  `MessageHeader::header`) round-trip the same blob; a plain Vorbis
+  file with no Skeleton still demuxes and reports `skeleton() = None`;
+  a Skeleton 3.0 BOS (64-byte fishead, no index packets) parses with
+  `segment_length == None` and `content_byte_offset == None`; and the
+  public `is_fishead` / `is_fisbone` / `is_index` magic detectors
+  match on the spec's magic bytes. All previously-passing tests still
+  pass (page CRC, mux/demux roundtrip, chained-link diagnostics,
+  page-loss / framing-error / resync counters, seek bisection + index)
+  — Skeleton routing is gated on the file's first BOS being a fishead,
+  so it is invisible on non-Skeleton inputs.
+
 ### Changed
 
 - `page::Page::parse` now validates the RFC 3533 §6 field 7 CRC by

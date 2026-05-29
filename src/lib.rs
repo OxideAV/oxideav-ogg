@@ -11,6 +11,7 @@ pub mod crc;
 pub mod demux;
 pub mod mux;
 pub mod page;
+pub mod skeleton;
 
 use oxideav_core::ContainerRegistry;
 
