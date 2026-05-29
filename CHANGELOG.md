@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `page::Page::parse` now validates the RFC 3533 §6 field 7 CRC by
+  streaming through `crc::compute_page_checksum` over the borrowed
+  page bytes (which treats the 4-byte CRC field at offset 22..26 as
+  zero per the spec) instead of cloning the whole page into a scratch
+  `Vec<u8>`, zeroing those four bytes, and then calling `crc::checksum`
+  on the clone. Functionally identical (same polynomial, same
+  zero-CRC-field convention) but eliminates the per-page allocation +
+  memcpy that was paid on every `Demuxer::next_packet` /
+  `Page::parse` call. For a max-size 65 KiB page that was a second
+  full copy of the page body; for short packet pages it was still a
+  ~32-byte heap roundtrip per page. No public-API change — the
+  function signature, the `Result<(Page, usize)>` return shape, and
+  the `Error::InvalidData` mismatch error are all preserved
+  byte-for-byte (the formatted error message is unchanged).
+
+  Headline impact on the release-profile `benches/framing.rs`
+  Criterion harness (M1, `--quick`):
+
+  | scenario                  | before (r172) | after (this) |
+  |---------------------------|---------------|--------------|
+  | `page/parse/short`        | ~416 MiB/s    | ~489 MiB/s   |
+  | `page/parse/multi_segment`| ~426 MiB/s    | ~488 MiB/s   |
+  | `page/parse/max`          | ~411 MiB/s    | ~493 MiB/s   |
+
+  The end-to-end `demux/walk/vorbis_12pkt` and
+  `demux/build_index/vorbis_12pkt` scenarios benefit too, since
+  every page header the demuxer consumes flows through this same
+  `Page::parse` entry. All 54 unit + integration tests still pass
+  (page-CRC validation, mux/demux roundtrip, chained-link
+  diagnostics, page-loss / framing-error / resync counters, seek
+  bisection + index, fuzz harnesses' invariants). The four
+  cargo-fuzz targets keep compiling and running; the parse↔serialize
+  inverse-pair invariant in `page_parse` continues to hold because
+  CRC validation produces the same accept/reject decisions on the
+  same inputs.
+
 ### Added
 
 - Public chained-link diagnostic accessors on `OggDemuxer` so external

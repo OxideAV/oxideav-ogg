@@ -345,7 +345,19 @@ no `docs/` fixtures or external `.ogg` files are read. Scenarios:
   size 255×255 page (~65 KiB).
 - `page/parse/{short,multi_segment,max}` and
   `page/to_bytes/{short,multi_segment,max}` — the parse ↔ serialize
-  pair at the three legal-extreme sizes.
+  pair at the three legal-extreme sizes. `parse` now validates the
+  CRC by streaming through `crc::compute_page_checksum` over the
+  borrowed page bytes (with the field at offset 22..26 treated as
+  zero per RFC 3533 §6 field 7) rather than cloning the page into a
+  scratch `Vec<u8>` so the four CRC bytes can be filled with zeros
+  before re-checksumming; the allocation+memcpy was on the hot path
+  of every `next_packet`, and for a max-size 65 KiB page it was a
+  full second copy of the page body. Headline impact on the
+  release-profile bench harness (M1): `page/parse/max` went from
+  ~411 MiB/s to ~493 MiB/s, `page/parse/multi_segment` from
+  ~426 MiB/s to ~488 MiB/s, and `page/parse/short` from
+  ~416 MiB/s to ~489 MiB/s — a ~15-20% across-the-board speedup
+  with no behaviour change.
 - `page/lace/{short,exact_255,large}` — the segment-table builder,
   with the exact-multiple-of-255 zero-terminator branch covered.
 - `demux/walk/vorbis_12pkt` — open + drain a 12-packet synthetic

@@ -147,10 +147,15 @@ impl Page {
         }
         let data = bytes[header_len..total].to_vec();
 
-        // Validate CRC.
-        let mut to_check = bytes[..total].to_vec();
-        to_check[22..26].fill(0);
-        let computed = crc::checksum(&to_check);
+        // Validate CRC. Per RFC 3533 §6 field 7 the checksum is computed
+        // over the page bytes with the CRC field itself treated as zero;
+        // `crc::compute_page_checksum` implements that "zero-field"
+        // convention by stream — no need to clone the page just to overwrite
+        // four bytes. The `Option::expect` is infallible here because we
+        // already gated the slice on `bytes.len() >= 27 > CRC_FIELD_OFFSET +
+        // CRC_FIELD_LEN` at the top of this function.
+        let computed = crc::compute_page_checksum(&bytes[..total])
+            .expect("page slice already gated to >= 27 bytes");
         if computed != claimed_crc {
             return Err(Error::InvalidData(format!(
                 "Ogg page CRC mismatch (got {:08x}, expected {:08x})",
