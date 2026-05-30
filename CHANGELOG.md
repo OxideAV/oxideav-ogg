@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.4...v0.1.5) - 2026-05-30
+
+### Other
+
+- slice-by-4 CRC-32 + branch-free compute_page_checksum
+- decode/encode Ogg Skeleton 3.0 + 4.0 (fishead / fisbone / index)
+- avoid per-parse page clone in CRC validation
+- public chained-link diagnostic accessors (RFC 3533 §4 + §6 field 5)
+- criterion harness for the Ogg framing hot paths
+- continued-packet edge target — structured Vorbis BOS + attacker-shaped body pages
+- panic-hardening libFuzzer harnesses (page parse + recapture + granule walk)
+- public page-level CRC-32 validation helpers (RFC 3533 §6 field 7)
+- recapture page sync after a parsing error (RFC 3533 §3, §6 field 1)
+
 ### Performance
 
 - **Slice-by-4 CRC-32 fast path.** `crc::checksum` and
