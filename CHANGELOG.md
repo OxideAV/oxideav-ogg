@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Slice-by-4 CRC-32 fast path.** `crc::checksum` and
+  `crc::compute_page_checksum` now advance four input bytes per
+  iteration through four pre-shifted advancement tables (`T0..T3`,
+  each derived from the same generator polynomial 0x04C11DB7 the
+  original byte table used, just one extra zero-byte rank deeper).
+  A 0-to-3-byte scalar tail mops up the remainder. The recurrence is
+  pinned in unit tests against a verbatim copy of the original scalar
+  loop (oracle on lengths 0..65 535) so any future tweak to the
+  tables catches a mismatch immediately. On M1 the framing benches
+  measure:
+  - `page/parse/max` ~493 MiB/s → ~1.2 GiB/s (~2.5×)
+  - `page/parse/multi_segment` ~488 MiB/s → ~1.2 GiB/s
+  - `page/parse/short` ~489 MiB/s → ~1.3 GiB/s
+  - `crc/checksum/65536` ~1.4 GiB/s (previously bound by the
+    byte-at-a-time loop)
+- **Branch-free `compute_page_checksum`.** The original
+  implementation tested `(22..26).contains(&i)` on every input byte
+  to substitute the CRC field with zeros. r192 splits the page into
+  three straight-line segments (`[..22]`, four-zero CRC-field
+  substitute via `advance_four_zero_bytes`, `[26..]`) so the per-byte
+  range check is gone. For a max-size 65 KiB page this removes
+  65 535 range checks from the hot path.
+- **`crc::continue_checksum(state, bytes)`** is a new public helper
+  that lets callers feed the CRC state across multiple buffers
+  without materialising a concatenated slice — the contract is
+  `continue_checksum(0, bytes) == checksum(bytes)`. Verified by an
+  associativity test that splits a known payload at every position
+  0..200 and confirms both halves rejoin to the one-shot answer.
+  Used internally by `compute_page_checksum` to splice the
+  zero-CRC-field segment in.
+
 ### Added
 
 - Ogg Skeleton metadata bitstream decoding — both versions 3.0 and 4.0
