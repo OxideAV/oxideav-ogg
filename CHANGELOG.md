@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Skeleton 4.0 index-accelerated `seek_to`.** When a Xiph
+  Skeleton 4.0 `index\0` packet (`docs/container/ogg/ogg-skeleton-4.0.md`)
+  was parsed for a content stream's serial, `seek_to` now resolves
+  the target timestamp directly from the index's keypoint table —
+  no page bisection, no `build_seek_index` pre-scan, no per-page
+  tightening pass. The fast path:
+  1. converts the target pts (stream time-base units) into the
+     index's own timestamp denominator via `TimeBase::rescale`;
+  2. binary-searches the (already sorted) keypoint table for the
+     largest timestamp `<=` the target;
+  3. seeks the input to the keypoint's byte offset and returns
+     the keypoint's granule (back-converted through `rescale`).
+  Falls through to the existing page-level `index_floor` /
+  bisection path when no Skeleton index is available for the
+  requested serial (Skeleton 3.0 files, 4.0 files that omit the
+  index, or any stream whose serial isn't covered by the index).
+  Surfaced via `OggDemuxer::skeleton_index_seek_count()` so callers
+  and tests can confirm the fast path actually fired.
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.4...v0.1.5) - 2026-05-30
 
 ### Other

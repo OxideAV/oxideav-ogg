@@ -252,6 +252,18 @@ For encode-side use, every type round-trips through `to_bytes` /
   publicly so callers writing seek-tooling against raw `index\0`
   packets don't have to re-implement the encoding.
 
+When a Skeleton 4.0 `index\0` packet is present for the requested
+stream, [`Demuxer::seek_to`] skips both the page-level bisection scan
+and even the [`OggDemuxer::build_seek_index`] full-file scan: the
+target pts is rescaled into the index's `timestamp_denominator` units
+via [`TimeBase::rescale`], the keypoint table is binary-searched for
+the largest timestamp at or below the target, and the demuxer jumps
+straight to that keypoint's byte offset. Fast-path firings are counted
+on `OggDemuxer::skeleton_index_seek_count()`. Files without a
+Skeleton index — Skeleton 3.0 streams, 4.0 streams that omit the
+index, or seeks against a stream whose serial is uncovered — fall
+back to the existing bisection path unchanged.
+
 Spec reference: `docs/container/ogg/ogg-skeleton-3.0.md`,
 `docs/container/ogg/ogg-skeleton-4.0.md`,
 `docs/container/ogg/ogg-skeleton-message-headers.wiki`. The 4.0 page

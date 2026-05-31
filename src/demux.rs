@@ -187,6 +187,14 @@ pub struct OggDemuxer {
     /// for this so callers can read [`OggDemuxer::skeleton`] immediately
     /// after `open` and see every fisbone / index packet.
     skeleton_eos_seen: bool,
+    /// Number of times [`seek_to`](oxideav_core::Demuxer::seek_to)
+    /// satisfied a request directly from a Skeleton 4.0 `index\0` packet
+    /// (`docs/container/ogg/ogg-skeleton-4.0.md`) without paying for
+    /// either page-bisection or the [`build_seek_index`] full-file scan.
+    /// Stays at 0 when no Skeleton index is present for the requested
+    /// stream's serial. Surfaced via
+    /// [`OggDemuxer::skeleton_index_seek_count`].
+    skeleton_index_seeks: u64,
 }
 
 impl OggDemuxer {
@@ -212,6 +220,7 @@ impl OggDemuxer {
             skeleton_pending: Vec::new(),
             skeleton_last_seq: None,
             skeleton_eos_seen: false,
+            skeleton_index_seeks: 0,
         }
     }
 
@@ -593,6 +602,81 @@ impl OggDemuxer {
             .iter()
             .find(|(_, s)| self.streams[s.public_index].index == stream_index)
             .map(|(serial, _)| *serial)
+    }
+
+    /// Number of seek requests this demuxer satisfied directly from a
+    /// Skeleton 4.0 `index\0` keyframe-index packet, bypassing both the
+    /// per-page seek-index `index_floor` check and the bisection
+    /// fallback. The Skeleton spec
+    /// (`docs/container/ogg/ogg-skeleton-4.0.md`) carries an optional
+    /// per-stream `index\0` packet whose keypoints are
+    /// `(byte_offset, timestamp)` pairs in sorted order; when present,
+    /// [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to) finds the
+    /// floor keypoint for the target timestamp in O(log n) and jumps
+    /// straight to its byte offset.
+    ///
+    /// Stays at 0 when no Skeleton index is available for the requested
+    /// stream's serial (every other code path keeps working — only the
+    /// fast-path counter holds). A non-zero value tells callers that a
+    /// previous `seek_to` returned without paying for any page scanning.
+    pub fn skeleton_index_seek_count(&self) -> u64 {
+        self.skeleton_index_seeks
+    }
+
+    /// Resolve `(byte_offset, returned_granule)` from a Skeleton 4.0
+    /// keyframe-index packet for `serial`, if one is present and a
+    /// floor keypoint exists. `target_pts` is the seek target in the
+    /// stream's own time-base units (same as the public
+    /// [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to) contract).
+    /// `time_base` is the stream's time base, used to convert
+    /// `target_pts` into the index's `timestamp_denominator` units.
+    ///
+    /// Returns `None` if any of:
+    ///   * no Skeleton state is recorded;
+    ///   * no `index\0` packet was emitted for `serial`;
+    ///   * the index is empty;
+    ///   * the index's `timestamp_denominator` is non-positive
+    ///     (the spec requires it be positive, but defensively we treat
+    ///     an out-of-range value as "no usable index");
+    ///   * every keypoint sits past `target_pts`.
+    ///
+    /// On `Some`, the caller is expected to seek the input to the
+    /// returned byte offset, flush demuxer buffers, and return the
+    /// granule to its caller.
+    fn skeleton_index_seek(
+        &self,
+        serial: u32,
+        target_pts: i64,
+        time_base: TimeBase,
+    ) -> Option<(u64, i64)> {
+        let sk = self.skeleton.as_ref()?;
+        let index = sk.index_for_serial(serial)?;
+        let denom = index.timestamp_denominator;
+        if denom <= 0 || index.keypoints.is_empty() {
+            return None;
+        }
+        // Convert target_pts (stream time-base units) into the index's
+        // timestamp units (each unit = 1/denom seconds). Both directions
+        // go through `TimeBase::rescale`, which uses 128-bit intermediate
+        // arithmetic to avoid the precision loss of an f64 round-trip.
+        let index_tb = TimeBase::new(1, denom);
+        let target_index_ts = time_base.rescale(target_pts, index_tb);
+        // Find the rightmost keypoint with timestamp <= target_index_ts.
+        // Per spec the keypoints are stored in increasing-offset order
+        // "and thus by presentation time as well", so binary search by
+        // timestamp is well-defined.
+        let kps = &index.keypoints;
+        let idx = match kps.binary_search_by(|kp| kp.timestamp.cmp(&target_index_ts)) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let kp = kps[idx];
+        // Translate the keypoint's index-unit timestamp back into a
+        // stream-granule value so the public seek_to contract
+        // ("returns the actual granule landed on") still holds.
+        let returned_granule = index_tb.rescale(kp.timestamp, time_base);
+        Some((kp.offset, returned_granule))
     }
 
     /// Read pages until we leave the Beginning-Of-Stream section, registering
@@ -1519,6 +1603,30 @@ impl Demuxer for OggDemuxer {
         };
         if file_size == 0 {
             return Err(Error::unsupported("Ogg: empty input"));
+        }
+
+        // Fastest path: if a Skeleton 4.0 `index\0` packet was parsed for
+        // this stream's serial, look up its floor keypoint by timestamp
+        // and jump straight there. No bisection, no `build_seek_index`
+        // pre-scan, no per-page tightening — the index already promises
+        // the keypoint is a valid seek target (per
+        // `docs/container/ogg/ogg-skeleton-4.0.md`). Falls through to
+        // the page-level index_floor / bisection below when no Skeleton
+        // index is available for this stream's serial.
+        let stream_time_base = self.streams[stream_index as usize].time_base;
+        if let Some((off, returned_granule)) =
+            self.skeleton_index_seek(wanted_serial, pts, stream_time_base)
+        {
+            self.input.seek(SeekFrom::Start(off))?;
+            self.page_queue.clear();
+            self.out_queue.clear();
+            for state in self.state_by_serial.values_mut() {
+                state.pending.clear();
+                state.granule_seen = 0;
+            }
+            self.eof_reached = false;
+            self.skeleton_index_seeks = self.skeleton_index_seeks.saturating_add(1);
+            return Ok(returned_granule);
         }
 
         // Fast path: if the seek index already has a `(granule, offset)`
