@@ -381,7 +381,7 @@ do not need the segment table decoded into packets.
 
 A cargo-fuzz harness under `fuzz/` (panic-freedom only, no oracle —
 the clean-room wall bars libogg / Xiph / ffmpeg as cross-decoders)
-hammers four surfaces with attacker bytes:
+hammers five surfaces with attacker bytes:
 
 - `page_parse` — `Page::parse` at every byte offset, plus the
   standalone `crc::validate_page_crc` / `read_page_checksum` /
@@ -411,6 +411,20 @@ hammers four surfaces with attacker bytes:
   large = fabricated hole), and an optional single-byte global
   mutation that triggers CRC-failure resync. The reassembly path
   is therefore reached on essentially every iteration.
+- `skeleton_parse` — Xiph Skeleton 3.0 / 4.0 packet parsers
+  (`FisHead::parse`, `FisBone::parse`, `SkelIndex::parse`) at every
+  byte offset, plus the keypoint variable-byte-integer codec
+  (`read_vbi_u64` / `write_vbi_u64`) and the sniffers
+  (`is_fishead` / `is_fisbone` / `is_index`). A second pass
+  synthesises packets with the correct `fishead\0` / `fisbone\0` /
+  `index\0` prefix from fuzz input so the interior bounds-checking
+  branches inside each parser fire — fully random bytes almost
+  never produce a matching magic, so without the construction pass
+  the inside of these parsers is unreachable. Round-trip
+  equivalence (`parse → to_bytes → parse`) is asserted as a fuzz
+  invariant for FisHead and SkelIndex; FisBone gets fixed-prefix
+  equivalence (the writer normalises the trailing HTTP-style
+  message-header block).
 
 Run from `fuzz/` with `cargo +nightly fuzz run <target>`; no target
 runs as part of the per-PR CI shim (the org reusable workflow does
@@ -465,6 +479,21 @@ no `docs/` fixtures or external `.ogg` files are read. Scenarios:
   Vorbis stream end-to-end via `next_packet`.
 - `demux/build_index/vorbis_12pkt` — the page-header-only scan
   that powers O(log n) `seek_to`.
+- `skeleton/fishead/{parse,to_bytes}` — Skeleton 4.0 `fishead\0`
+  ident packet round-trip (80 bytes: presentation time, basetime,
+  4.0-only segment length + content byte offset).
+- `skeleton/fisbone/{parse,to_bytes}` — `fisbone\0` secondary
+  header carrying the three compulsory 4.0 message-header fields
+  (`Content-Type`, `Role`, `Name`) plus a `Title` extension.
+- `skeleton/index/{parse,to_bytes}_{4kp,64kp,512kp}` — 4.0
+  `index\0` keyframe-index packet at three sizes, driving the
+  `read_vbi_u64` / `write_vbi_u64` codec across the encoder's
+  full 1..10-byte range. The 512-keypoint case is the headline
+  scenario for index-accelerated `seek_to` setup cost on a
+  long-form file.
+- `skeleton/vbi/{write,read}` — raw variable-byte-integer
+  encode + decode in isolation, so each side's throughput is
+  measurable independently of the index packet wrapping.
 
 Run with `cargo bench -p oxideav-ogg --bench framing`. Like the
 cargo-fuzz harness, this is an offline tool — the per-PR CI shim

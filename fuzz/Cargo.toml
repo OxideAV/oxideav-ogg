@@ -12,7 +12,7 @@ cargo-fuzz = true
 # `demux::open` / `open_concrete` / `open_indexed`, the per-stream
 # `Demuxer::next_packet` drain, and granule-position `seek_to` — has
 # to be panic-free on arbitrary attacker bytes: a fuzz crash is a
-# fix, never an `#[ignore]`. This fuzz crate hammers all four entry
+# fix, never an `#[ignore]`. This fuzz crate hammers all five entry
 # points without consulting any external library (clean-room: spec +
 # our own source only — no libogg, no Xiph reference, no ffmpeg).
 
@@ -89,5 +89,25 @@ doc = false
 [[bin]]
 name = "continued_edge"
 path = "fuzz_targets/continued_edge.rs"
+test = false
+doc = false
+
+# Target 5: Xiph Skeleton packet parsers. The previous four targets
+# drive the page layer + packet-reassembly demuxer but don't directly
+# hammer `FisHead::parse` / `FisBone::parse` / `SkelIndex::parse` (the
+# demuxer's Skeleton BOS-walk routes the matching packets to them,
+# but a random-byte input rarely synthesises the `fishead\0` /
+# `fisbone\0` / `index\0` prefix). This target parses arbitrary bytes
+# at every offset, then also synthesises structurally-valid packets
+# out of the input so the bounds-checking branches inside each parser
+# actually fire. Round-trip equivalence (`parse → to_bytes → parse`)
+# is asserted for FisHead and SkelIndex; FisBone gets fixed-prefix
+# equivalence (the writer normalises the trailing HTTP-style
+# message-header block). The Skeleton 4.0 variable-byte-integer codec
+# `read_vbi_u64` / `write_vbi_u64` is also round-tripped on
+# attacker-derived u64 values.
+[[bin]]
+name = "skeleton_parse"
+path = "fuzz_targets/skeleton_parse.rs"
 test = false
 doc = false

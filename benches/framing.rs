@@ -44,6 +44,28 @@
 //! - **`demux/build_index/vorbis_12pkt`** — `open_concrete` + an
 //!   explicit `build_seek_index` over the same blob, measuring the
 //!   page-header scan (no payload reads) that powers O(log n) seeks.
+//! - **`skeleton/fishead/{parse,to_bytes}`** — Skeleton 4.0
+//!   `fishead\0` ident packet (80 bytes) parse + serialize. Covers the
+//!   little-endian rational decoding (presentation time, basetime) and
+//!   the 4.0-only segment-length / content-byte-offset trailing
+//!   fields.
+//! - **`skeleton/fisbone/{parse,to_bytes}`** — Skeleton `fisbone\0`
+//!   secondary header packet carrying the three compulsory 4.0
+//!   message-header fields (`Content-Type`, `Role`, `Name`) plus a
+//!   `Title` extension. Hot path for the demuxer's per-content-stream
+//!   metadata pickup.
+//! - **`skeleton/index/{parse,to_bytes,parse_512kp}`** — Skeleton 4.0
+//!   `index\0` keyframe-index packet at three sizes: a 4-keypoint
+//!   smoke index (one variable-byte-integer pair per entry), a
+//!   64-keypoint index, and a 512-keypoint index that drives the
+//!   `read_vbi_u64` / `write_vbi_u64` codec across the full encoder
+//!   range. This is the headline scenario for index-accelerated
+//!   `seek_to` setup cost on a long-form file.
+//! - **`skeleton/vbi/{write,read}`** — raw `write_vbi_u64` and
+//!   `read_vbi_u64` over a u64 value derived from a deterministic
+//!   xorshift, in isolation, so the encoder-side and decoder-side
+//!   throughput of the variable-byte-integer codec is measurable
+//!   independently of the index packet wrapping.
 //!
 //! Run with:
 //!     cargo bench -p oxideav-ogg --bench framing
@@ -56,6 +78,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use oxideav_core::{CodecId, CodecParameters, Packet, ReadSeek, StreamInfo, TimeBase, WriteSeek};
 use oxideav_ogg::crc::{self, validate_page_crc};
 use oxideav_ogg::page::{self, flags, Page};
+use oxideav_ogg::skeleton::{
+    self, FisBone, FisHead, Rational as SkRational, SkelIndex, Version as SkVersion,
+};
 
 /// Cheap deterministic xorshift32 — fills test buffers with non-zero
 /// non-DC bytes so the CRC loop has to do real table lookups (a pure-
@@ -335,5 +360,119 @@ fn bench_demux(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_crc, bench_page, bench_demux);
+// ---------------------------------------------------------------------------
+// Skeleton bench-input builders.
+// ---------------------------------------------------------------------------
+
+/// Build a Skeleton 4.0 `fishead\0` ident packet (80 bytes) with the
+/// trailing `segment_length` / `content_byte_offset` fields filled in
+/// so the bench exercises the 4.0 branch of `FisHead::parse`.
+fn build_fishead_4_0() -> Vec<u8> {
+    let mut h = FisHead::new(SkVersion::V4_0);
+    h.presentation_time = SkRational::new(0, 1_000);
+    h.basetime = SkRational::new(0, 1_000);
+    h.segment_length = Some(0x1234_5678_9ABC_DEF0);
+    h.content_byte_offset = Some(0x4096);
+    h.utc = *b"20260601T000000.000Z";
+    h.to_bytes()
+}
+
+/// Build a Skeleton `fisbone\0` packet carrying the three compulsory
+/// 4.0 message-header fields plus a `Title` extension. Mirrors what
+/// `tests/skeleton.rs` already builds, but exercised in the bench
+/// harness so the metadata pickup hot path is measurable.
+fn build_fisbone() -> Vec<u8> {
+    let mut b = FisBone::new(0xCAFE_BABE, SkRational::new(48_000, 1));
+    b.num_headers = 3;
+    b.preroll = 2;
+    b.granuleshift = 0;
+    b.set_header("Content-Type", "audio/vorbis");
+    b.set_header("Role", "audio/main");
+    b.set_header("Name", "track 1");
+    b.set_header("Title", "Bench Track");
+    b.to_bytes()
+}
+
+/// Build a Skeleton 4.0 `index\0` keyframe-index packet with `n`
+/// keypoints. Each keypoint advances `(offset, timestamp)` by a
+/// pseudo-random delta so the encoded variable-byte-integer pairs
+/// cover the 1..10-byte range of the codec.
+fn build_index(n: usize) -> Vec<u8> {
+    let mut idx = SkelIndex::new(0xCAFE_BABE, 1_000);
+    let mut state = 0xC0DE_FACEu32;
+    let mut off: u64 = 0;
+    let mut ts: i64 = 0;
+    for _ in 0..n {
+        let d = xorshift32(&mut state);
+        // Mix in a 16..40-bit step so VBI lengths exercise 2..6 bytes
+        // routinely and the occasional 8..10-byte encoding lands too.
+        let off_step = 0x4000 + (d as u64 & 0xFFFF_FFFF);
+        let ts_step = 960 + (d as i64 & 0xFFFF);
+        off = off.wrapping_add(off_step);
+        ts = ts.wrapping_add(ts_step);
+        idx.push(off, ts);
+    }
+    idx.to_bytes()
+}
+
+fn bench_skeleton(c: &mut Criterion) {
+    let mut g = c.benchmark_group("skeleton");
+
+    let fishead = build_fishead_4_0();
+    let fishead_decoded = FisHead::parse(&fishead).expect("parse fishead");
+    g.throughput(Throughput::Bytes(fishead.len() as u64));
+    g.bench_function(BenchmarkId::new("fishead", "parse"), |b| {
+        b.iter(|| FisHead::parse(black_box(&fishead)).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("fishead", "to_bytes"), |b| {
+        b.iter(|| black_box(&fishead_decoded).to_bytes());
+    });
+
+    let fisbone = build_fisbone();
+    let fisbone_decoded = FisBone::parse(&fisbone).expect("parse fisbone");
+    g.throughput(Throughput::Bytes(fisbone.len() as u64));
+    g.bench_function(BenchmarkId::new("fisbone", "parse"), |b| {
+        b.iter(|| FisBone::parse(black_box(&fisbone)).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("fisbone", "to_bytes"), |b| {
+        b.iter(|| black_box(&fisbone_decoded).to_bytes());
+    });
+
+    for &(label, n) in &[("4kp", 4usize), ("64kp", 64), ("512kp", 512)] {
+        let bytes = build_index(n);
+        let decoded = SkelIndex::parse(&bytes).expect("parse index");
+        g.throughput(Throughput::Bytes(bytes.len() as u64));
+        g.bench_function(BenchmarkId::new("index", format!("parse_{label}")), |b| {
+            b.iter(|| SkelIndex::parse(black_box(&bytes)).unwrap());
+        });
+        g.bench_function(
+            BenchmarkId::new("index", format!("to_bytes_{label}")),
+            |b| {
+                b.iter(|| black_box(&decoded).to_bytes());
+            },
+        );
+    }
+
+    // Raw variable-byte-integer codec — encode + decode in isolation,
+    // measured over a deterministic xorshift-derived u64 so every
+    // iteration touches the same value range.
+    let mut state = 0xC0DE_FACEu32;
+    let probe: u64 = ((xorshift32(&mut state) as u64) << 32) | xorshift32(&mut state) as u64;
+    g.bench_function(BenchmarkId::new("vbi", "write"), |b| {
+        b.iter(|| {
+            let mut out = Vec::with_capacity(10);
+            skeleton::write_vbi_u64(&mut out, black_box(probe));
+            out
+        });
+    });
+    let mut encoded = Vec::with_capacity(10);
+    skeleton::write_vbi_u64(&mut encoded, probe);
+    g.bench_function(BenchmarkId::new("vbi", "read"), |b| {
+        b.iter(|| skeleton::read_vbi_u64(black_box(&encoded)).unwrap());
+    });
+
+    g.finish();
+}
+
+criterion_group!(benches, bench_crc, bench_page, bench_demux, bench_skeleton);
 criterion_main!(benches);

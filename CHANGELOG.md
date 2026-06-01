@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton-packet fuzz target + criterion bench coverage.** A
+  fifth cargo-fuzz target, `skeleton_parse`, drives `FisHead::parse`,
+  `FisBone::parse`, `SkelIndex::parse` and the `read_vbi_u64` /
+  `write_vbi_u64` variable-byte-integer codec at every byte offset
+  of attacker input, plus a structured-construction pass that
+  synthesises packets with the correct `fishead\0` / `fisbone\0` /
+  `index\0` magic so the interior bounds-checking branches actually
+  fire. Round-trip equivalence (`parse → to_bytes → parse`) is
+  asserted as a fuzz invariant for FisHead and SkelIndex. The
+  `framing` criterion bench gains a `skeleton/` group covering
+  fishead 4.0 parse/serialize, fisbone parse/serialize, index parse
+  /serialize at 4 / 64 / 512 keypoints (driving the VBI codec
+  across its full encoder range), and the raw VBI write / read
+  paths in isolation — closing the depth-mode "saturated →
+  fuzz/bench" gap on the v0.1.5 Skeleton landing.
 - **Skeleton 4.0 index-accelerated `seek_to`.** When a Xiph
   Skeleton 4.0 `index\0` packet (`docs/container/ogg/ogg-skeleton-4.0.md`)
   was parsed for a content stream's serial, `seek_to` now resolves
