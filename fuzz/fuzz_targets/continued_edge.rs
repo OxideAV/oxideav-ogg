@@ -33,8 +33,7 @@
 //! * Counter accessors `hole_count` / `framing_error_count` /
 //!   `resync_count` after the drain. They are interrogated, not
 //!   compared to ground truth — the only oracle is "must not panic"
-//!   per the clean-room wall (no libogg, no Xiph reference, no
-//!   ffmpeg cross-decoder is allowed).
+//!   per the clean-room wall.
 //!
 //! Soft invariant that IS checked: every delivered packet's
 //! `stream_index` must be inside the bound the demuxer just reported

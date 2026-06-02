@@ -379,9 +379,9 @@ do not need the segment table decoded into packets.
 
 ### Fuzzing
 
-A cargo-fuzz harness under `fuzz/` (panic-freedom only, no oracle —
-the clean-room wall bars libogg / Xiph / ffmpeg as cross-decoders)
-hammers four surfaces with attacker bytes:
+A cargo-fuzz harness under `fuzz/` (panic-freedom only, no
+cross-decoder oracle — the clean-room wall holds at the spec
+and our own source) hammers five surfaces with attacker bytes:
 
 - `page_parse` — `Page::parse` at every byte offset, plus the
   standalone `crc::validate_page_crc` / `read_page_checksum` /
@@ -411,6 +411,24 @@ hammers four surfaces with attacker bytes:
   large = fabricated hole), and an optional single-byte global
   mutation that triggers CRC-failure resync. The reassembly path
   is therefore reached on essentially every iteration.
+- `skeleton_parse` — the four other targets virtually never reach
+  the Skeleton packet parsers because random fuzz buffers almost
+  never begin with `fishead\0` / `fisbone\0` / `index\0`. This
+  target calls [`skeleton::FisHead::parse`],
+  [`skeleton::FisBone::parse`] and [`skeleton::SkelIndex::parse`]
+  directly on the fuzz buffer (asserting inverse-pair equality
+  with `to_bytes` on every successful parse), roundtrips the
+  variable-byte integer codec
+  ([`skeleton::write_vbi_u64`] → [`skeleton::read_vbi_u64`]) on
+  fuzz-derived `u64`s, and also wraps the buffer in a synthetic
+  Skeleton BOS page handed to [`demux::open_concrete`] so the
+  demuxer's auto-detect aggregation (`OggDemuxer::skeleton()`)
+  fires too. The 42-byte `index\0` packet whose on-wire
+  `n_keypoints` field declares a 4-billion-entry table is the
+  prototype case the parser was hardened against: capacity is
+  now clamped by `(packet.len() - 42) / 2` (the minimum two
+  bytes per delta-encoded keypoint) so a tiny attacker packet
+  cannot pre-allocate gigabytes.
 
 Run from `fuzz/` with `cargo +nightly fuzz run <target>`; no target
 runs as part of the per-PR CI shim (the org reusable workflow does

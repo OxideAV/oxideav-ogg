@@ -509,7 +509,21 @@ impl SkelIndex {
         let first_sample_time = i64::from_le_bytes(packet[26..34].try_into().expect("8 bytes"));
         let last_sample_time = i64::from_le_bytes(packet[34..42].try_into().expect("8 bytes"));
 
-        let mut keypoints = Vec::with_capacity(n_keypoints.min(u32::MAX as u64) as usize);
+        // Cap the up-front allocation by the bytes actually remaining in
+        // the packet. Each keypoint is (offset-delta vbi, timestamp-delta
+        // vbi), and the variable-byte integer encoder always emits at
+        // least one byte per integer, so the absolute upper bound on
+        // representable keypoints is `(packet.len() - PREFIX) / 2`. An
+        // attacker-controlled `n_keypoints = u64::MAX` declaring billions
+        // of keypoints in a 42-byte packet would otherwise pre-allocate
+        // tens of gigabytes before the read loop ever discovered the
+        // truncation. The cap is purely a starting capacity; the loop
+        // below still grows the vector if `n_keypoints` is genuinely
+        // achievable.
+        let payload_remaining = packet.len() - PREFIX;
+        let cap_by_bytes = payload_remaining / 2;
+        let init_cap = (n_keypoints as usize).min(cap_by_bytes);
+        let mut keypoints = Vec::with_capacity(init_cap);
         let mut cursor = PREFIX;
         let mut abs_offset: u64 = 0;
         let mut abs_timestamp: i64 = 0;
@@ -853,6 +867,28 @@ mod tests {
         bytes.extend_from_slice(&0i64.to_le_bytes()); // first sample
         bytes.extend_from_slice(&0i64.to_le_bytes()); // last sample
         write_vbi_u64(&mut bytes, 4096); // offset delta only
+        assert!(SkelIndex::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn index_capacity_bounded_by_remaining_payload() {
+        // A 42-byte `index\0` packet whose on-wire `n_keypoints` field
+        // declares u64::MAX must NOT pre-allocate ~96 GB. The parser
+        // bounds the up-front allocation by the remaining payload
+        // length (every delta-encoded keypoint is at least 2 VBI bytes
+        // = 2 bytes total, so a 0-byte remaining payload yields a
+        // 0-capacity vector). The parse itself fails with `Invalid`
+        // because no keypoint bytes are present, but it must fail
+        // *fast* — without an allocation step that the OS rejects.
+        let mut bytes = Vec::with_capacity(42);
+        bytes.extend_from_slice(INDEX_MAGIC);
+        bytes.extend_from_slice(&7u32.to_le_bytes()); // serial
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // attacker n_keypoints
+        bytes.extend_from_slice(&1_000_000i64.to_le_bytes()); // ts denom
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // first sample
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // last sample
+        assert_eq!(bytes.len(), 42);
+        // Must return an error (truncated body), not OOM-abort.
         assert!(SkelIndex::parse(&bytes).is_err());
     }
 

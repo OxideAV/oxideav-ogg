@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton-parser fuzz target.** A fifth cargo-fuzz harness,
+  `skeleton_parse`, hammers `skeleton::FisHead::parse` /
+  `FisBone::parse` / `SkelIndex::parse` directly on attacker
+  bytes, roundtrips them through `to_bytes`, fuzzes the
+  variable-byte integer codec (`write_vbi_u64` → `read_vbi_u64`)
+  on fuzz-derived u64 values, and additionally wraps the buffer
+  in a synthetic Skeleton BOS page handed to
+  `demux::open_concrete` so the demuxer's auto-detect aggregation
+  (`OggDemuxer::skeleton()`) is also exercised. None of the
+  pre-existing four targets (`page_parse`, `demux_recapture`,
+  `granule_walk`, `continued_edge`) reaches the Skeleton parsers
+  reliably — random fuzz buffers virtually never begin with
+  `fishead\0` / `fisbone\0` / `index\0`. Run with
+  `cargo +nightly fuzz run skeleton_parse` from `fuzz/`.
+
 - **Skeleton 4.0 index-accelerated `seek_to`.** When a Xiph
   Skeleton 4.0 `index\0` packet (`docs/container/ogg/ogg-skeleton-4.0.md`)
   was parsed for a content stream's serial, `seek_to` now resolves
@@ -27,6 +42,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index, or any stream whose serial isn't covered by the index).
   Surfaced via `OggDemuxer::skeleton_index_seek_count()` so callers
   and tests can confirm the fast path actually fired.
+
+### Security
+
+- **`SkelIndex::parse` bounded allocation.** The 42-byte
+  `index\0` packet header includes an on-wire `n_keypoints`
+  `u64` count. The previous capacity calculation
+  (`Vec::with_capacity(n_keypoints.min(u32::MAX as u64) as usize)`)
+  trusted that value up to `u32::MAX`, which an attacker could
+  set to ~4 billion in a 42-byte packet — pre-allocating
+  approximately 96 GB of `KeyPoint` storage before the parse
+  loop ever discovered the truncation. The capacity is now
+  clamped by the actual remaining payload bytes
+  (`(packet.len() - 42) / 2`, since each delta-encoded keypoint
+  is a pair of variable-byte integers consuming at minimum two
+  bytes), so a tiny attacker packet declares only a tiny
+  initial allocation and the parse fails with `Error::Invalid`
+  on the truncated body rather than OOM-aborting. New unit
+  test `index_capacity_bounded_by_remaining_payload` locks in
+  the regression bound.
 
 ## [0.1.5](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.4...v0.1.5) - 2026-05-30
 

@@ -10,11 +10,11 @@ cargo-fuzz = true
 # `oxideav-ogg` is the RFC 3533 page-framing + packet-reassembly +
 # multi-stream demuxer / muxer. Its public surface — `Page::parse`,
 # `demux::open` / `open_concrete` / `open_indexed`, the per-stream
-# `Demuxer::next_packet` drain, and granule-position `seek_to` — has
-# to be panic-free on arbitrary attacker bytes: a fuzz crash is a
-# fix, never an `#[ignore]`. This fuzz crate hammers all four entry
-# points without consulting any external library (clean-room: spec +
-# our own source only — no libogg, no Xiph reference, no ffmpeg).
+# `Demuxer::next_packet` drain, granule-position `seek_to`, and the
+# Skeleton 3.0 / 4.0 packet parsers — has to be panic-free on
+# arbitrary attacker bytes: a fuzz crash is a fix, never an
+# `#[ignore]`. This fuzz crate hammers all five entry points under
+# the clean-room wall (spec + our own source only).
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -89,5 +89,25 @@ doc = false
 [[bin]]
 name = "continued_edge"
 path = "fuzz_targets/continued_edge.rs"
+test = false
+doc = false
+
+# Target 5: Skeleton 3.0 / 4.0 packet parsers. Targets 1-4 feed
+# arbitrary bytes or a Vorbis-shaped construction; neither path
+# reliably reaches `skeleton::FisHead::parse` /
+# `skeleton::FisBone::parse` / `skeleton::SkelIndex::parse`
+# (random buffers virtually never begin with `fishead\0` /
+# `fisbone\0` / `index\0`). This target calls each parser
+# directly on the fuzz buffer, roundtrips the result through
+# `to_bytes`, hammers `read_vbi_u64` / `write_vbi_u64` with
+# fuzz-derived u64s, and also wraps the buffer in a synthetic
+# Skeleton BOS page fed to `demux::open_concrete` so the
+# auto-detect path is exercised. The 42-byte `index\0` packet
+# with attacker-controlled `n_keypoints` is the priority case —
+# the parser must not pre-allocate based on the on-wire count
+# without bounding it by remaining input.
+[[bin]]
+name = "skeleton_parse"
+path = "fuzz_targets/skeleton_parse.rs"
 test = false
 doc = false
