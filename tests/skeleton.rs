@@ -600,3 +600,249 @@ fn skeleton_detector_helpers_match_magic_bytes() {
     assert!(!skeleton::is_fisbone(b"OggS"));
     assert!(!skeleton::is_index(b"fishead\0"));
 }
+
+// --- Skeleton 4.0 index-validity checks ------------------------------------
+// `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for faster
+// seeking" lists three conditions under which the index must be treated
+// as invalid and the seek must fall back to bisection:
+//
+//   1. The segment doesn't end at the segment length offset stored in
+//      the Skeleton BOS packet.
+//   2. After a seek to a keypoint's offset, you don't land exactly on
+//      a page boundary.
+//   3. After a seek to a keypoint's offset, you don't land on a page
+//      which belongs to that keypoint's stream.
+//
+// Each of the three tests below patches a freshly-built fixture to
+// exercise one of those rejection paths, then asserts:
+//   * `skeleton_index_seek_count()` does NOT advance (fast path skipped),
+//   * `skeleton_index_invalid_count()` DOES advance by 1,
+//   * `seek_to` still returns Ok (bisection fallback succeeded).
+
+#[test]
+fn skeleton_index_rejected_on_segment_length_mismatch() {
+    // Build a clean fixture, then overwrite the fishead's segment_length
+    // field with a value that disagrees with the file size. The BOS
+    // page CRC covers the fishead body, so we must parse the BOS page
+    // FIRST (on clean bytes), edit `page.data` (the fishead packet),
+    // and emit a fresh page with the new CRC.
+    let (mut bytes, _expected) = build_skeleton_indexed_seek_ogg();
+    let bogus: u64 = 999_999_999;
+    let new_bos = {
+        let (mut page, consumed) =
+            oxideav_ogg::page::Page::parse(&bytes).expect("BOS reparse on clean bytes");
+        // The fishead packet payload is `page.data`. The segment_length
+        // field sits at bytes 64..72 of the packet.
+        page.data[64..72].copy_from_slice(&bogus.to_le_bytes());
+        let refreshed = page.to_bytes();
+        assert_eq!(refreshed.len(), consumed);
+        refreshed
+    };
+    bytes[..new_bos.len()].copy_from_slice(&new_bos);
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    let sk = dmx.skeleton().expect("Skeleton present");
+    assert_eq!(
+        sk.head.as_ref().unwrap().segment_length,
+        Some(bogus),
+        "patched segment_length parsed back"
+    );
+    assert_eq!(dmx.skeleton_index_seek_count(), 0);
+    assert_eq!(dmx.skeleton_index_invalid_count(), 0);
+
+    // Seek to a target that would normally hit the fast path's middle
+    // keypoint. The segment-length check must invalidate the whole
+    // index → fast-path counter stays at 0, reject counter ticks to 1,
+    // and the seek still completes successfully via bisection.
+    let _ = oxideav_core::Demuxer::seek_to(&mut dmx, 0, 1200).expect("seek ok");
+    assert_eq!(
+        dmx.skeleton_index_seek_count(),
+        0,
+        "segment_length mismatch must disable the fast path"
+    );
+    assert_eq!(
+        dmx.skeleton_index_invalid_count(),
+        1,
+        "rejection counter ticks once per disqualified seek"
+    );
+
+    // A second seek against the same file must also stay on the slow
+    // path AND must tick the reject counter again (the cached
+    // segment-length verdict is "no", so every subsequent seek that
+    // would have hit the fast path is counted as another rejection).
+    let _ = oxideav_core::Demuxer::seek_to(&mut dmx, 0, 1440).expect("seek ok");
+    assert_eq!(dmx.skeleton_index_seek_count(), 0);
+    assert_eq!(dmx.skeleton_index_invalid_count(), 2);
+}
+
+#[test]
+fn skeleton_index_segment_length_match_keeps_fast_path() {
+    // Same fixture, but patch segment_length to the ACTUAL file size.
+    // Per spec this is the "trusted index" case — fast path must fire.
+    let (mut bytes, expected_keypoints) = build_skeleton_indexed_seek_ogg();
+    let actual = bytes.len() as u64;
+    // Parse + edit + re-emit the BOS page so the CRC matches the
+    // edited fishead. Same shape as the mismatch test above.
+    let new_bos = {
+        let (mut page, consumed) =
+            oxideav_ogg::page::Page::parse(&bytes).expect("BOS reparse on clean bytes");
+        page.data[64..72].copy_from_slice(&actual.to_le_bytes());
+        let refreshed = page.to_bytes();
+        assert_eq!(refreshed.len(), consumed);
+        refreshed
+    };
+    bytes[..new_bos.len()].copy_from_slice(&new_bos);
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    assert_eq!(
+        dmx.skeleton()
+            .unwrap()
+            .head
+            .as_ref()
+            .unwrap()
+            .segment_length,
+        Some(actual)
+    );
+
+    let landed = oxideav_core::Demuxer::seek_to(&mut dmx, 0, 1200).expect("seek ok");
+    assert_eq!(landed, expected_keypoints[1].1);
+    assert_eq!(
+        dmx.skeleton_index_seek_count(),
+        1,
+        "matching segment_length keeps the fast path armed"
+    );
+    assert_eq!(dmx.skeleton_index_invalid_count(), 0);
+}
+
+#[test]
+fn skeleton_index_rejected_on_keypoint_offset_not_on_page_boundary() {
+    // Build a fresh fixture but patch the first keypoint's stored byte
+    // offset to a value that is NOT at a page boundary. The simplest
+    // way is to rebuild the index packet with a deliberately-corrupt
+    // first offset and re-emit just that page. Easier still: corrupt
+    // the keypoint's offset delta on the wire by adding 1 to the first
+    // VBI byte of the index packet's keypoint section, then re-CRC
+    // the index page.
+    //
+    // The keypoint offsets are unsigned and encoded as deltas — adding
+    // 1 to the first delta shifts every subsequent keypoint by +1 too,
+    // which lands every keypoint between two pages instead of on a
+    // page header. That's exactly the rejection case the spec calls
+    // out as "you don't land exactly on a page boundary".
+    let (mut bytes, _expected) = build_skeleton_indexed_seek_ogg();
+
+    // Walk the file to find the index page (Skeleton serial,
+    // seq_no = 2). Parse it cleanly first, then corrupt its first
+    // keypoint's offset delta in the parsed packet, then re-emit the
+    // page (which recomputes the CRC) and splice it back into `bytes`.
+    let mut cursor = 0usize;
+    let mut patched = false;
+    while cursor < bytes.len() {
+        if cursor + 27 > bytes.len() || &bytes[cursor..cursor + 4] != b"OggS" {
+            cursor += 1;
+            continue;
+        }
+        let (mut page, consumed) = oxideav_ogg::page::Page::parse(&bytes[cursor..])
+            .expect("page reparse on clean fixture");
+        if page.serial == SKEL_SERIAL && page.seq_no == 2 {
+            // The body is the Skeleton index packet; keypoints start
+            // at byte 42. Shift the very first VBI offset-delta byte
+            // up by 1 so every keypoint's reconstructed offset is +1
+            // (off the page boundary by one byte).
+            assert!(
+                page.data.len() >= 43,
+                "index packet must include at least one keypoint VBI byte"
+            );
+            let kp_byte = &mut page.data[42];
+            assert!(
+                (*kp_byte & 0x7F) < 0x7F,
+                "no carry expected for fixture sizes"
+            );
+            *kp_byte = (*kp_byte & 0x80) | ((*kp_byte & 0x7F) + 1);
+            let refreshed = page.to_bytes();
+            assert_eq!(refreshed.len(), consumed);
+            bytes[cursor..cursor + consumed].copy_from_slice(&refreshed);
+            patched = true;
+            break;
+        }
+        cursor += consumed;
+    }
+    assert!(patched, "index page must have been found and patched");
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+
+    let _ = oxideav_core::Demuxer::seek_to(&mut dmx, 0, 1200).expect("seek ok");
+    assert_eq!(
+        dmx.skeleton_index_seek_count(),
+        0,
+        "off-page-boundary keypoint must disable the fast path"
+    );
+    assert_eq!(
+        dmx.skeleton_index_invalid_count(),
+        1,
+        "per-keypoint rejection ticks the diagnostic counter"
+    );
+}
+
+#[test]
+fn skeleton_index_rejected_on_keypoint_offset_belongs_to_other_stream() {
+    // Build a Skeleton 4.0 fixture whose index points at a page
+    // belonging to a DIFFERENT stream's serial. We synthesise a second
+    // (mostly-empty) Vorbis-like stream alongside the real one and
+    // direct the keypoint at THAT stream's page.
+    //
+    // Strategy: take the clean fixture, locate the first Vorbis data
+    // page (serial = VORBIS_SERIAL, granule = 480), and overwrite its
+    // serial field to a fake one. After the BOS section the demuxer
+    // will not have a registration for the fake serial, but for the
+    // purposes of the validity check we only need the page-header
+    // serial at the keypoint offset to disagree with VORBIS_SERIAL.
+    let (mut bytes, expected_keypoints) = build_skeleton_indexed_seek_ogg();
+    let first_kp_off = expected_keypoints[0].0 as usize;
+    assert_eq!(
+        &bytes[first_kp_off..first_kp_off + 4],
+        b"OggS",
+        "clean keypoint lands on a page header"
+    );
+    // Parse the keypoint page cleanly, mutate its serial in the parsed
+    // struct, re-emit (which recomputes the CRC), and splice back.
+    // Overwriting the serial bytes in place would invalidate the CRC
+    // and the demuxer's BOS-section walk would reject the page during
+    // open(); the validity check we're testing runs from seek_to.
+    let bogus_serial: u32 = 0xDEAD_FACE;
+    {
+        let (mut page, consumed) =
+            oxideav_ogg::page::Page::parse(&bytes[first_kp_off..]).expect("kp page reparse");
+        page.serial = bogus_serial;
+        let refreshed = page.to_bytes();
+        assert_eq!(refreshed.len(), consumed);
+        bytes[first_kp_off..first_kp_off + consumed].copy_from_slice(&refreshed);
+    }
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+
+    // Ask for a target that resolves to the first keypoint. Per
+    // build_skeleton_indexed_seek_ogg keypoint 0 is granule 480, and
+    // anything in [0, 960) lands on that keypoint via the index
+    // (well, anything >= the first keypoint's timestamp does — pts=480
+    // is the exact match).
+    let _ = oxideav_core::Demuxer::seek_to(&mut dmx, 0, 480).expect("seek ok");
+    assert_eq!(
+        dmx.skeleton_index_seek_count(),
+        0,
+        "keypoint-on-wrong-serial must disable the fast path"
+    );
+    assert_eq!(
+        dmx.skeleton_index_invalid_count(),
+        1,
+        "per-keypoint rejection ticks the diagnostic counter"
+    );
+}

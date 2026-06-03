@@ -195,6 +195,31 @@ pub struct OggDemuxer {
     /// stream's serial. Surfaced via
     /// [`OggDemuxer::skeleton_index_seek_count`].
     skeleton_index_seeks: u64,
+    /// Number of times the Skeleton 4.0 fast-path keypoint was rejected
+    /// because the per-spec validity checks failed
+    /// (`docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
+    /// faster seeking" — three conditions: segment length mismatch,
+    /// keypoint offset not on a page boundary, keypoint offset's page
+    /// belongs to a different serial). Each rejection forces the seek
+    /// to fall back to the page-level index_floor / bisection path,
+    /// which is correct but pays the slower I/O cost. A non-zero count
+    /// surfaces "this file's Skeleton index is stale or corrupted"
+    /// without losing the seek result. Surfaced via
+    /// [`OggDemuxer::skeleton_index_invalid_count`].
+    skeleton_index_rejects: u64,
+    /// Cached result of validating the Skeleton 4.0 BOS `Segment length
+    /// in bytes` field against the actual file length. Computed lazily
+    /// on the first [`Demuxer::seek_to`] call after `open`, then reused
+    /// across subsequent calls.
+    ///
+    /// * `None` — not yet computed, or no Skeleton / no 4.0 segment-length
+    ///   field present (3.0 streams; 4.0 streams that left segment_length
+    ///   at 0 to opt out of this check).
+    /// * `Some(true)` — segment-length matches the file, index believed
+    ///   trustworthy at the file level.
+    /// * `Some(false)` — segment-length mismatches the file, the spec
+    ///   says the index is invalid; fast path is skipped.
+    skeleton_segment_length_ok: Option<bool>,
 }
 
 impl OggDemuxer {
@@ -221,6 +246,8 @@ impl OggDemuxer {
             skeleton_last_seq: None,
             skeleton_eos_seen: false,
             skeleton_index_seeks: 0,
+            skeleton_index_rejects: 0,
+            skeleton_segment_length_ok: None,
         }
     }
 
@@ -621,6 +648,102 @@ impl OggDemuxer {
     /// previous `seek_to` returned without paying for any page scanning.
     pub fn skeleton_index_seek_count(&self) -> u64 {
         self.skeleton_index_seeks
+    }
+
+    /// Number of times a [`Demuxer::seek_to`] call attempted the
+    /// Skeleton 4.0 fast path but found the per-spec validity checks
+    /// failed and fell back to the page-level
+    /// [`index_floor`](OggDemuxer) / bisection path.
+    ///
+    /// Per `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes
+    /// for faster seeking" the three rejection conditions are:
+    ///
+    /// 1. The `fishead` BOS packet's *Segment length in bytes* field
+    ///    (bytes 64..72) disagrees with the actual file size, meaning
+    ///    the indexed segment has been rewritten or chained against
+    ///    since the index was built.
+    /// 2. After seeking to a keypoint's stored offset, the bytes there
+    ///    do not start with the `OggS` capture pattern — the keypoint
+    ///    no longer lands on a page boundary.
+    /// 3. After seeking to a keypoint's stored offset, the page there
+    ///    is from a different `bitstream_serial_number` than the
+    ///    keypoint's `index\0` packet declares — the stream layout has
+    ///    shifted under the index.
+    ///
+    /// Each rejection counts once. The seek itself still completes via
+    /// the slower bisection path, so the counter is purely diagnostic.
+    /// A value of 0 across a long run means every Skeleton index seen
+    /// has been internally consistent with its file.
+    pub fn skeleton_index_invalid_count(&self) -> u64 {
+        self.skeleton_index_rejects
+    }
+
+    /// Lazily validate the Skeleton 4.0 BOS `Segment length in bytes`
+    /// field against the actual file length, caching the result.
+    ///
+    /// Returns `true` if the index is allowed to fire at the file level:
+    ///   * no Skeleton state is recorded, or
+    ///   * the recorded `fishead` is a 3.0 header (no segment_length
+    ///     field at all — fall back to per-seek keypoint validation), or
+    ///   * a 4.0 header has `segment_length = 0` (encoder opted out of
+    ///     this check), or
+    ///   * the recorded segment_length equals the file size.
+    ///
+    /// Returns `false` only when a 4.0 fishead recorded a non-zero
+    /// segment_length and that length doesn't match the file. Per the
+    /// 4.0 spec ("if it doesn't match the length stored in the Skeleton
+    /// header packet, you know that either the index is out of date,
+    /// or the file has been chained since indexing") that is a hard
+    /// disqualification of the entire Skeleton index — every index in
+    /// every fisbone is treated as untrusted, and seeks fall through to
+    /// bisection.
+    fn skeleton_segment_length_check(&mut self, file_size: u64) -> bool {
+        if let Some(cached) = self.skeleton_segment_length_ok {
+            return cached;
+        }
+        let ok = match self.skeleton.as_ref().and_then(|s| s.head.as_ref()) {
+            // No Skeleton, no head, or 3.0 head (no segment_length field):
+            // there's nothing to disprove at the file level.
+            None => true,
+            Some(h) => match h.segment_length {
+                None | Some(0) => true,
+                Some(declared) => declared == file_size,
+            },
+        };
+        self.skeleton_segment_length_ok = Some(ok);
+        ok
+    }
+
+    /// Verify that the bytes at `offset` start an Ogg page whose
+    /// `bitstream_serial_number` equals `expected_serial`. Used to
+    /// implement the Skeleton 4.0 per-seek validity check ("after a
+    /// seek to a keypoint's offset, you don't land exactly on a page
+    /// boundary" / "you don't land on a page which belongs to that
+    /// keypoint's stream"; `docs/container/ogg/ogg-skeleton-4.0.md`).
+    ///
+    /// Only the 27-byte page header is read; the segment table and
+    /// body are not consulted. Returns `false` on any I/O error so the
+    /// caller falls back to bisection without surfacing transient
+    /// failures as seek errors.
+    fn verify_keypoint_landing(&mut self, offset: u64, expected_serial: u32) -> bool {
+        if self.input.seek(SeekFrom::Start(offset)).is_err() {
+            return false;
+        }
+        let mut hdr = [0u8; 27];
+        let mut filled = 0usize;
+        while filled < hdr.len() {
+            match self.input.read(&mut hdr[filled..]) {
+                Ok(0) => return false,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
+        if hdr[0..4] != page::CAPTURE_PATTERN {
+            return false;
+        }
+        let serial = u32::from_le_bytes([hdr[14], hdr[15], hdr[16], hdr[17]]);
+        serial == expected_serial
     }
 
     /// Resolve `(byte_offset, returned_granule)` from a Skeleton 4.0
@@ -1608,25 +1731,68 @@ impl Demuxer for OggDemuxer {
         // Fastest path: if a Skeleton 4.0 `index\0` packet was parsed for
         // this stream's serial, look up its floor keypoint by timestamp
         // and jump straight there. No bisection, no `build_seek_index`
-        // pre-scan, no per-page tightening — the index already promises
-        // the keypoint is a valid seek target (per
+        // pre-scan, no per-page tightening — the index promises the
+        // keypoint is a valid seek target (per
         // `docs/container/ogg/ogg-skeleton-4.0.md`). Falls through to
         // the page-level index_floor / bisection below when no Skeleton
-        // index is available for this stream's serial.
+        // index is available for this stream's serial, OR when the
+        // index fails the three per-spec validity checks:
+        //
+        //   1. `fishead` `Segment length in bytes` matches the file size
+        //      (a one-shot lazy check on the first seek call);
+        //   2. the keypoint's stored offset lands on an `OggS` page
+        //      boundary;
+        //   3. that page's `bitstream_serial_number` equals the
+        //      keypoint's stream serial.
+        //
+        // Per the spec ("Be aware that you cannot assume that any or all
+        // Ogg files will contain keyframe indexes, so when implementing
+        // Ogg seeking, you must gracefully fall-back to a bisection
+        // search or other seek algorithm when the index is not present,
+        // or when it is invalid.") a failed check is silent — the
+        // fall-through bisection still returns the right answer, just
+        // more slowly. `skeleton_index_invalid_count()` exposes the
+        // running tally of rejections for diagnostics.
         let stream_time_base = self.streams[stream_index as usize].time_base;
-        if let Some((off, returned_granule)) =
-            self.skeleton_index_seek(wanted_serial, pts, stream_time_base)
-        {
-            self.input.seek(SeekFrom::Start(off))?;
-            self.page_queue.clear();
-            self.out_queue.clear();
-            for state in self.state_by_serial.values_mut() {
-                state.pending.clear();
-                state.granule_seen = 0;
+        if self.skeleton_segment_length_check(file_size) {
+            if let Some((off, returned_granule)) =
+                self.skeleton_index_seek(wanted_serial, pts, stream_time_base)
+            {
+                if self.verify_keypoint_landing(off, wanted_serial) {
+                    self.input.seek(SeekFrom::Start(off))?;
+                    self.page_queue.clear();
+                    self.out_queue.clear();
+                    for state in self.state_by_serial.values_mut() {
+                        state.pending.clear();
+                        state.granule_seen = 0;
+                    }
+                    self.eof_reached = false;
+                    self.skeleton_index_seeks = self.skeleton_index_seeks.saturating_add(1);
+                    return Ok(returned_granule);
+                } else {
+                    // Per-keypoint validity check failed: the bytes at
+                    // `off` are not an `OggS` page belonging to the
+                    // requested serial. The seek MUST still complete via
+                    // bisection — reset to a known-good position before
+                    // falling through.
+                    self.skeleton_index_rejects = self.skeleton_index_rejects.saturating_add(1);
+                    self.input.seek(SeekFrom::Start(0))?;
+                }
             }
-            self.eof_reached = false;
-            self.skeleton_index_seeks = self.skeleton_index_seeks.saturating_add(1);
-            return Ok(returned_granule);
+        } else {
+            // Segment-length disagreement: per spec the whole Skeleton
+            // index is untrusted. Count one rejection regardless of
+            // whether a floor keypoint would have been found, so the
+            // diagnostic counter reflects "we skipped the fast path
+            // because of this file's BOS-level mismatch".
+            if self
+                .skeleton
+                .as_ref()
+                .and_then(|s| s.index_for_serial(wanted_serial))
+                .is_some()
+            {
+                self.skeleton_index_rejects = self.skeleton_index_rejects.saturating_add(1);
+            }
         }
 
         // Fast path: if the seek index already has a `(granule, offset)`

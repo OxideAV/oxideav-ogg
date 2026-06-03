@@ -264,6 +264,30 @@ Skeleton index — Skeleton 3.0 streams, 4.0 streams that omit the
 index, or seeks against a stream whose serial is uncovered — fall
 back to the existing bisection path unchanged.
 
+Before the fast path commits to a keypoint, the demuxer runs the
+three validity checks the Skeleton 4.0 spec requires (per
+`docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
+faster seeking"):
+
+1. the `fishead` BOS packet's *Segment length in bytes* field equals
+   the actual file size (a one-shot lazy check on the first seek;
+   encoders that left this field at `0` opt out, which is the
+   prevailing pattern);
+2. the keypoint's stored byte offset starts an `OggS` capture
+   pattern (i.e. it lands on a page boundary, not mid-payload);
+3. the page at that offset has `bitstream_serial_number` equal to
+   the keypoint's stream serial.
+
+A failed check silently disables the fast path for the call and
+falls through to the existing page-level `index_floor` / bisection
+seek — the seek itself still completes correctly, just paying the
+slower I/O cost. The number of rejections (per spec: "you must
+gracefully fall-back to a bisection search or other seek algorithm
+when the index is not present, or when it is invalid") is exposed
+on `OggDemuxer::skeleton_index_invalid_count()` so callers can
+surface "this file's Skeleton index is stale" diagnostics without
+losing the seek.
+
 Spec reference: `docs/container/ogg/ogg-skeleton-3.0.md`,
 `docs/container/ogg/ogg-skeleton-4.0.md`,
 `docs/container/ogg/ogg-skeleton-message-headers.wiki`. The 4.0 page

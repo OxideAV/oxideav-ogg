@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton 4.0 index-validity gating in the fast-path `seek_to`.**
+  `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
+  faster seeking" requires that a decoder treat a Skeleton 4.0
+  keyframe index as invalid (and fall back to bisection) under any
+  of three conditions: the `fishead` BOS `Segment length in bytes`
+  field disagrees with the actual file size; a keypoint's stored
+  byte offset does not land on a page boundary; or that page's
+  `bitstream_serial_number` is not the keypoint's stream serial.
+  Prior to this release the Ogg demuxer trusted every Skeleton 4.0
+  index it parsed, which means a stale or rewritten file would
+  silently jump to junk bytes and a content-mismatched offset
+  would land on the wrong stream. `OggDemuxer::seek_to` now runs
+  all three checks: (1) a one-shot lazy comparison of the
+  recorded `segment_length` against `file_size` (encoders that
+  leave `segment_length = 0` opt out of this check, which is the
+  prevailing pattern for indexers that don't pre-measure); (2) a
+  per-keypoint `OggS`-capture-pattern check at the candidate
+  offset; (3) a serial-equality check against the page header
+  parsed at that same offset. A failed check is silent — the
+  seek still completes via the existing page-level `index_floor`
+  / bisection path — but rejections are tallied by the new
+  `OggDemuxer::skeleton_index_invalid_count()` accessor so callers
+  can surface "this file's index is stale" without losing the
+  seek result.
+
 - **Skeleton-parser fuzz target.** A fifth cargo-fuzz harness,
   `skeleton_parse`, hammers `skeleton::FisHead::parse` /
   `FisBone::parse` / `SkelIndex::parse` directly on attacker
