@@ -846,3 +846,328 @@ fn skeleton_index_rejected_on_keypoint_offset_belongs_to_other_stream() {
         "per-keypoint rejection ticks the diagnostic counter"
     );
 }
+
+const VORBIS_SERIAL_A: u32 = 0x12345678;
+const VORBIS_SERIAL_B: u32 = 0x9ABCDEF0;
+
+/// Build a multiplexed Ogg file with Skeleton 4.0 + two concurrent
+/// Vorbis streams (A and B), each with its own Skeleton `index\0`
+/// packet. Stream A has frequent keypoints (every data page); stream
+/// B has a single sparse keypoint at its first data page. Returns the
+/// file bytes plus the absolute byte offset of stream B's first data
+/// page (= B's sole keypoint offset, which must win the multi-stream
+/// minimisation when seeking on stream A to a later target) plus
+/// every stream-A keypoint as a `(byte_offset, granule)` pair.
+///
+/// Used by `skeleton_index_seek_minimises_offset_across_streams` to
+/// exercise the Skeleton 4.0 spec rule
+/// (`docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
+/// faster seeking"): "first construct the set which contains every
+/// active streams' last keypoint which has time less than or equal to
+/// the seek target time. … from that set of key points, select the
+/// key point with the smallest byte offset."
+fn build_skeleton_multi_stream_indexed_ogg() -> (Vec<u8>, u64, Vec<(u64, i64)>) {
+    let v_id_a = vorbis_id_packet(2, 48_000);
+    let v_id_b = vorbis_id_packet(1, 48_000);
+    let v_comment_a = vorbis_comment_packet();
+    let v_comment_b = vorbis_comment_packet();
+    let v_setup_a = vorbis_setup_packet();
+    let v_setup_b = vorbis_setup_packet();
+
+    // Stream A: 4 data pages, granules 480, 960, 1440, 1920.
+    let data_packets_a: Vec<Vec<u8>> = vec![
+        (0..40u8).collect(),
+        (40..120u8).collect(),
+        (0..200u8).collect(),
+        (0..50u8).collect(),
+    ];
+    let data_granules_a: Vec<i64> = vec![480, 960, 1440, 1920];
+
+    // Stream B: 2 data pages, granules 480 and 1920. Sparse — only the
+    // first is indexed.
+    let data_packets_b: Vec<Vec<u8>> = vec![(0..60u8).collect(), (0..80u8).collect()];
+    let data_granules_b: Vec<i64> = vec![480, 1920];
+
+    let mut head = FisHead::new(Version::V4_0);
+    head.presentation_time = Rational::new(0, 1000);
+    head.basetime = Rational::new(0, 1000);
+    // Opt out of the segment-length check so we exercise the
+    // multi-stream rule independently of that diagnostic path.
+    head.segment_length = Some(0);
+    head.content_byte_offset = Some(0);
+    let head_packet = head.to_bytes();
+
+    let mut bone_a = FisBone::new(VORBIS_SERIAL_A, Rational::new(48_000, 1));
+    bone_a.num_headers = 3;
+    bone_a.set_header("Content-Type", "audio/vorbis");
+    bone_a.set_header("Role", "audio/main");
+    bone_a.set_header("Name", "stream_a");
+    let bone_a_packet = bone_a.to_bytes();
+
+    let mut bone_b = FisBone::new(VORBIS_SERIAL_B, Rational::new(48_000, 1));
+    bone_b.num_headers = 3;
+    bone_b.set_header("Content-Type", "audio/vorbis");
+    bone_b.set_header("Role", "audio/alternate");
+    bone_b.set_header("Name", "stream_b");
+    let bone_b_packet = bone_b.to_bytes();
+
+    // Pre-compute the header section so we know where data pages start.
+    let mut header_section = Vec::new();
+    header_section.extend_from_slice(&single_packet_page(
+        &head_packet,
+        flags::FIRST_PAGE,
+        SKEL_SERIAL,
+        0,
+        0,
+    ));
+    header_section.extend_from_slice(&single_packet_page(
+        &v_id_a,
+        flags::FIRST_PAGE,
+        VORBIS_SERIAL_A,
+        0,
+        0,
+    ));
+    header_section.extend_from_slice(&single_packet_page(
+        &v_id_b,
+        flags::FIRST_PAGE,
+        VORBIS_SERIAL_B,
+        0,
+        0,
+    ));
+    header_section.extend_from_slice(&single_packet_page(&v_comment_a, 0, VORBIS_SERIAL_A, 1, 0));
+    header_section.extend_from_slice(&single_packet_page(&v_comment_b, 0, VORBIS_SERIAL_B, 1, 0));
+    header_section.extend_from_slice(&single_packet_page(&bone_a_packet, 0, SKEL_SERIAL, 1, 0));
+    header_section.extend_from_slice(&single_packet_page(&bone_b_packet, 0, SKEL_SERIAL, 2, 0));
+
+    let setup_a_size = 27 + oxideav_ogg::page::lace(v_setup_a.len()).len() + v_setup_a.len();
+    let setup_b_size = 27 + oxideav_ogg::page::lace(v_setup_b.len()).len() + v_setup_b.len();
+    let skel_eos_page_size = 27 + 1;
+    let data_a_sizes: Vec<usize> = data_packets_a
+        .iter()
+        .map(|p| 27 + oxideav_ogg::page::lace(p.len()).len() + p.len())
+        .collect();
+    let data_b_sizes: Vec<usize> = data_packets_b
+        .iter()
+        .map(|p| 27 + oxideav_ogg::page::lace(p.len()).len() + p.len())
+        .collect();
+
+    let denom: i64 = 1_000_000;
+    let granule_to_index_ts = |g: i64| -> i64 { g * denom / 48_000 };
+
+    // Data-page interleaving: A[0], B[0], A[1], A[2], B[1], A[3].
+    //
+    // Fixed-point converge on the index-page sizes: the keypoint
+    // offsets depend on the index sizes, and the index sizes depend
+    // on the keypoint offsets (because the VBI delta encoding's byte
+    // length scales with offset magnitude).
+    let mut idx_a_page_size: usize = 100;
+    let mut idx_b_page_size: usize = 64;
+    let (idx_a_packet, idx_b_packet, expected_keypoints_a, b_first_data_offset) = loop {
+        let pre_data = header_section.len()
+            + idx_a_page_size
+            + idx_b_page_size
+            + setup_a_size
+            + setup_b_size
+            + skel_eos_page_size;
+        let mut pos = pre_data;
+        let a0 = pos;
+        pos += data_a_sizes[0];
+        let b0 = pos;
+        pos += data_b_sizes[0];
+        let a1 = pos;
+        pos += data_a_sizes[1];
+        let a2 = pos;
+        pos += data_a_sizes[2];
+        let _b1 = pos;
+        pos += data_b_sizes[1];
+        let a3 = pos;
+
+        let mut idx_a = SkelIndex::new(VORBIS_SERIAL_A, denom);
+        idx_a.first_sample_time = 0;
+        idx_a.last_sample_time = granule_to_index_ts(*data_granules_a.last().unwrap());
+        idx_a.push(a0 as u64, granule_to_index_ts(data_granules_a[0]));
+        idx_a.push(a1 as u64, granule_to_index_ts(data_granules_a[1]));
+        idx_a.push(a2 as u64, granule_to_index_ts(data_granules_a[2]));
+        idx_a.push(a3 as u64, granule_to_index_ts(data_granules_a[3]));
+        let idx_a_bytes = idx_a.to_bytes();
+
+        let mut idx_b = SkelIndex::new(VORBIS_SERIAL_B, denom);
+        idx_b.first_sample_time = 0;
+        idx_b.last_sample_time = granule_to_index_ts(*data_granules_b.last().unwrap());
+        idx_b.push(b0 as u64, granule_to_index_ts(data_granules_b[0]));
+        let idx_b_bytes = idx_b.to_bytes();
+
+        let new_a_size = 27 + oxideav_ogg::page::lace(idx_a_bytes.len()).len() + idx_a_bytes.len();
+        let new_b_size = 27 + oxideav_ogg::page::lace(idx_b_bytes.len()).len() + idx_b_bytes.len();
+        if new_a_size == idx_a_page_size && new_b_size == idx_b_page_size {
+            let expected_a: Vec<(u64, i64)> = vec![
+                (a0 as u64, data_granules_a[0]),
+                (a1 as u64, data_granules_a[1]),
+                (a2 as u64, data_granules_a[2]),
+                (a3 as u64, data_granules_a[3]),
+            ];
+            break (idx_a_bytes, idx_b_bytes, expected_a, b0 as u64);
+        }
+        idx_a_page_size = new_a_size;
+        idx_b_page_size = new_b_size;
+    };
+
+    // Assemble: header section, idx_a page, idx_b page, setup_a,
+    // setup_b, Skeleton EOS, interleaved data pages.
+    let mut out = header_section;
+    out.extend_from_slice(&single_packet_page(&idx_a_packet, 0, SKEL_SERIAL, 3, 0));
+    out.extend_from_slice(&single_packet_page(&idx_b_packet, 0, SKEL_SERIAL, 4, 0));
+    out.extend_from_slice(&single_packet_page(&v_setup_a, 0, VORBIS_SERIAL_A, 2, 0));
+    out.extend_from_slice(&single_packet_page(&v_setup_b, 0, VORBIS_SERIAL_B, 2, 0));
+    out.extend_from_slice(&single_packet_page(
+        &[],
+        flags::LAST_PAGE,
+        SKEL_SERIAL,
+        5,
+        0,
+    ));
+    out.extend_from_slice(&single_packet_page(
+        &data_packets_a[0],
+        0,
+        VORBIS_SERIAL_A,
+        3,
+        data_granules_a[0],
+    ));
+    out.extend_from_slice(&single_packet_page(
+        &data_packets_b[0],
+        0,
+        VORBIS_SERIAL_B,
+        3,
+        data_granules_b[0],
+    ));
+    out.extend_from_slice(&single_packet_page(
+        &data_packets_a[1],
+        0,
+        VORBIS_SERIAL_A,
+        4,
+        data_granules_a[1],
+    ));
+    out.extend_from_slice(&single_packet_page(
+        &data_packets_a[2],
+        0,
+        VORBIS_SERIAL_A,
+        5,
+        data_granules_a[2],
+    ));
+    out.extend_from_slice(&single_packet_page(
+        &data_packets_b[1],
+        flags::LAST_PAGE,
+        VORBIS_SERIAL_B,
+        4,
+        data_granules_b[1],
+    ));
+    out.extend_from_slice(&single_packet_page(
+        &data_packets_a[3],
+        flags::LAST_PAGE,
+        VORBIS_SERIAL_A,
+        6,
+        data_granules_a[3],
+    ));
+
+    // Spot-check every expected keypoint offset lands on an OggS
+    // boundary in the assembled bytes.
+    let check_offsets = [
+        b_first_data_offset as usize,
+        expected_keypoints_a[0].0 as usize,
+        expected_keypoints_a[1].0 as usize,
+        expected_keypoints_a[2].0 as usize,
+        expected_keypoints_a[3].0 as usize,
+    ];
+    for off in &check_offsets {
+        assert!(off + 4 <= out.len(), "expected offset out of bounds");
+        assert_eq!(
+            &out[*off..*off + 4],
+            b"OggS",
+            "expected offset must land on an OggS page boundary"
+        );
+    }
+
+    (out, b_first_data_offset, expected_keypoints_a)
+}
+
+#[test]
+fn skeleton_index_seek_minimises_offset_across_streams() {
+    // Per `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes
+    // for faster seeking" the seek algorithm must walk every active
+    // stream's index and pick the keypoint with the SMALLEST byte
+    // offset. A naive implementation that only consults the requested
+    // stream's index would land past another stream's required
+    // keyframe, leaving that stream's decoder unable to resume.
+    //
+    // Setup: two Vorbis streams A and B. A has frequent keypoints
+    // (every data page); B has one sparse keypoint at its first data
+    // page (granule 480), located byte-wise between A[0] and A[1].
+    // We seek on stream A to pts=1440 (= keypoint A[2]). A naive
+    // implementation lands at A[2]. The spec-correct implementation
+    // sees B's keypoint at B[0] (timestamp 480 / 48 000 s, well
+    // before the 1440 / 48 000 s target) with a smaller byte offset
+    // and lands there instead.
+    let (bytes, b_first_data_offset, expected_keypoints_a) =
+        build_skeleton_multi_stream_indexed_ogg();
+    assert!(
+        b_first_data_offset < expected_keypoints_a[2].0,
+        "test premise: B's keypoint offset must precede A's floor keypoint for pts=1440"
+    );
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    assert!(dmx.skeleton().is_some(), "Skeleton expected");
+    assert_eq!(dmx.skeleton_index_seek_count(), 0);
+
+    // Seek on stream A (public index 0) to pts=1440. The returned
+    // granule MUST be 1440 (the requested stream's floor keypoint
+    // timestamp), regardless of which stream's keypoint won the byte
+    // offset minimisation: the public seek_to contract returns the
+    // granule in the REQUESTED stream's time-base.
+    let landed = oxideav_core::Demuxer::seek_to(&mut dmx, 0, 1440).expect("seek ok");
+    assert_eq!(
+        landed, 1440,
+        "returned granule belongs to the requested stream's index"
+    );
+    assert_eq!(
+        dmx.skeleton_index_seek_count(),
+        1,
+        "fast path fired once via the multi-stream minimisation"
+    );
+    assert_eq!(
+        dmx.skeleton_index_invalid_count(),
+        0,
+        "no per-spec rejections — both keypoints land on page boundaries"
+    );
+}
+
+#[test]
+fn skeleton_index_seek_falls_back_when_primary_has_no_index() {
+    // The multi-stream minimisation is anchored on the REQUESTED
+    // stream's index — that anchor fixes the returned-granule
+    // mapping. If the requested stream has no Skeleton index at all,
+    // the fast path must not silently land on some other stream's
+    // keypoint (the returned granule wouldn't be in the right time
+    // base). This test pins that behaviour: seeking on the indexed
+    // companion stream still works.
+    let (bytes, _b_first_data_offset, _) = build_skeleton_multi_stream_indexed_ogg();
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    let sk = dmx.skeleton().expect("Skeleton expected");
+    assert!(
+        sk.index_for_serial(VORBIS_SERIAL_A).is_some(),
+        "test premise: stream A has an index"
+    );
+    assert!(
+        sk.index_for_serial(VORBIS_SERIAL_B).is_some(),
+        "test premise: stream B has an index"
+    );
+    // Seek on stream B (public index 1) — at least one of the index
+    // packets covers it, so the fast path should fire at least once.
+    let _ = oxideav_core::Demuxer::seek_to(&mut dmx, 1, 480).expect("seek ok");
+    assert!(
+        dmx.skeleton_index_seek_count() >= 1,
+        "seek on stream B fires the fast path"
+    );
+}

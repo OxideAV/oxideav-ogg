@@ -54,6 +54,22 @@ pub fn open_concrete(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> R
     Ok(state)
 }
 
+/// Outcome of the Skeleton 4.0 keyframe-index fast-path lookup.
+///
+/// Carries the byte offset chosen by the multi-stream minimisation
+/// (per `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes
+/// for faster seeking"), the serial of the stream whose keypoint won
+/// that minimisation (used by the per-keypoint validity check, which
+/// expects the page at the offset to belong to that serial — not
+/// necessarily the originally-requested stream), and the granule the
+/// public `seek_to` contract should return, which is always expressed
+/// in the requested stream's own time-base units.
+struct SkeletonIndexSeek {
+    byte_offset: u64,
+    winning_serial: u32,
+    returned_granule: i64,
+}
+
 struct LogicalStream {
     /// Index into the public `streams` vec.
     public_index: usize,
@@ -646,6 +662,16 @@ impl OggDemuxer {
     /// stream's serial (every other code path keeps working — only the
     /// fast-path counter holds). A non-zero value tells callers that a
     /// previous `seek_to` returned without paying for any page scanning.
+    ///
+    /// When the file carries indexes for multiple concurrent streams,
+    /// the fast path applies the
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
+    /// faster seeking" multi-stream rule: "first construct the set
+    /// which contains every active streams' last keypoint which has
+    /// time less than or equal to the seek target time. … select the
+    /// key point with the smallest byte offset." Each such successful
+    /// lookup is a single tick on this counter, regardless of how many
+    /// streams' indexes participated in the minimisation.
     pub fn skeleton_index_seek_count(&self) -> u64 {
         self.skeleton_index_seeks
     }
@@ -746,60 +772,125 @@ impl OggDemuxer {
         serial == expected_serial
     }
 
-    /// Resolve `(byte_offset, returned_granule)` from a Skeleton 4.0
-    /// keyframe-index packet for `serial`, if one is present and a
-    /// floor keypoint exists. `target_pts` is the seek target in the
-    /// stream's own time-base units (same as the public
-    /// [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to) contract).
-    /// `time_base` is the stream's time base, used to convert
-    /// `target_pts` into the index's `timestamp_denominator` units.
+    /// Look up the rightmost keypoint with timestamp `<= target_index_ts`
+    /// in a single [`SkelIndex`], returning `(byte_offset, kp_timestamp)`
+    /// when one exists. Used as the inner step of both the single-stream
+    /// floor lookup and the multi-stream minimum-offset minimisation
+    /// (`docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
+    /// faster seeking" — "first construct the set which contains every
+    /// active streams' last keypoint which has time less than or equal
+    /// to the seek target time").
+    fn keypoint_floor(index: &SkelIndex, target_index_ts: i64) -> Option<(u64, i64)> {
+        if index.timestamp_denominator <= 0 || index.keypoints.is_empty() {
+            return None;
+        }
+        let kps = &index.keypoints;
+        let i = match kps.binary_search_by(|kp| kp.timestamp.cmp(&target_index_ts)) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let kp = kps[i];
+        Some((kp.offset, kp.timestamp))
+    }
+
+    /// Resolve `(byte_offset, returned_granule)` from the Skeleton 4.0
+    /// keyframe-index packets when seeking on `serial`. `target_pts` is
+    /// the seek target in the stream's own time-base units (same as the
+    /// public [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to)
+    /// contract). `time_base` is the requested stream's time base, used
+    /// to convert `target_pts` into each index's `timestamp_denominator`
+    /// units.
+    ///
+    /// Per `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes
+    /// for faster seeking": "first construct the set which contains
+    /// every active streams' last keypoint which has time less than or
+    /// equal to the seek target time. This tells you a known point on
+    /// every stream which lies before the seek target. Then from that
+    /// set of key points, select the key point with the smallest byte
+    /// offset." A seek that only consulted the requested stream's index
+    /// would land past one or more other concurrent streams' required
+    /// keyframes; selecting the minimum offset across every active
+    /// stream's index guarantees decoding can resume cleanly for every
+    /// multiplexed stream after the seek.
     ///
     /// Returns `None` if any of:
     ///   * no Skeleton state is recorded;
-    ///   * no `index\0` packet was emitted for `serial`;
-    ///   * the index is empty;
-    ///   * the index's `timestamp_denominator` is non-positive
-    ///     (the spec requires it be positive, but defensively we treat
-    ///     an out-of-range value as "no usable index");
-    ///   * every keypoint sits past `target_pts`.
+    ///   * no `index\0` packet was emitted for `serial` (this is the
+    ///     anchor — without an index for the requested stream we have
+    ///     no way to map back into its granule space);
+    ///   * the requested serial's index is empty or has non-positive
+    ///     timestamp_denominator;
+    ///   * every keypoint in the requested serial's index sits past
+    ///     `target_pts`.
     ///
-    /// On `Some`, the caller is expected to seek the input to the
-    /// returned byte offset, flush demuxer buffers, and return the
-    /// granule to its caller.
+    /// On `Some`, the returned `byte_offset` is the minimum across
+    /// every active stream's index that resolved a floor keypoint at
+    /// the seek target time; `winning_serial` identifies which stream
+    /// owns that keypoint (used by the per-keypoint validity check at
+    /// the call site to verify the byte at `byte_offset` is an `OggS`
+    /// page belonging to that serial); `granule` is in the requested
+    /// stream's time-base units (the result of seeking to the requested
+    /// stream's own floor keypoint, even if a different stream's index
+    /// won the minimisation).
     fn skeleton_index_seek(
         &self,
         serial: u32,
         target_pts: i64,
         time_base: TimeBase,
-    ) -> Option<(u64, i64)> {
+    ) -> Option<SkeletonIndexSeek> {
         let sk = self.skeleton.as_ref()?;
-        let index = sk.index_for_serial(serial)?;
-        let denom = index.timestamp_denominator;
-        if denom <= 0 || index.keypoints.is_empty() {
-            return None;
-        }
-        // Convert target_pts (stream time-base units) into the index's
-        // timestamp units (each unit = 1/denom seconds). Both directions
-        // go through `TimeBase::rescale`, which uses 128-bit intermediate
-        // arithmetic to avoid the precision loss of an f64 round-trip.
-        let index_tb = TimeBase::new(1, denom);
-        let target_index_ts = time_base.rescale(target_pts, index_tb);
-        // Find the rightmost keypoint with timestamp <= target_index_ts.
-        // Per spec the keypoints are stored in increasing-offset order
-        // "and thus by presentation time as well", so binary search by
-        // timestamp is well-defined.
-        let kps = &index.keypoints;
-        let idx = match kps.binary_search_by(|kp| kp.timestamp.cmp(&target_index_ts)) {
-            Ok(i) => i,
-            Err(0) => return None,
-            Err(i) => i - 1,
-        };
-        let kp = kps[idx];
+        let primary = sk.index_for_serial(serial)?;
+
+        // Convert target_pts into the requested stream's index unit so
+        // we can look up its floor keypoint (which fixes the returned
+        // granule).
+        let primary_tb = TimeBase::new(1, primary.timestamp_denominator);
+        let primary_target_ts = time_base.rescale(target_pts, primary_tb);
+        let (primary_off, primary_kp_ts) = Self::keypoint_floor(primary, primary_target_ts)?;
+
         // Translate the keypoint's index-unit timestamp back into a
         // stream-granule value so the public seek_to contract
         // ("returns the actual granule landed on") still holds.
-        let returned_granule = index_tb.rescale(kp.timestamp, time_base);
-        Some((kp.offset, returned_granule))
+        let returned_granule = primary_tb.rescale(primary_kp_ts, time_base);
+
+        // Multi-stream minimisation: every other index in the Skeleton
+        // contributes a candidate offset. Iterate, rescale into that
+        // stream's own timestamp_denominator, find its floor keypoint,
+        // and track the minimum byte offset across all candidates.
+        let mut min_off = primary_off;
+        let mut winning_serial = serial;
+        for other in &sk.indexes {
+            if other.serial == serial {
+                continue;
+            }
+            // Reject pathological denominators defensively — a 0 or
+            // negative denominator is undefined for rescale and would
+            // be rejected by the inner floor lookup too.
+            if other.timestamp_denominator <= 0 {
+                continue;
+            }
+            let other_tb = TimeBase::new(1, other.timestamp_denominator);
+            let other_target_ts = time_base.rescale(target_pts, other_tb);
+            if let Some((cand_off, _)) = Self::keypoint_floor(other, other_target_ts) {
+                if cand_off < min_off {
+                    min_off = cand_off;
+                    winning_serial = other.serial;
+                }
+            }
+            // A stream whose index has no keypoint at or before the
+            // target time is silently skipped — the spec says "every
+            // ACTIVE stream's last keypoint" and we can't prove the
+            // stream is inactive at this offset without re-scanning,
+            // so falling back to the primary anchor when no floor
+            // exists is the safe choice.
+        }
+
+        Some(SkeletonIndexSeek {
+            byte_offset: min_off,
+            winning_serial,
+            returned_granule,
+        })
     }
 
     /// Read pages until we leave the Beginning-Of-Stream section, registering
@@ -1755,11 +1846,24 @@ impl Demuxer for OggDemuxer {
         // running tally of rejections for diagnostics.
         let stream_time_base = self.streams[stream_index as usize].time_base;
         if self.skeleton_segment_length_check(file_size) {
-            if let Some((off, returned_granule)) =
-                self.skeleton_index_seek(wanted_serial, pts, stream_time_base)
+            if let Some(SkeletonIndexSeek {
+                byte_offset,
+                winning_serial,
+                returned_granule,
+            }) = self.skeleton_index_seek(wanted_serial, pts, stream_time_base)
             {
-                if self.verify_keypoint_landing(off, wanted_serial) {
-                    self.input.seek(SeekFrom::Start(off))?;
+                // Per the Skeleton 4.0 multi-stream minimisation rule
+                // (`docs/container/ogg/ogg-skeleton-4.0.md`
+                // §"Keyframe indexes for faster seeking"), the winning
+                // keypoint may belong to a stream OTHER than the one
+                // the user asked to seek on. The per-spec validity
+                // check ("you don't land on a page which belongs to
+                // that keypoint's stream") therefore tests against
+                // `winning_serial`, not against the user-requested
+                // `wanted_serial`. The returned granule still belongs
+                // to the requested stream's time base.
+                if self.verify_keypoint_landing(byte_offset, winning_serial) {
+                    self.input.seek(SeekFrom::Start(byte_offset))?;
                     self.page_queue.clear();
                     self.out_queue.clear();
                     for state in self.state_by_serial.values_mut() {

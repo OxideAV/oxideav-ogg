@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton 4.0 multi-stream keyframe-index minimisation in the
+  fast-path `seek_to`.** `docs/container/ogg/ogg-skeleton-4.0.md`
+  §"Keyframe indexes for faster seeking" prescribes that the seek
+  algorithm "first construct the set which contains every active
+  streams' last keypoint which has time less than or equal to the
+  seek target time. … Then from that set of key points, select the
+  key point with the smallest byte offset." Prior to this release
+  the demuxer's Skeleton-index fast path consulted only the
+  requested stream's `index\0` packet, which on a multi-stream file
+  (Theora + Vorbis, dual-language audio, …) lands the seek past
+  another concurrent stream's required keyframe and leaves that
+  stream's decoder unable to resume. `OggDemuxer::seek_to` now
+  anchors the lookup on the requested stream's index (which fixes
+  the returned-granule mapping into that stream's time-base),
+  iterates every *other* Skeleton index in the file, rescales the
+  target time into each index's own `timestamp_denominator` units,
+  and tracks the minimum byte offset across every floor keypoint.
+  The per-keypoint validity check (`OggS` capture pattern +
+  `bitstream_serial_number` equality) is then performed against
+  the *winning* stream's serial, not the originally-requested
+  stream's, so the spec's "after a seek to a keypoint's offset,
+  you don't land on a page which belongs to that keypoint's
+  stream" rule still gates the chosen offset correctly. Single-
+  stream Skeleton-indexed files are byte-identical to r215 — the
+  minimisation collapses to the requested stream's floor keypoint
+  when no other index is present.
+
 - **Skeleton 4.0 index-validity gating in the fast-path `seek_to`.**
   `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
   faster seeking" requires that a decoder treat a Skeleton 4.0

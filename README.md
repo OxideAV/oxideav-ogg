@@ -288,6 +288,28 @@ on `OggDemuxer::skeleton_index_invalid_count()` so callers can
 surface "this file's Skeleton index is stale" diagnostics without
 losing the seek.
 
+When a multi-stream Ogg carries a Skeleton index for more than one
+concurrent stream (e.g. a Theora video track + a Vorbis audio
+track), the fast path implements the per-spec multi-stream
+minimisation: "first construct the set which contains every active
+streams' last keypoint which has time less than or equal to the
+seek target time. This tells you a known point on every stream
+which lies before the seek target. Then from that set of key
+points, select the key point with the smallest byte offset." The
+demuxer anchors the lookup on the requested stream's index (which
+fixes the returned granule via the requested stream's own
+time-base), then iterates every *other* index in the Skeleton
+state, rescales the target into that index's `timestamp_denominator`
+units, and tracks the smallest byte offset among the floor
+keypoints. Landing on the smallest offset guarantees decoding can
+resume cleanly for every multiplexed stream — a naive lookup that
+consulted only the requested stream's index would land past
+another concurrent stream's required keyframe, leaving its decoder
+unable to recover. The per-keypoint validity check (#3 above) is
+performed against the *winning* stream's serial — the page at the
+chosen offset must belong to that stream, not necessarily the
+originally-requested one.
+
 Spec reference: `docs/container/ogg/ogg-skeleton-3.0.md`,
 `docs/container/ogg/ogg-skeleton-4.0.md`,
 `docs/container/ogg/ogg-skeleton-message-headers.wiki`. The 4.0 page
