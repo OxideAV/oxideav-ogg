@@ -86,9 +86,27 @@ required by RFC 3533 §6.
 `seek_to(stream_index, pts)` performs a bounded bisection over the
 file using granule-position timestamps on Ogg pages. Vorbis, Opus,
 FLAC and Speex land on the greatest page whose granule is at or
-below the target. Theora and unknown streams return
-`Error::Unsupported` — Theora's granule encoding packs keyframe
-distance into the timestamp and needs codec-aware translation.
+below the target.
+
+For Theora, the page's raw granule packs `(keyframe_idx << shift) |
+frame_offset`, so the comparison axis is the frame number
+`(g >> shift) + (g & ((1 << shift) - 1))` rather than the raw
+granule value. The required `shift` and frame rate come from the
+per-stream Skeleton 4.0 `fisbone\0` (`granuleshift` and
+`granule_rate`, per `docs/container/ogg/ogg-skeleton-4.0.md`): the
+user's `pts` (microseconds) is rescaled into frame-rate units via
+[`TimeBase::rescale`] to produce the target frame number, and the
+bisection — both its index-floor lookup and its forward
+`find_next_page_for_serial` scan — compares mapped frame numbers
+against that target. The returned granule is the actual on-wire
+value of the landed page, so a downstream Theora decoder can
+recover the keyframe-index / offset pair as usual. A Theora stream
+that lacks a `fisbone\0` (or whose `fisbone\0` has
+`granuleshift == 0`) still returns `Error::Unsupported`: without
+the Skeleton-borne shift+rate we cannot translate `pts` to a frame
+number, and the conservative choice is to refuse rather than
+silently misinterpret the raw granule as a target. Codecs other
+than the five listed above continue to return `Error::Unsupported`.
 
 For workloads with many seeks (scrubbing, looped playback) call
 `oxideav_ogg::demux::open_indexed` instead of `open`. It does a

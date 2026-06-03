@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Codec-aware `seek_to` for Theora streams paired with a Skeleton
+  `fisbone\0`.** Theora encodes its page granule as
+  `(keyframe_idx << shift) | frame_offset_from_keyframe`, so the raw
+  granule value is not a usable comparison axis for a bisection
+  driven by a microsecond `pts`. Prior releases rejected every
+  Theora `seek_to` with `Error::Unsupported`. When a Skeleton 4.0
+  `fisbone\0` is present for the requested stream's serial (per
+  `docs/container/ogg/ogg-skeleton-4.0.md`), the demuxer now uses
+  the per-stream `granuleshift` and `granule_rate` carried by that
+  fisbone: the user's `pts` is rescaled from the stream's
+  `time_base` into frame-rate units via [`TimeBase::rescale`] to
+  produce the target frame number, and the bisection compares
+  `(g >> shift) + (g & ((1 << shift) - 1))` against that target.
+  The returned granule is the actual on-wire value of the landed
+  page so a downstream Theora decoder can recover the
+  `(keyframe_idx, frame_offset)` pair as usual. A new
+  `SeekKey::TheoraFrame` strategy is plumbed through both the
+  `find_next_page_for_serial` scan and a new
+  `OggDemuxer::index_floor_by` lookup so the codec-aware comparison
+  axis drives both the pre-built seek-index path
+  (`build_seek_index` / `open_indexed`) and the on-demand bisection
+  path. Theora without a Skeleton fisbone, or with a fisbone whose
+  `granuleshift == 0` (which would collapse the keyframe packing —
+  indistinguishable from an encoder that forgot to set the shift),
+  continues to return `Error::Unsupported`. Vorbis / Opus / FLAC /
+  Speex still drive the bisection on the raw granule via the
+  collapsed-to-identity `SeekKey::Identity` strategy, so their
+  per-page byte-level behaviour is unchanged.
+
+- **Idempotent Skeleton BOS re-registration in `register_stream`.**
+  `OggDemuxer::build_seek_index` re-walks every page header in the
+  file after `open` has already drained the BOS + header section,
+  including a second visit to the Skeleton BOS. Prior to this
+  release the second visit clobbered the in-memory `Skeleton` with
+  a fresh empty one (re-running `FisHead::parse` and
+  `Skeleton::new` from scratch), wiping the `fisbone\0` /
+  `index\0` packets the demuxer had already pushed during the
+  initial header walk. Round 227's Theora seek path relies on
+  those packets being present *after* a `build_seek_index` call;
+  the regression bound is locked in by the new
+  `theora_bisection_seek_after_build_seek_index_uses_index_floor`
+  test. `register_stream` now short-circuits when the
+  `bitstream_serial_number` of the BOS being registered already
+  matches `skeleton_serial` *and* a `Skeleton` is already recorded.
+
+### Added (continued)
+
 - **Skeleton 4.0 multi-stream keyframe-index minimisation in the
   fast-path `seek_to`.** `docs/container/ogg/ogg-skeleton-4.0.md`
   §"Keyframe indexes for faster seeking" prescribes that the seek

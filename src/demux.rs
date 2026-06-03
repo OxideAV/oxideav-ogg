@@ -54,6 +54,99 @@ pub fn open_concrete(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> R
     Ok(state)
 }
 
+/// Per-codec strategy for the bisection-path comparison axis in
+/// [`OggDemuxer::seek_to`]. The bisection works by comparing each page's
+/// "ordering key" (`key_of(granule)`) against a target key derived from
+/// the user-supplied `pts`. For most codecs the granule itself is the
+/// key; Theora layers a `(keyframe << shift) | offset` packing on top of
+/// its native granule space so the comparison axis is the underlying
+/// frame number, derived from the Skeleton 4.0 `fisbone` per-stream
+/// `granuleshift` + `granule_rate`.
+#[derive(Clone, Copy)]
+struct SeekKey {
+    target_key: i64,
+    flavor: SeekKeyFlavor,
+}
+
+#[derive(Clone, Copy)]
+enum SeekKeyFlavor {
+    /// `key_of(g) == g`. Used by codecs whose stream time-base matches
+    /// their granule unit (Vorbis / Opus / FLAC / Speex), so `pts` IS
+    /// the target granule.
+    Identity,
+    /// `key_of(g) == (g >> shift) + (g & ((1 << shift) - 1))`. Used by
+    /// Theora: the encoded granule packs a keyframe index in the upper
+    /// `64-shift` bits and a frame offset from that keyframe in the
+    /// lower `shift` bits. The sum of the two is the absolute frame
+    /// number. With `shift == 0` the offset half is empty and the key
+    /// collapses to the raw granule, which is also a valid frame
+    /// number — so the same codec path can also drive seeks on
+    /// pre-Skeleton (shift-unset) fisbones, though that's vanishingly
+    /// rare in practice (Theora streams in the wild almost always
+    /// declare a non-zero shift).
+    TheoraFrame { shift: u32 },
+}
+
+impl SeekKey {
+    fn identity(target: i64) -> Self {
+        Self {
+            target_key: target,
+            flavor: SeekKeyFlavor::Identity,
+        }
+    }
+
+    fn theora_frame(target_frame: i64, shift: u32) -> Self {
+        Self {
+            target_key: target_frame,
+            flavor: SeekKeyFlavor::TheoraFrame { shift },
+        }
+    }
+
+    /// Map an on-wire page granule into the comparison key.
+    fn key_of(&self, granule: i64) -> i64 {
+        match self.flavor {
+            SeekKeyFlavor::Identity => granule,
+            SeekKeyFlavor::TheoraFrame { shift } => theora_frame_no(granule, shift),
+        }
+    }
+}
+
+/// Decode the Theora granule packing `granule = (frame_idx_of_last_keyframe
+/// << shift) | (frame_offset_from_last_keyframe)` into the absolute frame
+/// index. Per `docs/container/ogg/ogg-skeleton-4.0.md` (granuleshift is
+/// "the number of lower bits from the granulepos field that are used to
+/// provide position information for sub-seekable units (like the
+/// keyframe shift in theora)"), the sum of the two halves is the
+/// absolute frame number.
+///
+/// Negative granules (`-1` "no packet finishes on this page" per RFC 3533
+/// §6) are returned as-is so that the bisection comparator treats them
+/// as "smaller than every real page" — matching the existing
+/// "skip pages with granule -1" convention used elsewhere in this
+/// module.
+///
+/// A `shift >= 63` is clamped to a frame number of `0`; the spec
+/// doesn't write down a maximum value and a shift past `63` would mean
+/// every bit is "offset" with no room for a keyframe index, which is
+/// nonsensical. Round 227 prefers a degenerate but well-defined output
+/// over a panic so a misbuilt or attacker-edited fisbone cannot crash
+/// the seek path.
+fn theora_frame_no(granule: i64, shift: u32) -> i64 {
+    if granule < 0 {
+        return granule;
+    }
+    if shift == 0 {
+        return granule;
+    }
+    if shift >= 63 {
+        return 0;
+    }
+    let g = granule as u64;
+    let kf = (g >> shift) as i64;
+    let off = (g & ((1u64 << shift) - 1)) as i64;
+    kf.saturating_add(off)
+}
+
 /// Outcome of the Skeleton 4.0 keyframe-index fast-path lookup.
 ///
 /// Carries the byte offset chosen by the multi-stream minimisation
@@ -301,20 +394,40 @@ impl OggDemuxer {
     }
 
     /// Look up the seek index for the largest entry on `serial` whose
-    /// granule is `<= target`. Returns `(granule, page_offset)` if any
-    /// such entry exists.
-    fn index_floor(&self, serial: u32, target: i64) -> Option<(i64, u64)> {
+    /// *mapped* key, computed by `key_of`, is `<= target_key`. Returns
+    /// `(granule, page_offset)` if any such entry exists. Used by the
+    /// codec-aware seek path so a comparison axis other than the raw
+    /// granule (e.g. Theora frame number derived from the encoded
+    /// `(keyframe << shift) | offset` granule layout) can drive the
+    /// floor lookup.
+    ///
+    /// The seek_index is sorted by raw granule, and the codec-aware
+    /// mapping (currently only Theora's `(g >> shift) + (g & mask)`)
+    /// is monotonically non-decreasing as a function of raw granule
+    /// for any single logical stream (proof in `seek_to`'s comment
+    /// block), so a linear scan from the right finds the floor in the
+    /// raw-granule order and the first entry with `key_of(g) <=
+    /// target_key` is the rightmost mapped-floor entry. The walk is
+    /// bounded by the index length and runs at most once per `seek_to`
+    /// call, so even the linear path is cheap.
+    fn index_floor_by<F>(&self, serial: u32, target_key: i64, key_of: F) -> Option<(i64, u64)>
+    where
+        F: Fn(i64) -> i64,
+    {
         let entries = self.seek_index.get(&serial)?;
         if entries.is_empty() {
             return None;
         }
-        // Find the rightmost entry with granule <= target.
-        let idx = match entries.binary_search_by(|(g, _)| g.cmp(&target)) {
-            Ok(i) => i,
-            Err(0) => return None,
-            Err(i) => i - 1,
-        };
-        Some(entries[idx])
+        // Walk right-to-left since `entries` is sorted by raw granule
+        // and the mapped key is monotonic in raw granule per-stream:
+        // the first entry whose mapped key is `<= target_key` is the
+        // rightmost mapped-floor entry.
+        for &(g, off) in entries.iter().rev() {
+            if key_of(g) <= target_key {
+                return Some((g, off));
+            }
+        }
+        None
     }
 
     /// Walk every page header in the file once, recording
@@ -833,6 +946,46 @@ impl OggDemuxer {
     /// stream's time-base units (the result of seeking to the requested
     /// stream's own floor keypoint, even if a different stream's index
     /// won the minimisation).
+    /// Build a [`SeekKey::TheoraFrame`] strategy for the Theora stream
+    /// whose serial is `serial`, given the user's `pts` in the stream's
+    /// `time_base` units. Returns `None` when the prerequisites for
+    /// Theora granule translation are missing — no Skeleton was parsed,
+    /// no `fisbone\0` was emitted for this serial, the fisbone's
+    /// `granule_rate` numerator/denominator is non-positive, or the
+    /// fisbone's `granuleshift` is zero (which collapses the Theora
+    /// granule packing to a raw frame count; without a non-zero shift
+    /// we have no way to tell whether the encoder was running with a
+    /// shift of zero or simply forgot to set it, so the conservative
+    /// choice is `None` and the caller returns `Unsupported`).
+    ///
+    /// On `Some`, the returned key's `target_key` is the absolute
+    /// Theora frame number at or before `pts`: the user's `pts` is
+    /// rescaled from `time_base` (microseconds, in practice) into
+    /// frame-rate units `(gr_den, gr_num)` via [`TimeBase::rescale`].
+    /// The bisection then compares each page's
+    /// `(g >> shift) + (g & mask)` against this target frame number.
+    fn theora_seek_key(&self, serial: u32, pts: i64, time_base: TimeBase) -> Option<SeekKey> {
+        let bone = self.skeleton.as_ref()?.bone_for_serial(serial)?;
+        let shift = bone.granuleshift as u32;
+        if shift == 0 {
+            return None;
+        }
+        let gr_num = bone.granule_rate.numerator;
+        let gr_den = bone.granule_rate.denominator;
+        if gr_num <= 0 || gr_den <= 0 {
+            return None;
+        }
+        // Rescale `pts` (in `time_base` units) into "frames" by
+        // converting to a time base of `1 frame = gr_den / gr_num
+        // seconds`. `TimeBase::new(gr_den, gr_num)` rounds half-away-
+        // from-zero, which can shift `target_frame` by one tick at the
+        // boundary; that's within the seek_to contract ("greatest page
+        // whose granule is at or below the target" lands on the nearest
+        // page either way).
+        let target_frame = time_base.rescale(pts, TimeBase::new(gr_den, gr_num));
+        Some(SeekKey::theora_frame(target_frame, shift))
+    }
+
     fn skeleton_index_seek(
         &self,
         serial: u32,
@@ -938,6 +1091,22 @@ impl OggDemuxer {
         // so subsequent fisbone / index packets can be routed away from
         // the regular packet-reassembly path.
         if skeleton::is_fishead(first) {
+            // Re-encountering an already-recorded Skeleton BOS — for
+            // example because `build_seek_index` re-walks every page
+            // header in the file after `open` already drained the
+            // header section — must not clobber the populated
+            // `Skeleton` state with a fresh empty one (the previously
+            // pushed `fisbone` / `index` packets would be lost,
+            // turning the codec-aware seek path into a fall-through
+            // `Unsupported` for any subsequent Theora seek). Idempotent
+            // re-registration: the second time we see the Skeleton BOS
+            // we already have `skeleton_serial == Some(this serial)`
+            // and `skeleton.is_some()`, so just refresh
+            // `skeleton_last_seq` and return.
+            if self.skeleton_serial == Some(bos_page.serial) && self.skeleton.is_some() {
+                self.skeleton_last_seq = Some(bos_page.seq_no);
+                return Ok(());
+            }
             let head = FisHead::parse(first)?;
             let mut sk = Skeleton::new();
             sk.serial = Some(bos_page.serial);
@@ -1790,14 +1959,48 @@ impl Demuxer for OggDemuxer {
             Error::unsupported(format!("Ogg: no logical stream for index {stream_index}"))
         })?;
 
-        // For codecs the demuxer tracks (Vorbis, Opus, FLAC), the stream's
-        // time_base already matches the native granule unit, so pts IS the
-        // target granule. Theora and unknown streams use a microsecond base
-        // and granule translation is codec-specific — reject that until we
-        // grow a per-codec granule_to_pts helper.
+        // Build the codec-aware comparison axis for the bisection.
+        //
+        // For Vorbis / Opus / FLAC / Speex the stream's `time_base` already
+        // matches the native granule unit (samples/Hz), so `pts` *is* the
+        // target granule and every page's raw `granule_position` is the
+        // comparison key — `target_key == pts`, `key_of(g) == g`.
+        //
+        // Theora packs a keyframe index and a per-keyframe offset into a
+        // single granule value (`(kf << shift) | offset`) so the raw
+        // granule isn't a usable comparison axis on its own. When a
+        // Skeleton 4.0 `fisbone\0` is present for the stream's serial,
+        // `bone.granuleshift` and `bone.granule_rate` give us enough to
+        // translate: the comparison key is the frame number
+        // `(g >> shift) + (g & mask)` and the target is the frame
+        // number that corresponds to `pts` under the stream's time-base
+        // (rescaled into frame-rate units via `TimeBase::rescale`).
+        //
+        // Theora's encoded granule values are strictly monotonic with the
+        // frame number across a single logical stream (see the
+        // implementation comment block on `index_floor_by` and on
+        // `theora_frame_no` for the proof), so a binary search by frame
+        // number is well-defined on the raw-granule-sorted seek index.
+        //
+        // Theora without a Skeleton fisbone, and any other unrecognised
+        // codec, still returns `Unsupported` — there's no codec-agnostic
+        // way to translate `pts` into a granule key without the
+        // fisbone's `granuleshift` + `granule_rate`. This keeps the same
+        // public contract for the pre-Skeleton cases the round 199
+        // change covered.
         let codec_id = self.streams[stream_index as usize].params.codec_id.clone();
-        let target_granule = match codec_id.as_str() {
-            "vorbis" | "opus" | "flac" | "speex" => pts,
+        let stream_tb_for_key = self.streams[stream_index as usize].time_base;
+        let seek_key: SeekKey = match codec_id.as_str() {
+            "vorbis" | "opus" | "flac" | "speex" => SeekKey::identity(pts),
+            "theora" => match self.theora_seek_key(wanted_serial, pts, stream_tb_for_key) {
+                Some(key) => key,
+                None => {
+                    return Err(Error::unsupported(format!(
+                        "Ogg: seek_to on stream {stream_index} ({}) requires a Skeleton fisbone with non-zero granuleshift and granule_rate",
+                        codec_id.as_str()
+                    )));
+                }
+            },
             _ => {
                 return Err(Error::unsupported(format!(
                     "Ogg: seek_to not implemented for codec {}",
@@ -1805,6 +2008,7 @@ impl Demuxer for OggDemuxer {
                 )));
             }
         };
+        let target_key = seek_key.target_key;
 
         // Determine the seekable byte range. `lo` is the current position
         // of the first page after the BOS/header section isn't known here —
@@ -1900,12 +2104,20 @@ impl Demuxer for OggDemuxer {
         }
 
         // Fast path: if the seek index already has a `(granule, offset)`
-        // entry with granule <= target_granule, jump to it directly.
+        // entry whose mapped key is `<= target_key`, jump to it directly.
         // The remaining linear-tail scan below still runs to tighten the
         // landing point against any indexed entries that were inserted
         // between the floor and the target — that scan reuses the index
         // too because `find_next_page_for_serial` records as it goes.
-        if let Some((g, off)) = self.index_floor(wanted_serial, target_granule) {
+        // For codecs with `SeekKey::Identity` this collapses to the raw
+        // `granule <= target_granule` semantics the pre-Theora path
+        // already had; for Theora's `SeekKey::TheoraFrame` the floor
+        // lookup runs through `(g >> shift) + (g & mask)` so the
+        // largest indexed page whose *frame number* is at or before the
+        // target frame wins.
+        if let Some((g, off)) =
+            self.index_floor_by(wanted_serial, target_key, |g| seek_key.key_of(g))
+        {
             self.input.seek(SeekFrom::Start(off))?;
             self.page_queue.clear();
             self.out_queue.clear();
@@ -1930,9 +2142,10 @@ impl Demuxer for OggDemuxer {
         // Bisection state.
         let mut lo: u64 = 0;
         let mut hi: u64 = file_size;
-        // Best-so-far: the last page with granule <= target_granule that
-        // belongs to the requested stream. Tuple of (page_offset, granule).
-        let mut landed: Option<(u64, i64)> = None;
+        // Best-so-far: the last page with `key_of(granule) <= target_key`
+        // belonging to the requested stream. Tuple of (page_offset,
+        // granule, key).
+        let mut landed: Option<(u64, i64, i64)> = None;
         let threshold: u64 = 64 * 1024;
 
         // Upper bound on iterations: log2(file_size) + a handful for the
@@ -1958,17 +2171,18 @@ impl Demuxer for OggDemuxer {
                     }
                 };
 
-            if granule <= target_granule {
+            let key = seek_key.key_of(granule);
+            if key <= target_key {
                 // This page is at or before target — remember it, try
                 // later offsets.
-                if landed.map(|(_, g)| granule >= g).unwrap_or(true) {
-                    landed = Some((page_off, granule));
+                if landed.map(|(_, _, lk)| key >= lk).unwrap_or(true) {
+                    landed = Some((page_off, granule, key));
                 }
                 // Advance past this page's header to avoid re-landing on
                 // the same page forever.
                 lo = page_off + 1;
             } else {
-                // granule > target — search the lower half.
+                // key > target — search the lower half.
                 hi = page_off;
             }
 
@@ -1981,17 +2195,18 @@ impl Demuxer for OggDemuxer {
         // After bisection, do a bounded linear scan from `lo` toward `hi`
         // to tighten `landed` — this handles the final few pages inside
         // the threshold window without more bisection iterations.
-        if let Some((_, _)) = landed {
-            let mut cursor = landed.map(|(off, _)| off + 1).unwrap_or(lo);
+        if landed.is_some() {
+            let mut cursor = landed.map(|(off, _, _)| off + 1).unwrap_or(lo);
             let scan_end = hi.min(cursor + threshold * 2);
             while cursor < scan_end {
                 match self.find_next_page_for_serial(cursor, scan_end, wanted_serial)? {
                     Some((off, g)) => {
-                        if g > target_granule {
+                        let k = seek_key.key_of(g);
+                        if k > target_key {
                             break;
                         }
-                        if landed.map(|(_, lg)| g >= lg).unwrap_or(true) {
-                            landed = Some((off, g));
+                        if landed.map(|(_, _, lk)| k >= lk).unwrap_or(true) {
+                            landed = Some((off, g, k));
                         }
                         cursor = off + 1;
                     }
@@ -2004,17 +2219,15 @@ impl Demuxer for OggDemuxer {
             // granule exceeds the target (e.g., seek to pts 0 on a stream
             // whose first page already has granule > 0).
             if let Some((off, g)) = self.find_next_page_for_serial(0, file_size, wanted_serial)? {
-                if g <= target_granule {
-                    landed = Some((off, g));
-                } else {
-                    // Even the earliest page is past target — seek to it
-                    // anyway; it's the best we can do.
-                    landed = Some((off, g));
-                }
+                let k = seek_key.key_of(g);
+                // Even when this page's key is past target, returning it
+                // is still the best we can do — the user asked to seek
+                // before the first available page of the stream.
+                landed = Some((off, g, k));
             }
         }
 
-        let (landed_off, landed_granule) = landed.ok_or_else(|| {
+        let (landed_off, landed_granule, _landed_key) = landed.ok_or_else(|| {
             Error::unsupported(format!(
                 "Ogg: no seekable page found for stream {stream_index}"
             ))
