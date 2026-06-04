@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton-aware mux: `oxideav_ogg::mux::open_with_skeleton`.** New
+  factory accepts an optional [`skeleton::Skeleton`] and emits a
+  Skeleton metadata bitstream alongside the content streams, per the
+  encapsulation order in `docs/container/ogg/ogg-skeleton-3.0.md` /
+  `ogg-skeleton-4.0.md`. The Skeleton `fishead\0` BOS is written as
+  the very first BOS page of the physical stream so identification
+  takes one read; content streams' BOS pages follow; then each
+  `fisbone\0` secondary header and any 4.0 `index\0` packet is
+  emitted on its own page; and an empty-payload Skeleton EOS page
+  closes the control section before the first content data page.
+  When `skeleton.serial` is unset, the muxer assigns a
+  non-colliding serial (one past the largest content-stream serial).
+  Existing `oxideav_ogg::mux::open` continues to produce byte-
+  identical Skeleton-free output by delegating to
+  `open_with_skeleton(_, _, None)`. The demuxer's existing Skeleton
+  path round-trips the emitted fishead + fisbones + indexes
+  verbatim — verified by the new `tests/skeleton_mux.rs` harness
+  (BOS ordering, control-section boundary, per-page payload
+  classification, round-trip, opt-out behaviour).
+
 - **Codec-aware `seek_to` for Theora streams paired with a Skeleton
   `fisbone\0`.** Theora encodes its page granule as
   `(keyframe_idx << shift) | frame_offset_from_keyframe`, so the raw

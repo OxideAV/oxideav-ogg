@@ -13,11 +13,53 @@ use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
 use crate::page::{self, flags, lace, Page};
+use crate::skeleton::Skeleton;
 
 pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    open_with_skeleton(output, streams, None)
+}
+
+/// Open an Ogg muxer with an optional Skeleton metadata bitstream.
+///
+/// When `skeleton` is `Some`, the muxer emits a Skeleton logical bitstream
+/// before any content bitstream pages, per the encapsulation order
+/// described in `docs/container/ogg/ogg-skeleton-3.0.md` and
+/// `docs/container/ogg/ogg-skeleton-4.0.md`:
+///
+/// 1. The Skeleton `fishead\0` BOS is the very first BOS page in the
+///    physical stream so decoders can identify it straight away.
+/// 2. The BOS pages of all other logical bitstreams follow (existing
+///    `write_header` flow, unchanged).
+/// 3. Secondary header pages — Skeleton's `fisbone\0` packets plus
+///    every content codec's remaining headers — interleave next.
+/// 4. Skeleton 4.0 `index\0` packets, if any, ride alongside the
+///    fisbones in the secondary-header section.
+/// 5. The Skeleton EOS page (an empty-payload packet sitting on its
+///    own page) closes the control section before any content data
+///    page appears.
+///
+/// Each Skeleton packet is emitted on its own page with the carrier's
+/// own serial number and a monotonically increasing sequence number,
+/// matching the per-packet pagination the existing 3.0 / 4.0 streams
+/// in the wild use.
+///
+/// If `skeleton.serial` is `None`, a serial is derived (one past the
+/// largest content stream's derived serial) so it cannot collide with
+/// any content bitstream the muxer is already writing.
+///
+/// If `skeleton` is `None`, this function reduces to [`open`] — no
+/// Skeleton bytes are written and the output is byte-identical to the
+/// pre-Skeleton muxer.
+pub fn open_with_skeleton(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    skeleton: Option<Skeleton>,
+) -> Result<Box<dyn Muxer>> {
     let mut per_stream = HashMap::with_capacity(streams.len());
+    let mut max_serial: u32 = 0;
     for s in streams {
         let serial = derive_serial(s);
+        max_serial = max_serial.max(serial);
         let headers_remaining = codec_id::header_packet_count(&s.params.codec_id);
         per_stream.insert(
             s.index,
@@ -31,6 +73,14 @@ pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dy
             },
         );
     }
+    let skeleton_writer = skeleton.map(|sk| {
+        let serial = sk.serial.unwrap_or(max_serial.wrapping_add(1));
+        SkeletonWriter {
+            skel: sk,
+            serial,
+            seq_no: 0,
+        }
+    });
     Ok(Box::new(OggMuxer {
         output,
         streams: streams.to_vec(),
@@ -38,6 +88,7 @@ pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dy
         stream_order: streams.iter().map(|s| s.index).collect(),
         header_written: false,
         trailer_written: false,
+        skeleton: skeleton_writer,
     }))
 }
 
@@ -57,6 +108,18 @@ struct OggMuxer {
     stream_order: Vec<u32>,
     header_written: bool,
     trailer_written: bool,
+    /// Optional Skeleton metadata bitstream. When present, its fishead
+    /// BOS is emitted first (before any content BOS) and its EOS page
+    /// is emitted after the last content secondary header, before any
+    /// content data page is written — per the encapsulation order in
+    /// `docs/container/ogg/ogg-skeleton-{3,4}.0.md`.
+    skeleton: Option<SkeletonWriter>,
+}
+
+struct SkeletonWriter {
+    skel: Skeleton,
+    serial: u32,
+    seq_no: u32,
 }
 
 struct StreamWriter {
@@ -104,6 +167,77 @@ impl OggMuxer {
         self.per_stream
             .get_mut(&stream_index)
             .ok_or_else(|| Error::invalid(format!("unknown stream index {stream_index}")))
+    }
+
+    /// Emit a single Skeleton-stream page carrying `packet_bytes` as one
+    /// whole packet, with the supplied header flags. Granule is always 0
+    /// (Skeleton itself defines no time-axis content) and the sequence
+    /// number advances per call.
+    fn write_skeleton_page(&mut self, packet_bytes: &[u8], page_flags: u8) -> Result<()> {
+        let sk = self.skeleton.as_mut().expect("skeleton writer present");
+        let lacing = lace(packet_bytes.len());
+        let page = Page {
+            flags: page_flags,
+            granule_position: 0,
+            serial: sk.serial,
+            seq_no: sk.seq_no,
+            lacing,
+            data: packet_bytes.to_vec(),
+        };
+        sk.seq_no = sk.seq_no.wrapping_add(1);
+        let bytes = page.to_bytes();
+        self.output.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Emit the Skeleton fishead BOS page. Must run before any content
+    /// stream's BOS page, per the Skeleton 3.0 / 4.0 encapsulation order.
+    fn write_skeleton_fishead_bos(&mut self) -> Result<()> {
+        let head_bytes = {
+            let sk = self.skeleton.as_ref().expect("skeleton writer present");
+            sk.skel
+                .head
+                .as_ref()
+                .map(|h| h.to_bytes())
+                .unwrap_or_else(|| {
+                    // Caller attached a Skeleton with no fishead — emit a
+                    // minimal 4.0 fishead (zero-valued presentation time /
+                    // basetime / segment-length / content-byte-offset)
+                    // so the BOS is structurally valid for downstream
+                    // parsers.
+                    crate::skeleton::FisHead::new(crate::skeleton::Version::V4_0).to_bytes()
+                })
+        };
+        self.write_skeleton_page(&head_bytes, flags::FIRST_PAGE)
+    }
+
+    /// Emit every fisbone + index packet sitting on the attached
+    /// Skeleton (one packet per page, each at granule 0), then close
+    /// the Skeleton control section with an empty-payload EOS page.
+    /// Per the spec, the EOS packet appears by itself on its own page.
+    fn write_skeleton_fisbones_and_eos(&mut self) -> Result<()> {
+        // Take ownership of the secondary-header byte sequences first so
+        // we can hand each one to write_skeleton_page (which borrows
+        // self.skeleton mutably for seq_no advancement).
+        let payloads: Vec<Vec<u8>> = {
+            let sk = self.skeleton.as_ref().expect("skeleton writer present");
+            let mut out = Vec::with_capacity(sk.skel.bones.len() + sk.skel.indexes.len());
+            for bone in &sk.skel.bones {
+                out.push(bone.to_bytes());
+            }
+            for idx in &sk.skel.indexes {
+                out.push(idx.to_bytes());
+            }
+            out
+        };
+        for payload in &payloads {
+            self.write_skeleton_page(payload, 0)?;
+        }
+        // Empty packet on its own EOS page closes the Skeleton control
+        // section (per spec). A zero-byte packet lacing-encodes as a
+        // single `0` lacing value (lace(0) → [0]); the on-wire page
+        // therefore carries one segment whose body length is zero.
+        self.write_skeleton_page(&[], flags::LAST_PAGE)
     }
 
     /// Finalize the buffered page for `stream_index`. The newly built page
@@ -169,7 +303,15 @@ impl Muxer for OggMuxer {
             let packets = extract_codec_headers(&s.params.codec_id, &s.params.extradata);
             header_queues.push((s.index, s.time_base, packets));
         }
-        // Pass 1: BOS page per stream, written immediately.
+        // Step 0: Skeleton fishead BOS — the very first BOS page in the
+        // physical stream, per `docs/container/ogg/ogg-skeleton-{3,4}.0.md`
+        // ("the Skeleton bos page is the very first bos page in the Ogg
+        // stream"). The fisbones / indexes / EOS for Skeleton are emitted
+        // in step 3 once content BOS pages are out.
+        if self.skeleton.is_some() {
+            self.write_skeleton_fishead_bos()?;
+        }
+        // Step 1: BOS page per content stream, written immediately.
         for (idx, _tb, packets) in &header_queues {
             let Some(first) = packets.first() else {
                 continue;
@@ -193,12 +335,22 @@ impl Muxer for OggMuxer {
             let bytes = page.to_bytes();
             self.output.write_all(&bytes)?;
         }
-        // Pass 2: remaining header packets — normal write_packet flow.
+        // Step 2: remaining content-codec header packets — normal
+        // write_packet flow.
         for (idx, tb, packets) in &header_queues {
             for hp in packets.iter().skip(1) {
                 let pkt = Packet::new(*idx, *tb, hp.clone());
                 self.write_packet(&pkt)?;
             }
+        }
+        // Step 3: Skeleton secondary headers (fisbone packets + any
+        // 4.0 index packets) followed by the Skeleton EOS page. The
+        // EOS must precede any content data page (the spec requires
+        // it ends the control section "before any data pages of the
+        // other logical bitstreams appear"). Subsequent write_packet
+        // calls supply those content data pages.
+        if self.skeleton.is_some() {
+            self.write_skeleton_fisbones_and_eos()?;
         }
         Ok(())
     }

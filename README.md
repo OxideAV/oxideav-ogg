@@ -249,6 +249,30 @@ has no content packets and exists only to describe the other streams.
 Files without Skeleton behave exactly as before: `skeleton()` returns
 `None` and no other behaviour changes.
 
+#### Mux-side: attach a Skeleton at open time
+
+`oxideav_ogg::mux::open_with_skeleton(output, streams, Some(skel))`
+emits a Skeleton metadata bitstream alongside the content streams,
+following the encapsulation order spelled out in
+`docs/container/ogg/ogg-skeleton-3.0.md` /
+`docs/container/ogg/ogg-skeleton-4.0.md`:
+
+1. The Skeleton `fishead\0` BOS is the very first BOS page of the
+   physical stream so a decoder can identify Skeleton straight away
+   without having to look past Vorbis / Theora / Opus magic first.
+2. The BOS pages of all other logical bitstreams follow.
+3. Each `fisbone\0` secondary header rides on its own page, alongside
+   the content codecs' remaining secondary header packets.
+4. Any 4.0 `index\0` packets ride alongside the fisbones, one per page.
+5. An empty-payload Skeleton EOS page closes the control section
+   before the first content data page is written.
+
+`Skeleton::serial` controls which serial the muxer uses for the
+Skeleton bitstream; leaving it `None` lets the muxer pick one past the
+largest content-stream serial (so it cannot collide). The
+`open` factory continues to produce Skeleton-free output byte-for-byte
+by delegating to `open_with_skeleton(_, _, None)`.
+
 For encode-side use, every type round-trips through `to_bytes` /
 `parse`:
 
