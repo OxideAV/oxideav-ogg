@@ -588,6 +588,183 @@ impl SkelIndex {
     pub fn push(&mut self, offset: u64, timestamp: i64) {
         self.keypoints.push(KeyPoint { offset, timestamp });
     }
+
+    // ----------------------------------------------------------------
+    // Time-domain typed accessors.
+    //
+    // Skeleton 4.0 §"Keyframe index packets": every per-keypoint
+    // timestamp, plus the first-sample-time and last-sample-time
+    // numerators, share the single `timestamp_denominator` stored in
+    // the index packet header. The on-wire integers are deltas from
+    // the previous keypoint (already resolved into absolute values
+    // by `parse`); divide each absolute numerator by the shared
+    // denominator to recover seconds. The spec marks `denominator = 0`
+    // as "unable to be determined at indexing time, and is unknown"
+    // for first/last sample times — the typed accessors below surface
+    // that as `Option::None`.
+    // ----------------------------------------------------------------
+
+    /// Convert keypoint `index`'s timestamp to seconds using this
+    /// index packet's shared `timestamp_denominator`. Returns `None`
+    /// when `index` is out of range, or when the denominator is zero
+    /// (Skeleton 4.0 §"Keyframe index packets": a zero denominator
+    /// means the time value is unknown). Spec field-4 also notes
+    /// "This must not be 0" for the denominator on writes; readers
+    /// guard against malformed inputs that violate that constraint.
+    pub fn keypoint_seconds(&self, index: usize) -> Option<f64> {
+        if self.timestamp_denominator == 0 {
+            return None;
+        }
+        let kp = self.keypoints.get(index)?;
+        Some(kp.seconds(self.timestamp_denominator))
+    }
+
+    /// Presentation time in seconds of the first sample in this
+    /// stream. `None` when the on-wire `timestamp_denominator` is 0
+    /// (per Skeleton 4.0: "If the denominator is 0 for the
+    /// first-sample-time or the last-sample-time, then that value
+    /// was unable to be determined at indexing time, and is unknown.").
+    pub fn first_sample_seconds(&self) -> Option<f64> {
+        if self.timestamp_denominator == 0 {
+            None
+        } else {
+            Some(self.first_sample_time as f64 / self.timestamp_denominator as f64)
+        }
+    }
+
+    /// End time in seconds of the last sample in this stream. `None`
+    /// when the shared denominator is 0 — see [`Self::first_sample_seconds`].
+    pub fn last_sample_seconds(&self) -> Option<f64> {
+        if self.timestamp_denominator == 0 {
+            None
+        } else {
+            Some(self.last_sample_time as f64 / self.timestamp_denominator as f64)
+        }
+    }
+
+    /// Duration of the indexed stream in seconds — the difference
+    /// between the last- and first-sample times when both are known.
+    /// Skeleton 4.0 §"Keyframe indexes for faster seeking" calls this
+    /// out explicitly: "you can calculate the duration as the end time
+    /// of the last active stream minus the start time of first active
+    /// stream."
+    pub fn duration_seconds(&self) -> Option<f64> {
+        let first = self.first_sample_seconds()?;
+        let last = self.last_sample_seconds()?;
+        Some(last - first)
+    }
+
+    /// True iff keypoints are stored in non-decreasing-offset order.
+    /// Skeleton 4.0 §"Keyframe index packets" mandates: "The key
+    /// points are stored in increasing order by offset (and thus by
+    /// presentation time as well)." A keypoint vector that violates
+    /// this on a parsed index marks the input as malformed; the
+    /// helper lets callers cheaply validate the invariant before
+    /// trusting the binary search in [`Self::keypoint_for_time`].
+    pub fn is_sorted_by_offset(&self) -> bool {
+        self.keypoints
+            .windows(2)
+            .all(|w| w[0].offset <= w[1].offset && w[0].timestamp <= w[1].timestamp)
+    }
+
+    /// Locate the keypoint to start decoding from for a target time
+    /// in seconds. Returns the *index* of the last keypoint whose
+    /// presentation time is less than or equal to `target_seconds`, or
+    /// `None` when:
+    ///
+    /// * the shared `timestamp_denominator` is 0 (timestamps unknown),
+    /// * the keypoint vector is empty,
+    /// * `target_seconds` is NaN or precedes every keypoint's time.
+    ///
+    /// Per Skeleton 4.0 §"Keyframe indexes for faster seeking": "first
+    /// construct the set which contains every active streams' last
+    /// keypoint which has time less than or equal to the seek target
+    /// time." This helper computes that per-stream "last keypoint at
+    /// or before t" answer. The caller is then expected to take the
+    /// minimum byte-offset across all per-stream answers and seek
+    /// there.
+    ///
+    /// Uses binary search; runs in `O(log n)` over the keypoint table.
+    /// Relies on the spec invariant that keypoints are sorted by
+    /// increasing offset (and therefore by increasing timestamp);
+    /// callers can pre-flight with [`Self::is_sorted_by_offset`].
+    pub fn keypoint_for_time(&self, target_seconds: f64) -> Option<usize> {
+        if self.timestamp_denominator == 0 || self.keypoints.is_empty() {
+            return None;
+        }
+        // Special floating-point inputs: NaN is rejected (no ordering
+        // exists); +inf maps to "past every keypoint" → last index;
+        // -inf maps to "before every keypoint" → None.
+        if target_seconds.is_nan() {
+            return None;
+        }
+        if target_seconds == f64::INFINITY {
+            return Some(self.keypoints.len() - 1);
+        }
+        if target_seconds == f64::NEG_INFINITY {
+            return None;
+        }
+        // Convert the target back to numerator-space so the search is
+        // pure-integer comparison and immune to floating-point rounding
+        // around the boundary. `target_num` is the largest integer N
+        // such that N / timestamp_denominator <= target_seconds.
+        //
+        // Skeleton 4.0 stores timestamp_denominator as a signed i64
+        // whose spec permits any non-zero value (negative denominators
+        // are unusual but not forbidden by the wire format). Work in
+        // signed f64 throughout the conversion and floor toward
+        // negative infinity to honor the "less than or equal" wording
+        // in the spec.
+        let denom = self.timestamp_denominator as f64;
+        let scaled = target_seconds * denom;
+        // Reject overflow into the i64 range — a target so large it
+        // exceeds i64::MAX/i64::MIN in numerator-space cannot match
+        // any in-range keypoint, so behave like "after the last
+        // keypoint" (return the last index) for positive overflow and
+        // "before the first keypoint" (None) for negative overflow.
+        let max = i64::MAX as f64;
+        let min = i64::MIN as f64;
+        let target_num: i64 = if scaled >= max {
+            // Target time is greater than every representable timestamp
+            // → answer is the last keypoint.
+            return Some(self.keypoints.len() - 1);
+        } else if scaled <= min {
+            // Target time is before any representable timestamp → no
+            // valid "at or before" keypoint exists.
+            return None;
+        } else {
+            scaled.floor() as i64
+        };
+
+        // partition_point returns the count of leading elements whose
+        // timestamp is <= target_num. The keypoint we want is the one
+        // immediately preceding that boundary.
+        let strictly_after = self
+            .keypoints
+            .partition_point(|kp| kp.timestamp <= target_num);
+        if strictly_after == 0 {
+            None
+        } else {
+            Some(strictly_after - 1)
+        }
+    }
+}
+
+impl KeyPoint {
+    /// Presentation time of this keypoint in seconds, given the shared
+    /// `timestamp_denominator` from the enclosing [`SkelIndex`]. Returns
+    /// 0.0 when the denominator is zero — that matches [`Rational::to_seconds`]
+    /// and lets keypoint scans through degenerate indexes proceed without
+    /// branching at every step. Use [`SkelIndex::keypoint_seconds`] for the
+    /// `Option`-returning variant that distinguishes "unknown" from
+    /// "zero seconds".
+    pub fn seconds(&self, timestamp_denominator: i64) -> f64 {
+        if timestamp_denominator == 0 {
+            0.0
+        } else {
+            self.timestamp as f64 / timestamp_denominator as f64
+        }
+    }
 }
 
 /// Variable-byte integer encoder used by Skeleton 4.0 index keypoint
@@ -938,5 +1115,187 @@ mod tests {
         // Skeleton 4.0 §"Keyframe index packets": denominator 0 means
         // "unknown"; expose that as 0.0 rather than NaN.
         assert_eq!(Rational::new(123, 0).to_seconds(), 0.0);
+    }
+
+    // -------------------------------------------------------------
+    // Time-domain typed accessors for SkelIndex.
+    //
+    // Skeleton 4.0 §"Keyframe index packets" defines the shared
+    // `timestamp_denominator` for every per-keypoint timestamp and
+    // for the first/last sample times. The accessors below convert
+    // numerator-space integers into seconds and provide the binary
+    // search keyed on the spec's "last keypoint with time <= target"
+    // rule (§"Keyframe indexes for faster seeking").
+    // -------------------------------------------------------------
+
+    fn build_demo_index() -> SkelIndex {
+        // Per-stream index with the 7843-byte spec-worked-example
+        // offset delta and a 1 MHz denominator so per-keypoint times
+        // land at exact 1.0 s / 2.5 s boundaries.
+        let mut idx = SkelIndex::new(0x2A, 1_000_000);
+        idx.first_sample_time = 0;
+        idx.last_sample_time = 60_000_000;
+        idx.push(4096, 0);
+        idx.push(4096 + 7843, 1_000_000);
+        idx.push(4096 + 7843 + 65_536, 2_500_000);
+        idx
+    }
+
+    #[test]
+    fn skel_index_keypoint_seconds_typed() {
+        let idx = build_demo_index();
+        assert_eq!(idx.keypoint_seconds(0), Some(0.0));
+        assert_eq!(idx.keypoint_seconds(1), Some(1.0));
+        assert_eq!(idx.keypoint_seconds(2), Some(2.5));
+        assert_eq!(idx.keypoint_seconds(3), None); // out of range
+    }
+
+    #[test]
+    fn skel_index_keypoint_seconds_returns_none_on_unknown_denominator() {
+        // Manually craft an index with denominator 0 (forbidden on
+        // writes per §"Keyframe index packets" point 4 but accepted
+        // by `parse` to surface malformed inputs as unknown rather
+        // than NaN-yielding nonsense).
+        let mut idx = SkelIndex::new(1, 0);
+        idx.push(100, 42);
+        assert_eq!(idx.keypoint_seconds(0), None);
+    }
+
+    #[test]
+    fn skel_index_first_last_sample_seconds() {
+        let idx = build_demo_index();
+        assert_eq!(idx.first_sample_seconds(), Some(0.0));
+        assert_eq!(idx.last_sample_seconds(), Some(60.0));
+        assert_eq!(idx.duration_seconds(), Some(60.0));
+    }
+
+    #[test]
+    fn skel_index_first_last_seconds_unknown_when_denom_zero() {
+        let mut idx = SkelIndex::new(5, 0);
+        idx.first_sample_time = 12345;
+        idx.last_sample_time = 67890;
+        // §"Keyframe index packets": denom 0 → unknown.
+        assert_eq!(idx.first_sample_seconds(), None);
+        assert_eq!(idx.last_sample_seconds(), None);
+        assert_eq!(idx.duration_seconds(), None);
+    }
+
+    #[test]
+    fn skel_index_is_sorted_by_offset_invariant() {
+        let idx = build_demo_index();
+        assert!(idx.is_sorted_by_offset());
+
+        // A vector that violates the §"Keyframe index packets"
+        // increasing-offset invariant must report false.
+        let mut bad = SkelIndex::new(0xCAFE, 1_000_000);
+        bad.push(2_000, 100);
+        bad.push(1_000, 50);
+        assert!(!bad.is_sorted_by_offset());
+    }
+
+    #[test]
+    fn skel_index_keypoint_for_time_exact_boundaries() {
+        let idx = build_demo_index();
+        // At each keypoint's exact time, the per-spec answer is THAT
+        // keypoint (since the rule is "<= target").
+        assert_eq!(idx.keypoint_for_time(0.0), Some(0));
+        assert_eq!(idx.keypoint_for_time(1.0), Some(1));
+        assert_eq!(idx.keypoint_for_time(2.5), Some(2));
+    }
+
+    #[test]
+    fn skel_index_keypoint_for_time_between_keypoints() {
+        let idx = build_demo_index();
+        // Between keypoint 0 (t=0) and 1 (t=1) → answer is 0.
+        assert_eq!(idx.keypoint_for_time(0.5), Some(0));
+        // Between keypoint 1 (t=1) and 2 (t=2.5) → answer is 1.
+        assert_eq!(idx.keypoint_for_time(1.5), Some(1));
+        assert_eq!(idx.keypoint_for_time(2.4999), Some(1));
+        // Past the last keypoint → answer is the last keypoint
+        // (the spec's "last keypoint at or before t" rule degrades to
+        // "last keypoint" when t is past every entry).
+        assert_eq!(idx.keypoint_for_time(100.0), Some(2));
+    }
+
+    #[test]
+    fn skel_index_keypoint_for_time_before_first_is_none() {
+        let idx = build_demo_index();
+        // Negative target precedes every keypoint → no per-spec
+        // "at or before" answer exists.
+        assert_eq!(idx.keypoint_for_time(-1.0), None);
+    }
+
+    #[test]
+    fn skel_index_keypoint_for_time_rejects_nan_and_inf() {
+        let idx = build_demo_index();
+        assert_eq!(idx.keypoint_for_time(f64::NAN), None);
+        // +inf → spec answer is the last keypoint (target is past
+        // every entry). The implementation returns the last index
+        // via the overflow-clamp branch.
+        assert_eq!(idx.keypoint_for_time(f64::INFINITY), Some(2));
+        // -inf → no "at or before" answer exists.
+        assert_eq!(idx.keypoint_for_time(f64::NEG_INFINITY), None);
+    }
+
+    #[test]
+    fn skel_index_keypoint_for_time_empty_or_unknown_denominator() {
+        // Empty index → None.
+        let empty = SkelIndex::new(1, 48_000);
+        assert_eq!(empty.keypoint_for_time(1.0), None);
+        // Denominator 0 → None.
+        let mut unknown_denom = SkelIndex::new(1, 0);
+        unknown_denom.push(0, 0);
+        assert_eq!(unknown_denom.keypoint_for_time(1.0), None);
+    }
+
+    #[test]
+    fn skel_index_keypoint_seconds_with_negative_timestamps() {
+        // §"Keyframe index packets" timestamps are i64 numerators,
+        // signed: a stream whose `presentation_time` precedes
+        // granule 0 yields negative keypoint timestamps. The typed
+        // accessors must hand them through with sign preserved.
+        let mut idx = SkelIndex::new(11, 1_000);
+        idx.first_sample_time = -3_000;
+        idx.last_sample_time = 5_000;
+        idx.push(0, -2_500);
+        idx.push(8192, 0);
+        idx.push(16384, 4_000);
+        assert_eq!(idx.first_sample_seconds(), Some(-3.0));
+        assert_eq!(idx.last_sample_seconds(), Some(5.0));
+        assert_eq!(idx.duration_seconds(), Some(8.0));
+        assert_eq!(idx.keypoint_seconds(0), Some(-2.5));
+        assert_eq!(idx.keypoint_seconds(2), Some(4.0));
+        // Searching at -1.0 finds keypoint 0 (the only one at-or-before).
+        assert_eq!(idx.keypoint_for_time(-1.0), Some(0));
+        // Searching at -2.5 (exact match on keypoint 0) returns 0.
+        assert_eq!(idx.keypoint_for_time(-2.5), Some(0));
+        // Searching at -10.0 precedes every keypoint.
+        assert_eq!(idx.keypoint_for_time(-10.0), None);
+    }
+
+    #[test]
+    fn skel_index_keypoint_seconds_one_keypoint_at_zero() {
+        // Single keypoint at t=0 — the binary search must still
+        // honor the spec's "<=" boundary at the exact match.
+        let mut idx = SkelIndex::new(99, 48_000);
+        idx.push(0, 0);
+        assert_eq!(idx.keypoint_for_time(0.0), Some(0));
+        assert_eq!(idx.keypoint_for_time(0.5), Some(0));
+        // Below 0 → no at-or-before answer.
+        assert_eq!(idx.keypoint_for_time(-1e-6), None);
+    }
+
+    #[test]
+    fn keypoint_seconds_method_handles_zero_denominator() {
+        let kp = KeyPoint {
+            offset: 1024,
+            timestamp: 1_000_000,
+        };
+        // Non-zero denominator → exact division.
+        assert_eq!(kp.seconds(1_000_000), 1.0);
+        // Zero denominator → 0.0 (matches `Rational::to_seconds`
+        // behaviour; the `Option`-returning typed accessor is
+        // `SkelIndex::keypoint_seconds`).
+        assert_eq!(kp.seconds(0), 0.0);
     }
 }

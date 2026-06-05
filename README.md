@@ -290,6 +290,30 @@ For encode-side use, every type round-trips through `to_bytes` /
   relative to the previous entry and emits each as a Skeleton 4.0
   variable-byte integer (7 bits per byte, high bit set on the
   terminator, little-endian). `SkelIndex::parse` reverses both layers.
+- **Time-domain typed accessors** convert the on-wire numerator-space
+  integers in an `index\0` packet into seconds and provide spec-aligned
+  time-keyed lookup:
+  `KeyPoint::seconds(timestamp_denominator)` for one keypoint;
+  `SkelIndex::keypoint_seconds(i)`,
+  `SkelIndex::first_sample_seconds()`,
+  `SkelIndex::last_sample_seconds()`, and
+  `SkelIndex::duration_seconds()` for the indexed-segment endpoints
+  (each returning `Option<f64>` so the spec's "denominator 0 means
+  unknown" rule from
+  `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe index packets"
+  surfaces as `None` rather than NaN). `SkelIndex::is_sorted_by_offset()`
+  validates the spec's increasing-offset invariant; and
+  `SkelIndex::keypoint_for_time(seconds)` is an `O(log n)` binary search
+  that returns the index of the last keypoint with presentation time
+  `<= target_seconds`. That answer is the per-stream half of the seek
+  algorithm in §"Keyframe indexes for faster seeking" ("first construct
+  the set which contains every active streams' last keypoint which has
+  time less than or equal to the seek target time"); the caller then
+  takes the minimum byte-offset across all per-stream answers. The
+  search runs in pure-integer numerator space so floating-point rounding
+  around boundary timestamps cannot mis-classify the target; negative
+  timestamps (streams whose `presentation_time` precedes granule 0) are
+  handled with sign preserved.
 - `oxideav_ogg::skeleton::{read_vbi_u64, write_vbi_u64}` are exposed
   publicly so callers writing seek-tooling against raw `index\0`
   packets don't have to re-implement the encoding.

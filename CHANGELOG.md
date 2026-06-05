@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton 4.0 time-domain typed accessors on `SkelIndex`.** Six new
+  public methods convert the on-wire numerator-space integers into
+  seconds and provide spec-aligned time-keyed lookup, replacing the
+  per-call `kp.timestamp as f64 / idx.timestamp_denominator as f64`
+  boilerplate callers had to write themselves:
+  - `KeyPoint::seconds(timestamp_denominator)` — per-keypoint seconds
+    conversion; matches `Rational::to_seconds` and returns 0.0 on a
+    zero denominator.
+  - `SkelIndex::keypoint_seconds(index)` — `Option<f64>` variant that
+    distinguishes "unknown" (denominator 0 per
+    `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe index packets"
+    point 4) from "zero seconds".
+  - `SkelIndex::first_sample_seconds()` /
+    `SkelIndex::last_sample_seconds()` — typed wrappers around the
+    indexed segment's start/end sample times; `None` when the shared
+    denominator is 0 ("unable to be determined at indexing time, and
+    is unknown" per the spec).
+  - `SkelIndex::duration_seconds()` — convenience for
+    `last - first` per §"Keyframe indexes for faster seeking" ("you
+    can calculate the duration as the end time of the last active
+    stream minus the start time of first active stream").
+  - `SkelIndex::is_sorted_by_offset()` — validates the §"Keyframe
+    index packets" invariant ("The key points are stored in increasing
+    order by offset (and thus by presentation time as well)") before
+    the binary search trusts it.
+  - `SkelIndex::keypoint_for_time(target_seconds)` — `O(log n)` binary
+    search returning the index of the last keypoint whose presentation
+    time is `<= target_seconds`. Implements the per-stream half of the
+    spec's `§"Keyframe indexes for faster seeking"` algorithm: "first
+    construct the set which contains every active streams' last
+    keypoint which has time less than or equal to the seek target
+    time." Works in pure-integer numerator space so floating-point
+    rounding around boundary timestamps cannot mis-classify the
+    target. Edge cases: target before every keypoint → `None`;
+    `+inf` → last index; `-inf` and `NaN` → `None`; empty index or
+    zero denominator → `None`; negative timestamps (streams whose
+    `presentation_time` precedes granule 0) handled with sign
+    preserved.
+  Nine new lib unit tests cover exact-boundary lookups, between-
+  keypoint targets, before-first / after-last edge cases, NaN /
+  infinity inputs, empty / unknown-denominator indexes, single-
+  keypoint indexes, and negative-timestamp streams.
+
 - **Skeleton-aware mux: `oxideav_ogg::mux::open_with_skeleton`.** New
   factory accepts an optional [`skeleton::Skeleton`] and emits a
   Skeleton metadata bitstream alongside the content streams, per the
