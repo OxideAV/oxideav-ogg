@@ -286,6 +286,18 @@ For encode-side use, every type round-trips through `to_bytes` /
   `header` provide case-insensitive lookup for the spec's compulsory
   4.0 fields (`Content-Type`, `Role`, `Name`) plus the larger field
   registry in `docs/container/ogg/ogg-skeleton-message-headers.wiki`.
+- **Typed message-header accessors** parse two of those wiki-documented
+  fields into structured values:
+  `FisBone::role()` returns an `Option<Role>` whose `kind` is one of
+  the 24 enumerated `RoleKind` variants for `text/* | video/* | audio/*`
+  tracks (forward-compatible / vendor tags round-trip as
+  `RoleKind::Other(String)`); the wiki's documented parameter form
+  `video/alternate;angle=nw` is split into `Role::parameters` and
+  looked up case-insensitively via `Role::parameter("angle")`.
+  `FisBone::languages()` returns an `Option<Vec<&str>>` of trimmed
+  BCP-47-shaped tags split on `,` per the wiki's `Language: en-US, fr`
+  example, with the dominating language first and empty fragments
+  dropped.
 - `SkelIndex::to_bytes` re-deltifies keypoint offsets and timestamps
   relative to the previous entry and emits each as a Skeleton 4.0
   variable-byte integer (7 bits per byte, high bit set on the

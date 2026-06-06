@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `Role` + `Language` accessors for Skeleton-4 message headers.**
+  Two new methods on `FisBone` give callers structured access to the
+  two best-defined per-track message-header fields in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki`, so they no
+  longer have to lower-case-match the raw `header("Role")` /
+  `header("Language")` strings themselves.
+  - `FisBone::role() -> Option<Role>` parses the value into a tag
+    (one of the 24 enumerated `RoleKind` variants for
+    `text/* | video/* | audio/*`, mirroring every bullet in
+    §Role; vendor / forward-compatible values surface as
+    `RoleKind::Other(String)` so the wiki's "Other roles are
+    possible, too" note round-trips without loss) plus an ordered
+    list of `;key=value` parameters. The wiki's documented example
+    `video/alternate;angle=nw` parses to
+    `Role { kind: VideoAlternate, parameters: [("angle", "nw")] }`
+    and is queryable case-insensitively via `Role::parameter`. Three
+    convenience predicates (`RoleKind::is_text` / `is_video` /
+    `is_audio`) and a `RoleKind::as_wire` getter keep the typed value
+    a drop-in replacement for the raw string.
+  - `FisBone::languages() -> Option<Vec<&str>>` parses the comma-
+    separated tag list spelled out in §Language ("Language: en-US,
+    fr"), preserving the dominating-language-first order, trimming
+    surrounding whitespace on every tag and dropping empty fragments.
+    No BCP-47 grammar validation is performed inside the parser
+    because the wiki references the external BCP 47 / W3C LTLI
+    grammar without enumerating it inside the Skeleton spec itself.
+  16 new lib unit tests cover the full §Role enumeration (every
+  text/* + video/* + audio/* bullet), the parameterised
+  `video/alternate;angle=nw` example verbatim, the unknown-tag
+  round-trip, case-insensitive tag + parameter + header-name lookup,
+  whitespace tolerance, equals-less parameters, multi-parameter
+  order preservation, the wiki's `Language: en-US, fr` example, the
+  single-tag / blank-value / trailing-comma / surrounding-whitespace
+  edge cases, and the "header absent" `Option::None` distinction.
+
 - **Skeleton 4.0 time-domain typed accessors on `SkelIndex`.** Six new
   public methods convert the on-wire numerator-space integers into
   seconds and provide spec-aligned time-keyed lookup, replacing the

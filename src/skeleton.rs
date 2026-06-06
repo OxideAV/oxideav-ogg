@@ -251,6 +251,242 @@ impl MessageHeader {
     }
 }
 
+/// Documented value of the `Role` message-header field on a `fisbone`.
+///
+/// The Skeleton-4 message-headers wiki
+/// (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Role)
+/// enumerates the roles for text / video / audio tracks. Every variant
+/// here mirrors a single bullet from that list; the wiki notes "Other
+/// roles are possible, too", so callers will see [`RoleKind::Other`]
+/// for forward-compatible / vendor-defined values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoleKind {
+    /// `text/caption` — transcription of all sounds, including speech,
+    /// for the hard-of-hearing.
+    TextCaption,
+    /// `text/subtitle` — translation of speech, typically into a
+    /// different language.
+    TextSubtitle,
+    /// `text/textaudiodesc` — description/transcription of everything
+    /// happening in the video, for screen-reader / braille use.
+    TextTextAudioDesc,
+    /// `text/karaoke` — music lyrics delivered in chunks for sing-along.
+    TextKaraoke,
+    /// `text/chapters` — DVD-style chapter section titles.
+    TextChapters,
+    /// `text/tickertext` — text to scroll at the bottom of the display.
+    TextTickerText,
+    /// `text/lyrics` — transcript of song lyrics.
+    TextLyrics,
+    /// `text/metadata` — name/value pairs associated with sections of
+    /// the media.
+    TextMetadata,
+    /// `text/annotation` — free text associated with sections of the
+    /// media.
+    TextAnnotation,
+    /// `text/linguistic` — linguistic markup of spoken words.
+    TextLinguistic,
+    /// `video/main` — the main video track.
+    VideoMain,
+    /// `video/alternate` — an alternative video track (e.g. different
+    /// camera angle).
+    VideoAlternate,
+    /// `video/sign` — a sign-language video track.
+    VideoSign,
+    /// `video/captioned` — the main video with burnt-in captions.
+    VideoCaptioned,
+    /// `video/subtitled` — the main video with burnt-in subtitles.
+    VideoSubtitled,
+    /// `audio/main` — the main audio track.
+    AudioMain,
+    /// `audio/alternate` — an alternative audio track.
+    AudioAlternate,
+    /// `audio/dub` — the audio track dubbed into another language.
+    AudioDub,
+    /// `audio/audiodesc` — an audio description for the vision-impaired.
+    AudioAudioDesc,
+    /// `audio/described` — the main audio mixed with audio descriptions.
+    AudioDescribed,
+    /// `audio/music` — a music-only track.
+    AudioMusic,
+    /// `audio/speech` — a speech-only track.
+    AudioSpeech,
+    /// `audio/sfx` — a sound-effects-only track.
+    AudioSfx,
+    /// `audio/commentary` — commentary on the main audio or video.
+    AudioCommentary,
+    /// A role that does not match any of the wiki-enumerated values.
+    /// The original case-preserved kind string is retained verbatim so
+    /// callers can surface it without losing information.
+    Other(String),
+}
+
+impl RoleKind {
+    /// Wire-format representation of this role (everything up to the
+    /// first `;`). For [`RoleKind::Other`], the inner string is returned.
+    pub fn as_wire(&self) -> &str {
+        match self {
+            RoleKind::TextCaption => "text/caption",
+            RoleKind::TextSubtitle => "text/subtitle",
+            RoleKind::TextTextAudioDesc => "text/textaudiodesc",
+            RoleKind::TextKaraoke => "text/karaoke",
+            RoleKind::TextChapters => "text/chapters",
+            RoleKind::TextTickerText => "text/tickertext",
+            RoleKind::TextLyrics => "text/lyrics",
+            RoleKind::TextMetadata => "text/metadata",
+            RoleKind::TextAnnotation => "text/annotation",
+            RoleKind::TextLinguistic => "text/linguistic",
+            RoleKind::VideoMain => "video/main",
+            RoleKind::VideoAlternate => "video/alternate",
+            RoleKind::VideoSign => "video/sign",
+            RoleKind::VideoCaptioned => "video/captioned",
+            RoleKind::VideoSubtitled => "video/subtitled",
+            RoleKind::AudioMain => "audio/main",
+            RoleKind::AudioAlternate => "audio/alternate",
+            RoleKind::AudioDub => "audio/dub",
+            RoleKind::AudioAudioDesc => "audio/audiodesc",
+            RoleKind::AudioDescribed => "audio/described",
+            RoleKind::AudioMusic => "audio/music",
+            RoleKind::AudioSpeech => "audio/speech",
+            RoleKind::AudioSfx => "audio/sfx",
+            RoleKind::AudioCommentary => "audio/commentary",
+            RoleKind::Other(s) => s.as_str(),
+        }
+    }
+
+    /// True for `text/*` roles.
+    pub fn is_text(&self) -> bool {
+        matches!(
+            self,
+            RoleKind::TextCaption
+                | RoleKind::TextSubtitle
+                | RoleKind::TextTextAudioDesc
+                | RoleKind::TextKaraoke
+                | RoleKind::TextChapters
+                | RoleKind::TextTickerText
+                | RoleKind::TextLyrics
+                | RoleKind::TextMetadata
+                | RoleKind::TextAnnotation
+                | RoleKind::TextLinguistic
+        )
+    }
+
+    /// True for `video/*` roles.
+    pub fn is_video(&self) -> bool {
+        matches!(
+            self,
+            RoleKind::VideoMain
+                | RoleKind::VideoAlternate
+                | RoleKind::VideoSign
+                | RoleKind::VideoCaptioned
+                | RoleKind::VideoSubtitled
+        )
+    }
+
+    /// True for `audio/*` roles.
+    pub fn is_audio(&self) -> bool {
+        matches!(
+            self,
+            RoleKind::AudioMain
+                | RoleKind::AudioAlternate
+                | RoleKind::AudioDub
+                | RoleKind::AudioAudioDesc
+                | RoleKind::AudioDescribed
+                | RoleKind::AudioMusic
+                | RoleKind::AudioSpeech
+                | RoleKind::AudioSfx
+                | RoleKind::AudioCommentary
+        )
+    }
+}
+
+/// Parsed value of the `Role` message-header field.
+///
+/// The wiki documents two shapes:
+///
+/// * a bare role tag, e.g. `audio/main`;
+/// * a role tag followed by `;key=value` parameters, e.g.
+///   `video/alternate;angle=nw`.
+///
+/// [`Role::kind`] holds the tag; [`Role::parameters`] holds the
+/// (case-preserved, trimmed) key/value pairs in source order. Lookup
+/// helpers are case-insensitive on the key per the HTTP-style framing
+/// the rest of the Skeleton message-header block uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Role {
+    /// Semantic role kind (one of the enumerated wiki values, or
+    /// [`RoleKind::Other`]).
+    pub kind: RoleKind,
+    /// `;key=value` parameters appended after the role tag, in
+    /// declaration order. The key is preserved as written; case-
+    /// insensitive lookup is provided by [`Role::parameter`].
+    pub parameters: Vec<(String, String)>,
+}
+
+impl Role {
+    /// Parse a `Role` header value into a [`Role`].
+    ///
+    /// The role tag is matched case-insensitively against the
+    /// wiki-enumerated values; anything else maps to
+    /// [`RoleKind::Other`] retaining the as-written tag. Parameters
+    /// are split on `;`; each parameter is split on the first `=`
+    /// (no `=` → an empty value), and surrounding whitespace is
+    /// trimmed on every token.
+    pub fn parse(raw: &str) -> Role {
+        let mut parts = raw.split(';');
+        let head = parts.next().unwrap_or("").trim();
+        let kind = match head.to_ascii_lowercase().as_str() {
+            "text/caption" => RoleKind::TextCaption,
+            "text/subtitle" => RoleKind::TextSubtitle,
+            "text/textaudiodesc" => RoleKind::TextTextAudioDesc,
+            "text/karaoke" => RoleKind::TextKaraoke,
+            "text/chapters" => RoleKind::TextChapters,
+            "text/tickertext" => RoleKind::TextTickerText,
+            "text/lyrics" => RoleKind::TextLyrics,
+            "text/metadata" => RoleKind::TextMetadata,
+            "text/annotation" => RoleKind::TextAnnotation,
+            "text/linguistic" => RoleKind::TextLinguistic,
+            "video/main" => RoleKind::VideoMain,
+            "video/alternate" => RoleKind::VideoAlternate,
+            "video/sign" => RoleKind::VideoSign,
+            "video/captioned" => RoleKind::VideoCaptioned,
+            "video/subtitled" => RoleKind::VideoSubtitled,
+            "audio/main" => RoleKind::AudioMain,
+            "audio/alternate" => RoleKind::AudioAlternate,
+            "audio/dub" => RoleKind::AudioDub,
+            "audio/audiodesc" => RoleKind::AudioAudioDesc,
+            "audio/described" => RoleKind::AudioDescribed,
+            "audio/music" => RoleKind::AudioMusic,
+            "audio/speech" => RoleKind::AudioSpeech,
+            "audio/sfx" => RoleKind::AudioSfx,
+            "audio/commentary" => RoleKind::AudioCommentary,
+            _ => RoleKind::Other(head.to_string()),
+        };
+        let mut parameters = Vec::new();
+        for p in parts {
+            let p = p.trim();
+            if p.is_empty() {
+                continue;
+            }
+            if let Some(eq) = p.find('=') {
+                let (k, v) = p.split_at(eq);
+                parameters.push((k.trim().to_string(), v[1..].trim().to_string()));
+            } else {
+                parameters.push((p.to_string(), String::new()));
+            }
+        }
+        Role { kind, parameters }
+    }
+
+    /// Look up a parameter value by case-insensitive name.
+    pub fn parameter(&self, name: &str) -> Option<&str> {
+        self.parameters
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 /// `fisbone` secondary header packet describing one logical bitstream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FisBone {
@@ -318,6 +554,39 @@ impl FisBone {
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case(name))
             .map(|h| h.value.as_str())
+    }
+
+    /// Typed `Role` accessor.
+    ///
+    /// Parses the `Role` message header per
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Role into a
+    /// [`Role`] value (kind enum + optional `;key=value` parameters).
+    /// Returns `None` if no `Role` header is present.
+    ///
+    /// Unknown role strings round-trip as [`RoleKind::Other`] so callers
+    /// can surface forward-compatible role tags without a parse error.
+    pub fn role(&self) -> Option<Role> {
+        self.header("Role").map(Role::parse)
+    }
+
+    /// Parse the `Language` message header into a list of BCP-47-shaped
+    /// language tags per
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Language.
+    ///
+    /// The wiki specifies comma-separated tags with the dominating
+    /// language first; this method splits on `,`, trims each entry, and
+    /// drops empty fragments. No BCP-47 syntax validation is performed
+    /// (the wiki references BCP 47 / W3C LTLI but does not enumerate the
+    /// grammar inside the Skeleton spec itself).
+    ///
+    /// Returns `None` if no `Language` header is present.
+    pub fn languages(&self) -> Option<Vec<&str>> {
+        self.header("Language").map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
     }
 
     /// Parse a `fisbone` packet (the full Skeleton secondary header
@@ -1297,5 +1566,206 @@ mod tests {
         // behaviour; the `Option`-returning typed accessor is
         // `SkelIndex::keypoint_seconds`).
         assert_eq!(kp.seconds(0), 0.0);
+    }
+
+    // -------------------------------------------------------------
+    // Role / Language typed message-header accessors
+    // (docs/container/ogg/ogg-skeleton-message-headers.wiki).
+    // -------------------------------------------------------------
+
+    fn bone_with(name: &str, value: &str) -> FisBone {
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header(name, value);
+        b
+    }
+
+    #[test]
+    fn role_returns_none_when_header_absent() {
+        let b = FisBone::new(1, Rational::new(48_000, 1));
+        assert!(b.role().is_none());
+        assert!(b.languages().is_none());
+    }
+
+    #[test]
+    fn role_parses_each_documented_text_role() {
+        // Every text/* bullet from the wiki §Role list.
+        let cases = [
+            ("text/caption", RoleKind::TextCaption),
+            ("text/subtitle", RoleKind::TextSubtitle),
+            ("text/textaudiodesc", RoleKind::TextTextAudioDesc),
+            ("text/karaoke", RoleKind::TextKaraoke),
+            ("text/chapters", RoleKind::TextChapters),
+            ("text/tickertext", RoleKind::TextTickerText),
+            ("text/lyrics", RoleKind::TextLyrics),
+            ("text/metadata", RoleKind::TextMetadata),
+            ("text/annotation", RoleKind::TextAnnotation),
+            ("text/linguistic", RoleKind::TextLinguistic),
+        ];
+        for (wire, expected) in cases {
+            let r = Role::parse(wire);
+            assert_eq!(r.kind, expected, "{wire}");
+            assert!(r.parameters.is_empty(), "{wire}");
+            assert!(r.kind.is_text(), "{wire}");
+            assert!(!r.kind.is_video(), "{wire}");
+            assert!(!r.kind.is_audio(), "{wire}");
+            assert_eq!(r.kind.as_wire(), wire);
+        }
+    }
+
+    #[test]
+    fn role_parses_each_documented_video_role() {
+        // Every video/* bullet from the wiki §Role list.
+        let cases = [
+            ("video/main", RoleKind::VideoMain),
+            ("video/alternate", RoleKind::VideoAlternate),
+            ("video/sign", RoleKind::VideoSign),
+            ("video/captioned", RoleKind::VideoCaptioned),
+            ("video/subtitled", RoleKind::VideoSubtitled),
+        ];
+        for (wire, expected) in cases {
+            let r = Role::parse(wire);
+            assert_eq!(r.kind, expected, "{wire}");
+            assert!(r.kind.is_video(), "{wire}");
+            assert!(!r.kind.is_text(), "{wire}");
+            assert!(!r.kind.is_audio(), "{wire}");
+            assert_eq!(r.kind.as_wire(), wire);
+        }
+    }
+
+    #[test]
+    fn role_parses_each_documented_audio_role() {
+        // Every audio/* bullet from the wiki §Role list.
+        let cases = [
+            ("audio/main", RoleKind::AudioMain),
+            ("audio/alternate", RoleKind::AudioAlternate),
+            ("audio/dub", RoleKind::AudioDub),
+            ("audio/audiodesc", RoleKind::AudioAudioDesc),
+            ("audio/described", RoleKind::AudioDescribed),
+            ("audio/music", RoleKind::AudioMusic),
+            ("audio/speech", RoleKind::AudioSpeech),
+            ("audio/sfx", RoleKind::AudioSfx),
+            ("audio/commentary", RoleKind::AudioCommentary),
+        ];
+        for (wire, expected) in cases {
+            let r = Role::parse(wire);
+            assert_eq!(r.kind, expected, "{wire}");
+            assert!(r.kind.is_audio(), "{wire}");
+            assert!(!r.kind.is_text(), "{wire}");
+            assert!(!r.kind.is_video(), "{wire}");
+            assert_eq!(r.kind.as_wire(), wire);
+        }
+    }
+
+    #[test]
+    fn role_parses_with_wiki_example_parameter() {
+        // Wiki §Role: "video/alternate;angle=nw" is shown verbatim as
+        // the example of a parameterised role tag.
+        let r = Role::parse("video/alternate;angle=nw");
+        assert_eq!(r.kind, RoleKind::VideoAlternate);
+        assert_eq!(r.parameters.len(), 1);
+        assert_eq!(r.parameter("angle"), Some("nw"));
+        // Case-insensitive parameter lookup.
+        assert_eq!(r.parameter("Angle"), Some("nw"));
+        assert_eq!(r.parameter("ANGLE"), Some("nw"));
+        // Unknown parameter → None.
+        assert_eq!(r.parameter("missing"), None);
+    }
+
+    #[test]
+    fn role_case_insensitive_on_tag_and_whitespace_tolerant() {
+        // Spec-style HTTP framing: capitalisation of the role tag is
+        // not mandated by the wiki, and the trailing/leading whitespace
+        // that the parser already trims at the header level may also
+        // appear inside the value.
+        let r = Role::parse("  Video/Alternate ; ANGLE = nw ");
+        assert_eq!(r.kind, RoleKind::VideoAlternate);
+        assert_eq!(r.parameter("angle"), Some("nw"));
+    }
+
+    #[test]
+    fn role_unknown_tag_maps_to_other_preserving_case() {
+        // "Other roles are possible, too" per the wiki — the parser
+        // must round-trip an unknown tag without losing it.
+        let r = Role::parse("application/vendor-x;profile=2");
+        assert_eq!(r.kind, RoleKind::Other("application/vendor-x".to_string()));
+        assert_eq!(r.kind.as_wire(), "application/vendor-x");
+        assert_eq!(r.parameter("profile"), Some("2"));
+        assert!(!r.kind.is_text() && !r.kind.is_video() && !r.kind.is_audio());
+    }
+
+    #[test]
+    fn role_parameter_without_equals_yields_empty_value() {
+        let r = Role::parse("audio/main;flag");
+        assert_eq!(r.kind, RoleKind::AudioMain);
+        assert_eq!(r.parameters, vec![("flag".to_string(), String::new())]);
+        assert_eq!(r.parameter("flag"), Some(""));
+    }
+
+    #[test]
+    fn role_multiple_parameters_preserve_order_and_lookup() {
+        let r = Role::parse("video/alternate;angle=nw;quality=high");
+        assert_eq!(
+            r.parameters,
+            vec![
+                ("angle".to_string(), "nw".to_string()),
+                ("quality".to_string(), "high".to_string()),
+            ]
+        );
+        assert_eq!(r.parameter("Quality"), Some("high"));
+    }
+
+    #[test]
+    fn role_through_fisbone_accessor_round_trips_via_set_header() {
+        let b = bone_with("Role", "video/alternate;angle=nw");
+        let r = b.role().expect("role present");
+        assert_eq!(r.kind, RoleKind::VideoAlternate);
+        assert_eq!(r.parameter("angle"), Some("nw"));
+    }
+
+    #[test]
+    fn role_lookup_is_case_insensitive_on_header_name() {
+        // `FisBone::header` already lower-cases; make sure the typed
+        // accessor inherits that.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("role", "audio/main");
+        assert_eq!(b.role().map(|r| r.kind), Some(RoleKind::AudioMain));
+    }
+
+    #[test]
+    fn languages_parses_wiki_example() {
+        // Wiki §Language: "Language: en-US, fr" — dominating language
+        // first, comma-separated list after.
+        let b = bone_with("Language", "en-US, fr");
+        assert_eq!(b.languages(), Some(vec!["en-US", "fr"]));
+    }
+
+    #[test]
+    fn languages_handles_single_tag() {
+        let b = bone_with("Language", "de-DE");
+        assert_eq!(b.languages(), Some(vec!["de-DE"]));
+    }
+
+    #[test]
+    fn languages_drops_empty_fragments() {
+        // Trailing commas / double commas surface in real-world files
+        // even when not spec-conformant. The parser is liberal in what
+        // it accepts and just drops the empties.
+        let b = bone_with("Language", "en-US,, fr,");
+        assert_eq!(b.languages(), Some(vec!["en-US", "fr"]));
+    }
+
+    #[test]
+    fn languages_trims_surrounding_whitespace_on_each_tag() {
+        let b = bone_with("Language", "   en-US ,   fr   ");
+        assert_eq!(b.languages(), Some(vec!["en-US", "fr"]));
+    }
+
+    #[test]
+    fn languages_returns_empty_vec_when_value_is_blank() {
+        // Blank value → header is present but expands to zero tags
+        // after splitting. Distinguishable from "header absent" via
+        // the outer `Option` wrapper.
+        let b = bone_with("Language", "");
+        assert_eq!(b.languages(), Some(vec![]));
     }
 }
