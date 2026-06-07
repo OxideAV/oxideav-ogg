@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `Altitude` accessor on Skeleton-4 `FisBone`.** A new
+  `FisBone::altitude() -> Option<Result<i64>>` parses the stack-order
+  message-header field documented in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Altitude. The
+  wiki defines Altitude as a CSS-z-index-style signed integer
+  ("unlimited negative and positive numbers ... an element with greater
+  stack order is always in front of an element with a lower stack
+  order") with `Altitude: -150` as the worked example. The accessor's
+  outer `Option` distinguishes "header absent" from "header present",
+  and the inner `Result` surfaces parse errors (malformed
+  non-integer values, decimals, or magnitudes that exceed `i64`) as
+  `Err(_)` so callers can decide whether to skip the field or reject
+  the packet, instead of silently clamping. Surrounding whitespace on
+  the value is trimmed before parsing — the same HTTP-style framing
+  tolerance as `role()` and `languages()`. Header-name lookup remains
+  case-insensitive via the underlying `FisBone::header` path.
+  11 new lib unit tests cover the wiki worked example (`-150`),
+  positive / zero / boundary-value (`i64::MAX` / `i64::MIN`)
+  round-trips, the surrounding-whitespace trim, the past-`i64::MAX`
+  inner `Err`, the non-integer + blank + decimal inner `Err`,
+  case-insensitive header-name lookup, and the `set_header`-driven
+  replace semantics.
 - **Typed `Role` + `Language` accessors for Skeleton-4 message headers.**
   Two new methods on `FisBone` give callers structured access to the
   two best-defined per-track message-header fields in

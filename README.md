@@ -286,7 +286,7 @@ For encode-side use, every type round-trips through `to_bytes` /
   `header` provide case-insensitive lookup for the spec's compulsory
   4.0 fields (`Content-Type`, `Role`, `Name`) plus the larger field
   registry in `docs/container/ogg/ogg-skeleton-message-headers.wiki`.
-- **Typed message-header accessors** parse two of those wiki-documented
+- **Typed message-header accessors** parse three of those wiki-documented
   fields into structured values:
   `FisBone::role()` returns an `Option<Role>` whose `kind` is one of
   the 24 enumerated `RoleKind` variants for `text/* | video/* | audio/*`
@@ -298,6 +298,15 @@ For encode-side use, every type round-trips through `to_bytes` /
   BCP-47-shaped tags split on `,` per the wiki's `Language: en-US, fr`
   example, with the dominating language first and empty fragments
   dropped.
+  `FisBone::altitude()` returns an `Option<Result<i64>>` for the
+  CSS-z-index-style stack-order field documented in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Altitude
+  ("Altitude: -150" worked example, "unlimited negative and positive
+  numbers" wording): the outer `Option` distinguishes "header absent"
+  from "header present", the inner `Result` surfaces a parse error for
+  malformed / non-integer / out-of-`i64`-range values so the caller
+  can decide whether to skip the field or reject the packet. Higher
+  altitude values render in front of lower ones per the wiki.
 - `SkelIndex::to_bytes` re-deltifies keypoint offsets and timestamps
   relative to the previous entry and emits each as a Skeleton 4.0
   variable-byte integer (7 bits per byte, high bit set on the

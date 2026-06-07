@@ -589,6 +589,42 @@ impl FisBone {
         })
     }
 
+    /// Typed `Altitude` accessor.
+    ///
+    /// Parses the `Altitude` message header per
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Altitude
+    /// into a signed integer stack-order value: "The Altitude field
+    /// takes the same numerical values as the z-index in CSS, unlimited
+    /// negative and positive numbers. ... An element with greater stack
+    /// order is always in front of an element with a lower stack order."
+    /// The wiki gives `Altitude: -150` as the worked example.
+    ///
+    /// The outer `Option` distinguishes "header absent" from "header
+    /// present"; the inner [`Result`] surfaces a parse error (malformed
+    /// non-integer value, or one that overflows `i64`) so the caller
+    /// can decide whether to skip the field or reject the packet. The
+    /// value is trimmed of surrounding whitespace before parsing — the
+    /// rest of the Skeleton message-header block uses HTTP-style framing
+    /// that may inject a leading space after the colon.
+    ///
+    /// The wiki notes "unlimited" stack-order magnitudes; this accessor
+    /// caps at `i64` for the same reason CSS implementations cap at
+    /// 32/64-bit signed: a real `Altitude` value sits comfortably in
+    /// the small-integer range, and the spec phrasing stops at
+    /// "z-index in CSS" for the precision requirement. A value outside
+    /// `i64` range surfaces as `Some(Err(_))` rather than silently
+    /// clamping.
+    pub fn altitude(&self) -> Option<Result<i64>> {
+        self.header("Altitude").map(|raw| {
+            let trimmed = raw.trim();
+            trimmed.parse::<i64>().map_err(|e| {
+                Error::invalid(format!(
+                    "Skeleton fisbone: malformed Altitude value {trimmed:?}: {e}"
+                ))
+            })
+        })
+    }
+
     /// Parse a `fisbone` packet (the full Skeleton secondary header
     /// payload, starting with `fisbone\0`).
     pub fn parse(packet: &[u8]) -> Result<Self> {
@@ -1767,5 +1803,114 @@ mod tests {
         // the outer `Option` wrapper.
         let b = bone_with("Language", "");
         assert_eq!(b.languages(), Some(vec![]));
+    }
+
+    // -------------------------------------------------------------
+    // Typed `Altitude` accessor
+    // (docs/container/ogg/ogg-skeleton-message-headers.wiki §Altitude).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn altitude_returns_none_when_header_absent() {
+        let b = FisBone::new(1, Rational::new(48_000, 1));
+        assert!(b.altitude().is_none());
+    }
+
+    #[test]
+    fn altitude_parses_wiki_example_value() {
+        // Wiki §Altitude worked example: "Altitude: -150" — a CSS
+        // z-index-style negative integer.
+        let b = bone_with("Altitude", "-150");
+        assert_eq!(b.altitude().expect("present").expect("valid"), -150);
+    }
+
+    #[test]
+    fn altitude_parses_positive_integer() {
+        let b = bone_with("Altitude", "42");
+        assert_eq!(b.altitude().expect("present").expect("valid"), 42);
+    }
+
+    #[test]
+    fn altitude_parses_zero() {
+        let b = bone_with("Altitude", "0");
+        assert_eq!(b.altitude().expect("present").expect("valid"), 0);
+    }
+
+    #[test]
+    fn altitude_trims_surrounding_whitespace() {
+        // The Skeleton message-header block uses HTTP-style framing;
+        // surrounding whitespace on the value may appear after the
+        // leading-space strip done at parse time. Tolerate it on the
+        // typed accessor too.
+        let b = bone_with("Altitude", "   -150   ");
+        assert_eq!(b.altitude().expect("present").expect("valid"), -150);
+    }
+
+    #[test]
+    fn altitude_at_i64_bounds_round_trips() {
+        // Wiki §Altitude: "unlimited negative and positive numbers".
+        // The typed accessor caps at i64 — values at the boundary
+        // still parse successfully.
+        let b_max = bone_with("Altitude", "9223372036854775807"); // i64::MAX
+        assert_eq!(b_max.altitude().expect("present").expect("valid"), i64::MAX);
+        let b_min = bone_with("Altitude", "-9223372036854775808"); // i64::MIN
+        assert_eq!(b_min.altitude().expect("present").expect("valid"), i64::MIN);
+    }
+
+    #[test]
+    fn altitude_value_above_i64_max_yields_inner_err() {
+        // Past i64::MAX → inner Err so the caller can decide. Stays
+        // Some(...) so it's distinguishable from "header absent".
+        let b = bone_with("Altitude", "9223372036854775808");
+        let parsed = b.altitude().expect("header present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn altitude_non_integer_value_yields_inner_err() {
+        let b = bone_with("Altitude", "top");
+        let parsed = b.altitude().expect("header present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn altitude_blank_value_yields_inner_err() {
+        // Empty/blank value is "header present but unparseable", not
+        // "header absent" — the outer Option still distinguishes them.
+        let b = bone_with("Altitude", "");
+        let parsed = b.altitude().expect("header present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn altitude_lookup_is_case_insensitive_on_header_name() {
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("altitude", "-1");
+        assert_eq!(b.altitude().expect("present").expect("valid"), -1);
+        // Mixed case round-trips via the case-insensitive header
+        // lookup the underlying FisBone::header provides.
+        let mut b2 = FisBone::new(1, Rational::new(48_000, 1));
+        b2.set_header("Altitude", "7");
+        assert_eq!(b2.altitude().expect("present").expect("valid"), 7);
+    }
+
+    #[test]
+    fn altitude_decimal_value_yields_inner_err() {
+        // CSS z-index is integer-only; a decimal value violates the
+        // wiki's "z-index in CSS" specification and must surface as
+        // a parse error rather than silently truncating.
+        let b = bone_with("Altitude", "1.5");
+        let parsed = b.altitude().expect("header present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn altitude_through_set_header_replace() {
+        // The typed accessor reflects the most-recent set_header value
+        // (case-insensitive replacement on the underlying storage).
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Altitude", "10");
+        b.set_header("ALTITUDE", "-3");
+        assert_eq!(b.altitude().expect("present").expect("valid"), -3);
     }
 }
