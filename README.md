@@ -307,6 +307,25 @@ For encode-side use, every type round-trips through `to_bytes` /
   malformed / non-integer / out-of-`i64`-range values so the caller
   can decide whether to skip the field or reject the packet. Higher
   altitude values render in front of lower ones per the wiki.
+  `FisBone::display_hint()` returns an `Option<Result<DisplayHint>>`
+  for the parametric rendering-hint field documented in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Display-hint.
+  The wiki enumerates three documented hint forms — `pip(x,y[,w,h])`
+  (picture-in-picture, with the 2-arg `pip(20%,20%)` and 4-arg
+  `pip(40,40,690,60)` worked examples), `mask(img[,x,y[,w,h]])` (video
+  mask with URL plus optional placement coordinates), and
+  `transparent(p%)` (uniform 0..=100 transparency) — and the
+  accessor parses each into a structured [`DisplayHint`] variant.
+  Coordinates carry their pixel-vs-percent distinction via
+  [`DisplayCoord`] (the wiki's "x, y, w, and h can be specified in
+  percentage" clause). Forward-compatible / vendor hint tags map to
+  `DisplayHint::Other { tag, arguments }` per the wiki's
+  "Currently proposed hints are:" soft-enumeration wording. The outer
+  `Option` distinguishes "header absent" from "header present"; the
+  inner `Result` surfaces parse errors (missing parentheses, wrong
+  argument count for a documented tag, non-numeric coordinate, or a
+  `transparent` percent outside `0..=100`) so the caller can decide
+  whether to skip the field or reject the packet.
 - `SkelIndex::to_bytes` re-deltifies keypoint offsets and timestamps
   relative to the previous entry and emits each as a Skeleton 4.0
   variable-byte integer (7 bits per byte, high bit set on the

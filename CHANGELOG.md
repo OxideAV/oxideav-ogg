@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `Display-hint` accessor on Skeleton-4 `FisBone`.** A new
+  `FisBone::display_hint() -> Option<Result<DisplayHint>>` parses the
+  parametric rendering-hint message header documented in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Display-hint
+  into one of four discriminated variants on a new `DisplayHint` enum:
+  `Pip { x, y, width, height }` for the wiki's 2- and 4-arg
+  picture-in-picture forms (`pip(20%,20%)` / `pip(40,40,690,60)`),
+  `Mask { image, x, y, width, height }` for the 1-, 3- and 5-arg
+  video-mask forms (`mask(url)` / `mask(url,30%,25%)` /
+  `mask(url,20,20,400,320)`), `Transparent { percent }` for the
+  uniform-transparency hint (`transparent(25%)` worked example,
+  spec value range `0..=100`), and `Other { tag, arguments }` for
+  forward-compatible / vendor hint tags per the wiki's
+  "Currently proposed hints are:" soft-enumeration wording.
+  Coordinates carry the wiki's pixel-vs-percent distinction via a
+  new `DisplayCoord` enum (`Pixels(i32)` / `Percent(f32)`); each
+  argument token is parsed independently so a `pip(50%,30,75%,20)`
+  shape with mixed coordinate types round-trips. The outer `Option`
+  distinguishes "header absent" from "header present", and the
+  inner `Result` surfaces parse errors (missing parentheses, wrong
+  argument count for a documented tag, non-numeric coordinate,
+  decimal `transparent` percent, or a `transparent` value above 100)
+  so callers can decide whether to skip the field or reject the
+  packet. Surrounding whitespace on the value and on every argument
+  token is trimmed — the same HTTP-style framing tolerance as
+  `role()`, `languages()` and `altitude()`. Header-name lookup is
+  case-insensitive via the underlying `FisBone::header` path; the
+  hint tag itself is matched case-insensitively too (so `PIP(...)`
+  parses as `Pip`). 23 new lib unit tests cover every wiki worked
+  example for `pip` (2-arg percent, 4-arg pixel), `mask` (1-, 3-,
+  5-arg URL forms with `http://` and `file://` schemes), and
+  `transparent` (`25%`, `7%`, `0%`, `100%` boundaries), plus
+  rejection of every malformed shape spelled out above and the
+  Other fall-through for unknown tags.
 - **Typed `Altitude` accessor on Skeleton-4 `FisBone`.** A new
   `FisBone::altitude() -> Option<Result<i64>>` parses the stack-order
   message-header field documented in

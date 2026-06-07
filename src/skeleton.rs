@@ -487,6 +487,247 @@ impl Role {
     }
 }
 
+/// One numeric argument inside a `Display-hint` parametric form.
+///
+/// The Skeleton-4 message-headers wiki
+/// (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Display-hint)
+/// documents `pip(x,y,w,h)` and `mask(img,x,y,w,h)` arguments as
+/// "x, y, w, and h can be specified in percentage, thus allowing
+/// persistent placement independent of the scaling of the video display"
+/// — the worked examples are `pip(40,40,690,60)` (raw pixel integers) and
+/// `pip(20%,20%)` (percent values with a trailing `%`).
+///
+/// [`DisplayCoord::Percent`] carries the percent value (so `20%` →
+/// `Percent(20.0)`); [`DisplayCoord::Pixels`] carries the raw integer
+/// coordinate. Percent is `f32` because the wiki gives whole-number
+/// examples but does not forbid fractional percents (e.g. `12.5%`); pixel
+/// values are `i32` because the wiki gives only positive integer
+/// examples but does not forbid negative offsets for off-screen anchors.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DisplayCoord {
+    /// Raw pixel offset / extent (the wiki's `pip(40,40,690,60)` form).
+    Pixels(i32),
+    /// Percentage value (the wiki's `pip(20%,20%)` / `transparent(7%)`
+    /// form). The trailing `%` is stripped at parse time and the value
+    /// stored as the bare number.
+    Percent(f32),
+}
+
+impl DisplayCoord {
+    /// Parse a single coordinate token (the wiki spells these as raw
+    /// integers like `40` or percentages like `20%`). Trims surrounding
+    /// whitespace.
+    fn parse(raw: &str) -> Result<DisplayCoord> {
+        let trimmed = raw.trim();
+        if let Some(pct) = trimmed.strip_suffix('%') {
+            let pct = pct.trim();
+            pct.parse::<f32>().map(DisplayCoord::Percent).map_err(|e| {
+                Error::invalid(format!(
+                    "Skeleton Display-hint: malformed percent coordinate {trimmed:?}: {e}"
+                ))
+            })
+        } else {
+            trimmed
+                .parse::<i32>()
+                .map(DisplayCoord::Pixels)
+                .map_err(|e| {
+                    Error::invalid(format!(
+                        "Skeleton Display-hint: malformed pixel coordinate {trimmed:?}: {e}"
+                    ))
+                })
+        }
+    }
+}
+
+/// Parsed value of the `Display-hint` message-header field.
+///
+/// The Skeleton-4 message-headers wiki
+/// (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Display-hint)
+/// enumerates three forms for the rendering hint:
+///
+/// * `pip(x,y,w,h)` — picture-in-picture placement. `x`/`y` are the
+///   top-left origin; `w`/`h` are the width/height (optional per the
+///   wiki: "w,h the width and height in pixels which are optional").
+/// * `mask(img,x,y,w,h)` — black-on-white image mask. `img` is the URL
+///   (mandatory); the four placement coordinates are all optional.
+/// * `transparent(p%)` — uniform transparency `0..=100`.
+///
+/// The wiki explicitly warns "A media player can of course decide to
+/// ignore these hints", and notes "Currently proposed hints are:" — so
+/// vendor / forward-compatible hint kinds are surfaced as
+/// [`DisplayHint::Other`] with the original tag plus the raw
+/// comma-separated argument list, instead of failing to parse.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DisplayHint {
+    /// `pip(x,y[,w,h])` picture-in-picture hint. `width` / `height` are
+    /// `None` when the wiki's 2-arg shorthand (`pip(20%,20%)`) is used.
+    Pip {
+        x: DisplayCoord,
+        y: DisplayCoord,
+        width: Option<DisplayCoord>,
+        height: Option<DisplayCoord>,
+    },
+    /// `mask(img[,x,y[,w,h]])` video-mask hint. `image` is the mask URL.
+    /// The four placement coordinates are all optional per the wiki's
+    /// progressively-shorter examples (`mask(url)`, `mask(url,30%,25%)`,
+    /// `mask(url,20,20,400,320)`).
+    Mask {
+        image: String,
+        x: Option<DisplayCoord>,
+        y: Option<DisplayCoord>,
+        width: Option<DisplayCoord>,
+        height: Option<DisplayCoord>,
+    },
+    /// `transparent(p%)` uniform transparency hint. The wiki specifies
+    /// "int value between 0 and 100"; the parser stores it in a `u8` and
+    /// rejects values outside `0..=100` as `Err(_)` at the
+    /// `FisBone::display_hint()` outer layer.
+    Transparent {
+        /// Percent transparency, `0..=100`.
+        percent: u8,
+    },
+    /// A hint with a tag not listed in the wiki's "Currently proposed
+    /// hints are:" enumeration. The original tag is preserved verbatim
+    /// alongside the trimmed comma-separated argument list so callers
+    /// can route forward-compatible hints without losing information.
+    Other {
+        /// Hint name (everything before the opening `(`).
+        tag: String,
+        /// Raw, trimmed argument tokens in source order.
+        arguments: Vec<String>,
+    },
+}
+
+impl DisplayHint {
+    /// Parse a `Display-hint` header value into a [`DisplayHint`].
+    ///
+    /// The value must take the wiki's `tag(args...)` shape — a bare
+    /// `tag` with no parenthesised body is rejected as malformed because
+    /// every documented form carries arguments. Surrounding whitespace
+    /// on the value and on individual argument tokens is trimmed.
+    ///
+    /// Unknown hint tags map to [`DisplayHint::Other`] retaining the
+    /// as-written tag, per the wiki's "Currently proposed hints are:"
+    /// soft-enumeration wording.
+    pub fn parse(raw: &str) -> Result<DisplayHint> {
+        let value = raw.trim();
+        let open = value.find('(').ok_or_else(|| {
+            Error::invalid(format!(
+                "Skeleton Display-hint: missing '(' in value {value:?}"
+            ))
+        })?;
+        if !value.ends_with(')') {
+            return Err(Error::invalid(format!(
+                "Skeleton Display-hint: missing trailing ')' in value {value:?}"
+            )));
+        }
+        let tag = value[..open].trim();
+        if tag.is_empty() {
+            return Err(Error::invalid(format!(
+                "Skeleton Display-hint: empty tag in value {value:?}"
+            )));
+        }
+        let body = &value[open + 1..value.len() - 1];
+        let args: Vec<&str> = if body.trim().is_empty() {
+            Vec::new()
+        } else {
+            body.split(',').map(str::trim).collect()
+        };
+
+        match tag.to_ascii_lowercase().as_str() {
+            "pip" => {
+                if args.len() != 2 && args.len() != 4 {
+                    return Err(Error::invalid(format!(
+                        "Skeleton Display-hint: pip(...) expects 2 or 4 arguments, got {} in {value:?}",
+                        args.len()
+                    )));
+                }
+                let x = DisplayCoord::parse(args[0])?;
+                let y = DisplayCoord::parse(args[1])?;
+                let (width, height) = if args.len() == 4 {
+                    (
+                        Some(DisplayCoord::parse(args[2])?),
+                        Some(DisplayCoord::parse(args[3])?),
+                    )
+                } else {
+                    (None, None)
+                };
+                Ok(DisplayHint::Pip {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+            }
+            "mask" => {
+                if args.is_empty() {
+                    return Err(Error::invalid(format!(
+                        "Skeleton Display-hint: mask(...) requires at least the image URL in {value:?}"
+                    )));
+                }
+                // The wiki enumerates mask(img), mask(img,x,y),
+                // mask(img,x,y,w,h) — i.e. 1, 3 or 5 arguments. Anything
+                // else is rejected as malformed.
+                if !matches!(args.len(), 1 | 3 | 5) {
+                    return Err(Error::invalid(format!(
+                        "Skeleton Display-hint: mask(...) expects 1, 3 or 5 arguments, got {} in {value:?}",
+                        args.len()
+                    )));
+                }
+                let image = args[0].to_string();
+                let (x, y, width, height) = match args.len() {
+                    1 => (None, None, None, None),
+                    3 => (
+                        Some(DisplayCoord::parse(args[1])?),
+                        Some(DisplayCoord::parse(args[2])?),
+                        None,
+                        None,
+                    ),
+                    5 => (
+                        Some(DisplayCoord::parse(args[1])?),
+                        Some(DisplayCoord::parse(args[2])?),
+                        Some(DisplayCoord::parse(args[3])?),
+                        Some(DisplayCoord::parse(args[4])?),
+                    ),
+                    _ => unreachable!(),
+                };
+                Ok(DisplayHint::Mask {
+                    image,
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+            }
+            "transparent" => {
+                if args.len() != 1 {
+                    return Err(Error::invalid(format!(
+                        "Skeleton Display-hint: transparent(...) expects 1 argument, got {} in {value:?}",
+                        args.len()
+                    )));
+                }
+                let arg = args[0];
+                let stripped = arg.strip_suffix('%').unwrap_or(arg).trim();
+                let pct: u32 = stripped.parse().map_err(|e| {
+                    Error::invalid(format!(
+                        "Skeleton Display-hint: malformed transparent({arg:?}) value: {e}"
+                    ))
+                })?;
+                if pct > 100 {
+                    return Err(Error::invalid(format!(
+                        "Skeleton Display-hint: transparent({arg:?}) value {pct} exceeds 100"
+                    )));
+                }
+                Ok(DisplayHint::Transparent { percent: pct as u8 })
+            }
+            _ => Ok(DisplayHint::Other {
+                tag: tag.to_string(),
+                arguments: args.into_iter().map(|s| s.to_string()).collect(),
+            }),
+        }
+    }
+}
+
 /// `fisbone` secondary header packet describing one logical bitstream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FisBone {
@@ -623,6 +864,33 @@ impl FisBone {
                 ))
             })
         })
+    }
+
+    /// Typed `Display-hint` accessor.
+    ///
+    /// Parses the `Display-hint` message header per
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Display-hint
+    /// into a [`DisplayHint`] discriminating between the three documented
+    /// rendering hints — `pip(x,y[,w,h])`, `mask(img[,x,y[,w,h]])`,
+    /// `transparent(p%)` — and a fall-through [`DisplayHint::Other`] for
+    /// forward-compatible / vendor-defined hint tags (the wiki phrasing
+    /// "Currently proposed hints are:" leaves room for new ones).
+    ///
+    /// The outer `Option` distinguishes "header absent" from "header
+    /// present"; the inner [`Result`] surfaces a parse error (missing
+    /// parentheses, wrong number of arguments for a documented tag,
+    /// non-numeric coordinate, out-of-range `transparent` percent, …)
+    /// so the caller can decide whether to skip the field or reject the
+    /// packet. The header value is trimmed and so is every individual
+    /// argument token — the same HTTP-style framing tolerance as
+    /// `role()`, `languages()` and `altitude()`.
+    ///
+    /// The wiki notes "A media player can of course decide to ignore
+    /// these hints" — this accessor surfaces the structured form so
+    /// callers can route decisions on it rather than re-doing the string
+    /// match themselves.
+    pub fn display_hint(&self) -> Option<Result<DisplayHint>> {
+        self.header("Display-hint").map(DisplayHint::parse)
     }
 
     /// Parse a `fisbone` packet (the full Skeleton secondary header
@@ -1912,5 +2180,322 @@ mod tests {
         b.set_header("Altitude", "10");
         b.set_header("ALTITUDE", "-3");
         assert_eq!(b.altitude().expect("present").expect("valid"), -3);
+    }
+
+    // ---------------- Display-hint typed accessor ----------------
+    //
+    // Wiki reference: docs/container/ogg/ogg-skeleton-message-headers.wiki
+    // §Display-hint. Three documented hint forms — pip(...), mask(...),
+    // transparent(...) — plus a forward-compatible Other fall-through.
+
+    #[test]
+    fn display_hint_returns_none_when_header_absent() {
+        let b = FisBone::new(1, Rational::new(48_000, 1));
+        assert!(b.display_hint().is_none());
+    }
+
+    #[test]
+    fn display_hint_parses_wiki_pip_two_arg_percent_example() {
+        // Wiki example: "Display-hint: pip(20%,20%)".
+        let b = bone_with("Display-hint", "pip(20%,20%)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Pip {
+                x: DisplayCoord::Percent(20.0),
+                y: DisplayCoord::Percent(20.0),
+                width: None,
+                height: None,
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_parses_wiki_pip_four_arg_pixel_example() {
+        // Wiki example: "Display-hint: pip(40,40,690,60)".
+        let b = bone_with("Display-hint", "pip(40,40,690,60)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Pip {
+                x: DisplayCoord::Pixels(40),
+                y: DisplayCoord::Pixels(40),
+                width: Some(DisplayCoord::Pixels(690)),
+                height: Some(DisplayCoord::Pixels(60)),
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_pip_rejects_three_arguments() {
+        // The wiki enumerates 2- and 4-arg pip forms; 3 args is malformed.
+        let b = bone_with("Display-hint", "pip(10,20,30)");
+        let parsed = b.display_hint().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn display_hint_pip_mixed_pixel_and_percent() {
+        // The wiki documents both pixel and percent shapes; mixing them is
+        // not explicitly forbidden ("x, y, w, and h can be specified in
+        // percentage") so we parse each coordinate independently.
+        let b = bone_with("Display-hint", "pip(50%,30,75%,20)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Pip {
+                x: DisplayCoord::Percent(50.0),
+                y: DisplayCoord::Pixels(30),
+                width: Some(DisplayCoord::Percent(75.0)),
+                height: Some(DisplayCoord::Pixels(20)),
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_parses_wiki_mask_one_arg_example() {
+        // Wiki example: "Display-hint: mask(http://www.example.com/image.png)".
+        let b = bone_with("Display-hint", "mask(http://www.example.com/image.png)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Mask {
+                image: "http://www.example.com/image.png".to_string(),
+                x: None,
+                y: None,
+                width: None,
+                height: None,
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_parses_wiki_mask_three_arg_example() {
+        // Wiki example: "Display-hint: mask(http://.../image.png,30%,25%)".
+        let b = bone_with(
+            "Display-hint",
+            "mask(http://www.example.com/image.png,30%,25%)",
+        );
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Mask {
+                image: "http://www.example.com/image.png".to_string(),
+                x: Some(DisplayCoord::Percent(30.0)),
+                y: Some(DisplayCoord::Percent(25.0)),
+                width: None,
+                height: None,
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_parses_wiki_mask_five_arg_example() {
+        // Wiki example: "Display-hint: mask(http://.../image.png,20,20,400,320)".
+        let b = bone_with(
+            "Display-hint",
+            "mask(http://www.example.com/image.png,20,20,400,320)",
+        );
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Mask {
+                image: "http://www.example.com/image.png".to_string(),
+                x: Some(DisplayCoord::Pixels(20)),
+                y: Some(DisplayCoord::Pixels(20)),
+                width: Some(DisplayCoord::Pixels(400)),
+                height: Some(DisplayCoord::Pixels(320)),
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_mask_rejects_two_arguments() {
+        // The wiki enumerates 1-, 3- and 5-arg mask forms; 2-arg is
+        // malformed.
+        let b = bone_with("Display-hint", "mask(url,10%)");
+        let parsed = b.display_hint().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn display_hint_parses_wiki_transparent_examples() {
+        // Wiki examples: "Display-hint: transparent(25%)" and
+        // "Display-hint: transparent(7%)".
+        for (raw, expect) in [("transparent(25%)", 25u8), ("transparent(7%)", 7u8)] {
+            let b = bone_with("Display-hint", raw);
+            let parsed = b.display_hint().expect("present").expect("valid");
+            assert_eq!(parsed, DisplayHint::Transparent { percent: expect });
+        }
+    }
+
+    #[test]
+    fn display_hint_transparent_accepts_zero_and_hundred_bounds() {
+        for v in [0u8, 100u8] {
+            let raw = format!("transparent({v}%)");
+            let b = bone_with("Display-hint", &raw);
+            let parsed = b.display_hint().expect("present").expect("valid");
+            assert_eq!(parsed, DisplayHint::Transparent { percent: v });
+        }
+    }
+
+    #[test]
+    fn display_hint_transparent_rejects_value_above_100() {
+        // Wiki spec: "int value between 0 and 100".
+        let b = bone_with("Display-hint", "transparent(150%)");
+        let parsed = b.display_hint().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn display_hint_transparent_rejects_non_integer() {
+        // The wiki spells "int value" — fractional percent is malformed.
+        let b = bone_with("Display-hint", "transparent(25.5%)");
+        let parsed = b.display_hint().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn display_hint_unknown_tag_yields_other() {
+        // The wiki phrasing "Currently proposed hints are:" leaves room
+        // for vendor / forward-compatible hint tags. Anything not in the
+        // documented enumeration is surfaced as Other.
+        let b = bone_with("Display-hint", "vendor-zoom(2.0)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Other {
+                tag: "vendor-zoom".to_string(),
+                arguments: vec!["2.0".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_unknown_tag_preserves_multiple_arguments() {
+        let b = bone_with("Display-hint", "fancy(a,b,c,d)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Other {
+                tag: "fancy".to_string(),
+                arguments: vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                    "c".to_string(),
+                    "d".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_rejects_missing_open_paren() {
+        let b = bone_with("Display-hint", "pip 20%,20%");
+        let parsed = b.display_hint().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn display_hint_rejects_missing_close_paren() {
+        let b = bone_with("Display-hint", "pip(20%,20%");
+        let parsed = b.display_hint().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn display_hint_rejects_empty_tag() {
+        // A value of "(20%,20%)" has no tag — every documented form
+        // names its hint, so reject the empty-tag shape.
+        let b = bone_with("Display-hint", "(20%,20%)");
+        let parsed = b.display_hint().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn display_hint_trims_surrounding_whitespace_on_value_and_args() {
+        // The HTTP-style framing in the rest of the message-header block
+        // may inject a leading space after the colon; argument tokens
+        // commonly carry stray whitespace too.
+        let b = bone_with("Display-hint", "  pip( 10 , 20 , 30 , 40 )  ");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Pip {
+                x: DisplayCoord::Pixels(10),
+                y: DisplayCoord::Pixels(20),
+                width: Some(DisplayCoord::Pixels(30)),
+                height: Some(DisplayCoord::Pixels(40)),
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_pip_lowercase_tag_match_is_case_insensitive() {
+        // The wiki spells tags lower-case; tolerate upper-case spellings
+        // the way the rest of the message-header block tolerates
+        // case-mismatched header names.
+        let b = bone_with("Display-hint", "PIP(10%,10%)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Pip {
+                x: DisplayCoord::Percent(10.0),
+                y: DisplayCoord::Percent(10.0),
+                width: None,
+                height: None,
+            }
+        );
+    }
+
+    #[test]
+    fn display_hint_lookup_is_case_insensitive_on_header_name() {
+        // The accessor delegates to FisBone::header, which the rest of
+        // the typed accessors already verify is case-insensitive.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("display-hint", "transparent(40%)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(parsed, DisplayHint::Transparent { percent: 40 });
+
+        let mut b2 = FisBone::new(1, Rational::new(48_000, 1));
+        b2.set_header("DISPLAY-HINT", "transparent(60%)");
+        let parsed2 = b2.display_hint().expect("present").expect("valid");
+        assert_eq!(parsed2, DisplayHint::Transparent { percent: 60 });
+    }
+
+    #[test]
+    fn display_hint_through_set_header_replace() {
+        // Most-recent set_header value wins, via case-insensitive
+        // replacement on the underlying storage.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Display-hint", "transparent(10%)");
+        b.set_header("DISPLAY-HINT", "transparent(80%)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(parsed, DisplayHint::Transparent { percent: 80 });
+    }
+
+    #[test]
+    fn display_hint_pip_rejects_non_numeric_coordinate() {
+        let b = bone_with("Display-hint", "pip(abc,10%)");
+        let parsed = b.display_hint().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn display_hint_mask_preserves_image_url_as_first_arg_verbatim() {
+        // The mask image arg is documented as a URL (e.g. http://...);
+        // the parser must NOT try to coerce it into a numeric coordinate.
+        let b = bone_with("Display-hint", "mask(file:///opt/share/masks/circle.png)");
+        let parsed = b.display_hint().expect("present").expect("valid");
+        assert_eq!(
+            parsed,
+            DisplayHint::Mask {
+                image: "file:///opt/share/masks/circle.png".to_string(),
+                x: None,
+                y: None,
+                width: None,
+                height: None,
+            }
+        );
     }
 }
