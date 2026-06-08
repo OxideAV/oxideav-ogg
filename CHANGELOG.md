@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `Content-Type` accessor on Skeleton-4 `FisBone`.** A new
+  `FisBone::content_type() -> Option<Result<ContentType>>` parses the
+  only **mandatory** Skeleton 4 per-track message-header field
+  (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Content-type,
+  also worked-out as `"Content-Type: audio/vorbis"` in
+  `docs/container/ogg/ogg-skeleton-4.0.md` §3 and the matching 3.0 doc)
+  into a structured (`kind`, `subtype`, `parameters`) triple on a new
+  `ContentType` struct. The MIME top-level `type` is bucketed by a new
+  `ContentTypeKind` enum (`Audio` / `Video` / `Text` / `Image` /
+  `Application`) with case-insensitive matching (RFC 2045 § 5.1: "the
+  type, subtype, and parameter names are not case sensitive"); unknown
+  top-level types round-trip as `ContentTypeKind::Other(String)`
+  preserving the as-written token, so the wiki's "mime types don't
+  always provide the right main content type (e.g. application/kate is
+  semantically a text format)" pattern survives intact. Five
+  convenience predicates (`is_audio` / `is_video` / `is_text` /
+  `is_image` / `is_application`), an `as_wire` getter, a
+  `ContentType::subtype_eq` case-insensitive subtype compare, and a
+  `ContentType::parameter` case-insensitive parameter lookup mirror the
+  surface of the existing `role()` accessor. RFC 2045 parameters
+  (e.g. `audio/ogg;codecs=opus`, `video/mp4;codecs=avc1.42E01E;profiles=mp42`)
+  are split on `;` and `=`, surrounding whitespace is trimmed on every
+  token, empty segments are dropped, and `key`-only tokens become
+  `(key, "")`. The outer `Option` distinguishes "header absent" (a
+  non-conforming fisbone) from "header present", and the inner
+  `Result` surfaces parse errors (empty value, missing `/`, empty
+  `type` or `subtype`) so the caller can decide whether to skip the
+  field or reject the packet. Header-name lookup is case-insensitive
+  via the underlying `FisBone::header` path. 21 new lib unit tests
+  cover the wiki worked examples (`audio/vorbis`, `video/theora`),
+  every well-known top-level kind, case-insensitive bucket matching,
+  unknown-type round-trips into `Other`, single + multi-parameter
+  forms with order preservation, case-insensitive parameter and
+  header-name lookup, surrounding-whitespace trimming on value /
+  params, empty-segment tolerance (`;;`), the
+  `application/x-ogg-skeleton` self-bitstream form, rejection of every
+  malformed shape (missing `/`, empty value, empty `type`, empty
+  subtype, blank value), `set_header`-driven replace semantics, and
+  mutually-exclusive predicates.
+
 - **Typed `Display-hint` accessor on Skeleton-4 `FisBone`.** A new
   `FisBone::display_hint() -> Option<Result<DisplayHint>>` parses the
   parametric rendering-hint message header documented in

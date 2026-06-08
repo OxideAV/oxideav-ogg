@@ -286,8 +286,23 @@ For encode-side use, every type round-trips through `to_bytes` /
   `header` provide case-insensitive lookup for the spec's compulsory
   4.0 fields (`Content-Type`, `Role`, `Name`) plus the larger field
   registry in `docs/container/ogg/ogg-skeleton-message-headers.wiki`.
-- **Typed message-header accessors** parse three of those wiki-documented
+- **Typed message-header accessors** parse five of those wiki-documented
   fields into structured values:
+  `FisBone::content_type()` returns an `Option<Result<ContentType>>` for the
+  only **mandatory** Skeleton-4 per-track field
+  (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Content-type,
+  worked-out as `"Content-Type: audio/vorbis"` in
+  `docs/container/ogg/ogg-skeleton-4.0.md` §3): the MIME `type/subtype`
+  pair is split into a `ContentTypeKind` (`Audio` / `Video` / `Text` /
+  `Image` / `Application`, with unknown buckets surfaced as
+  `ContentTypeKind::Other(String)`) plus a preserved `subtype` string
+  and an RFC 2045 `;key=value` parameter list (so
+  `audio/ogg;codecs=opus` round-trips with `parameter("codecs")`
+  returning `Some("opus")`). Case-insensitive on bucket match,
+  subtype compare, and parameter lookup per RFC 2045 § 5.1; the
+  outer `Option` distinguishes "header absent" from "header present"
+  and the inner `Result` surfaces malformed-MIME parse errors so the
+  caller can decide whether to skip the field or reject the packet.
   `FisBone::role()` returns an `Option<Role>` whose `kind` is one of
   the 24 enumerated `RoleKind` variants for `text/* | video/* | audio/*`
   tracks (forward-compatible / vendor tags round-trip as

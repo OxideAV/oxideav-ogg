@@ -728,6 +728,218 @@ impl DisplayHint {
     }
 }
 
+/// Top-level "type" component of a `Content-Type` MIME value.
+///
+/// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Content-type names
+/// `Content-Type` as the only **mandatory** Skeleton 4 per-track message
+/// header; the value is "the mime type of the track" (e.g. `audio/vorbis`,
+/// `video/theora`). The wiki and the 3.0/4.0 `fisbone\0` documentation
+/// (`docs/container/ogg/ogg-skeleton-{3,4}.0.md`) both leave the
+/// MIME-string grammar to the external HTTP / RFC 2045 specification, and
+/// observe that the carried tracks fall almost entirely into three
+/// well-known top-level types — `text/*`, `audio/*`, `video/*` —
+/// matching the §Role enumeration shape.
+///
+/// `ContentTypeKind` enumerates those three plus an `Other(String)` escape
+/// for forward-compatible / vendor types like `application/kate` (called
+/// out verbatim in §Role: "mime types don't always provide the right main
+/// content type (e.g. application/kate is semantically a text format)"),
+/// `image/*` for cover-art tracks, etc. The original token is preserved
+/// inside `Other` so callers can route on a string match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentTypeKind {
+    /// `audio/*` — Vorbis, Opus, Speex, FLAC, …
+    Audio,
+    /// `video/*` — Theora, Daala (when carried), …
+    Video,
+    /// `text/*` — caption / subtitle / chapter / metadata tracks.
+    Text,
+    /// `image/*` — cover art and similar still-image tracks.
+    Image,
+    /// `application/*` — Kate (per the §Role note), Skeleton itself
+    /// (`application/x-ogg-skeleton`), and other application-typed payloads.
+    Application,
+    /// Any top-level type not in the four well-known buckets above. The
+    /// original token is preserved verbatim (case as written) so the
+    /// caller can match on it without losing information.
+    Other(String),
+}
+
+impl ContentTypeKind {
+    /// Match a top-level MIME type string case-insensitively against the
+    /// well-known buckets. Anything else maps to [`Self::Other`].
+    fn from_token(token: &str) -> Self {
+        match token.to_ascii_lowercase().as_str() {
+            "audio" => ContentTypeKind::Audio,
+            "video" => ContentTypeKind::Video,
+            "text" => ContentTypeKind::Text,
+            "image" => ContentTypeKind::Image,
+            "application" => ContentTypeKind::Application,
+            _ => ContentTypeKind::Other(token.to_string()),
+        }
+    }
+
+    /// `true` for `audio/*` tracks.
+    pub fn is_audio(&self) -> bool {
+        matches!(self, ContentTypeKind::Audio)
+    }
+
+    /// `true` for `video/*` tracks.
+    pub fn is_video(&self) -> bool {
+        matches!(self, ContentTypeKind::Video)
+    }
+
+    /// `true` for `text/*` tracks.
+    pub fn is_text(&self) -> bool {
+        matches!(self, ContentTypeKind::Text)
+    }
+
+    /// `true` for `image/*` tracks.
+    pub fn is_image(&self) -> bool {
+        matches!(self, ContentTypeKind::Image)
+    }
+
+    /// `true` for `application/*` tracks (incl. `application/kate` per
+    /// the §Role wiki note and `application/x-ogg-skeleton` for the
+    /// metadata bitstream itself).
+    pub fn is_application(&self) -> bool {
+        matches!(self, ContentTypeKind::Application)
+    }
+
+    /// Lower-case wire token for the kind. `ContentTypeKind::Other(t)`
+    /// returns `t` as-written so a round-trip preserves the original
+    /// casing.
+    pub fn as_wire(&self) -> &str {
+        match self {
+            ContentTypeKind::Audio => "audio",
+            ContentTypeKind::Video => "video",
+            ContentTypeKind::Text => "text",
+            ContentTypeKind::Image => "image",
+            ContentTypeKind::Application => "application",
+            ContentTypeKind::Other(s) => s.as_str(),
+        }
+    }
+}
+
+/// Parsed value of the `Content-Type` Skeleton message-header field.
+///
+/// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Content-type
+/// designates `Content-Type` as Skeleton 4's only **mandatory** message
+/// header, with the value being a MIME type. The 4.0 `fisbone\0`
+/// documentation (`docs/container/ogg/ogg-skeleton-4.0.md` §3 and
+/// the matching 3.0 doc) gives the worked example
+/// `"Content-Type: audio/vorbis"` and notes "Message header fields are
+/// terminated/delimited by `\r\n`". Beyond the well-known
+/// `<type>/<subtype>` shape, the wiki also points at the wider XiphWiki
+/// `MIME_Types_and_File_Extensions` registry for the full
+/// codec → mime-type map.
+///
+/// MIME types per RFC 2045 § 5.1 (Content-Type Header Field) allow
+/// `;name=value` parameters appended after the bare type — e.g.
+/// `audio/ogg;codecs=opus`, which encoders / containers occasionally
+/// emit even on a Skeleton fisbone. This typed accessor splits the
+/// MIME tail into a structured (`type_`, `subtype`, `parameters`)
+/// triple so callers can route on either the `subtype` string or the
+/// `kind` predicate without re-doing the parse themselves.
+///
+/// All three components are case-insensitive on lookup: MIME `type` and
+/// `subtype` per RFC 2045 § 5.1 ("the type, subtype, and parameter
+/// names are not case sensitive"), and parameter names follow the same
+/// rule. Surrounding whitespace on the value and on every parameter
+/// token is trimmed — the same HTTP-style framing tolerance the other
+/// typed accessors apply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentType {
+    /// Top-level MIME type bucketed by [`ContentTypeKind`]. The original
+    /// token survives inside [`ContentTypeKind::Other`] for forward-
+    /// compatible / vendor types.
+    pub kind: ContentTypeKind,
+    /// MIME subtype as written (e.g. `vorbis`, `theora`, `x-ogg-skeleton`).
+    /// Lookup via [`Self::subtype_eq`] is case-insensitive.
+    pub subtype: String,
+    /// `;key=value` parameters appended after the MIME tail, in
+    /// declaration order. The key is preserved as written; case-
+    /// insensitive lookup is provided by [`Self::parameter`]. Empty
+    /// parameter tokens are dropped (`audio/ogg;` is a bare type).
+    pub parameters: Vec<(String, String)>,
+}
+
+impl ContentType {
+    /// Parse a `Content-Type` header value into a [`ContentType`].
+    ///
+    /// The grammar follows RFC 2045 § 5.1: a `type/subtype` pair followed
+    /// by zero or more `;key=value` parameters. Surrounding whitespace
+    /// is tolerated on the value, the `type`, the `subtype`, and every
+    /// parameter token. The MIME `type` is matched case-insensitively
+    /// against the well-known [`ContentTypeKind`] buckets; anything else
+    /// (and the original casing) is preserved verbatim inside
+    /// [`ContentTypeKind::Other`].
+    ///
+    /// A bare value with no `/` is rejected as malformed — every
+    /// MIME-type spec requires the subtype, and accepting a bare
+    /// `audio` would silently collapse `audio/vorbis` and `audio/opus`
+    /// onto the same kind.
+    pub fn parse(raw: &str) -> Result<ContentType> {
+        let value = raw.trim();
+        let mut parts = value.split(';');
+        let head = parts.next().unwrap_or("").trim();
+        if head.is_empty() {
+            return Err(Error::invalid("Skeleton Content-Type: empty MIME value"));
+        }
+        let slash = head.find('/').ok_or_else(|| {
+            Error::invalid(format!(
+                "Skeleton Content-Type: missing '/' in MIME value {head:?}"
+            ))
+        })?;
+        let type_token = head[..slash].trim();
+        let subtype = head[slash + 1..].trim();
+        if type_token.is_empty() {
+            return Err(Error::invalid(format!(
+                "Skeleton Content-Type: empty top-level type in {head:?}"
+            )));
+        }
+        if subtype.is_empty() {
+            return Err(Error::invalid(format!(
+                "Skeleton Content-Type: empty subtype in {head:?}"
+            )));
+        }
+        let kind = ContentTypeKind::from_token(type_token);
+        let mut parameters = Vec::new();
+        for p in parts {
+            let p = p.trim();
+            if p.is_empty() {
+                continue;
+            }
+            if let Some(eq) = p.find('=') {
+                let (k, v) = p.split_at(eq);
+                parameters.push((k.trim().to_string(), v[1..].trim().to_string()));
+            } else {
+                parameters.push((p.to_string(), String::new()));
+            }
+        }
+        Ok(ContentType {
+            kind,
+            subtype: subtype.to_string(),
+            parameters,
+        })
+    }
+
+    /// Look up a parameter value by case-insensitive name (RFC 2045
+    /// § 5.1: "parameter names are not case sensitive").
+    pub fn parameter(&self, name: &str) -> Option<&str> {
+        self.parameters
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Case-insensitive subtype compare (RFC 2045 § 5.1: "the type,
+    /// subtype, and parameter names are not case sensitive").
+    pub fn subtype_eq(&self, expected: &str) -> bool {
+        self.subtype.eq_ignore_ascii_case(expected)
+    }
+}
+
 /// `fisbone` secondary header packet describing one logical bitstream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FisBone {
@@ -891,6 +1103,35 @@ impl FisBone {
     /// match themselves.
     pub fn display_hint(&self) -> Option<Result<DisplayHint>> {
         self.header("Display-hint").map(DisplayHint::parse)
+    }
+
+    /// Typed `Content-Type` accessor.
+    ///
+    /// Parses the `Content-Type` message header per
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Content-type
+    /// (and the matching example in `docs/container/ogg/ogg-skeleton-4.0.md`
+    /// §3 `"Content-Type: audio/vorbis"`) into a [`ContentType`] triple of
+    /// (`kind`, `subtype`, `parameters`). The MIME `type` is bucketed by
+    /// the [`ContentTypeKind`] enum (`audio` / `video` / `text` / `image`
+    /// / `application`); unknown top-level types round-trip as
+    /// [`ContentTypeKind::Other`] so the wiki's "mime types don't always
+    /// provide the right main content type (e.g. application/kate is
+    /// semantically a text format)" pattern survives intact.
+    ///
+    /// `Content-Type` is the only **mandatory** Skeleton 4 message header
+    /// per the wiki ("Right now, there is one mandatory message header
+    /// field for all of the logical bitstreams: the `Content-type`
+    /// header field"); the outer `Option` distinguishes "header absent"
+    /// (a non-conforming fisbone) from "header present", and the inner
+    /// [`Result`] surfaces a parse error (empty value, missing `/`,
+    /// empty `type` or `subtype`) so the caller can decide whether to
+    /// skip the field or reject the packet. Surrounding whitespace on
+    /// the value and on every parameter token is trimmed — the same
+    /// HTTP-style framing tolerance as `role()`, `languages()`,
+    /// `altitude()`, and `display_hint()`. Header-name lookup is
+    /// case-insensitive via the underlying `FisBone::header` path.
+    pub fn content_type(&self) -> Option<Result<ContentType>> {
+        self.header("Content-Type").map(ContentType::parse)
     }
 
     /// Parse a `fisbone` packet (the full Skeleton secondary header
@@ -2497,5 +2738,280 @@ mod tests {
                 height: None,
             }
         );
+    }
+
+    // -------------------------------------------------------------
+    // Typed `Content-Type` accessor
+    // (docs/container/ogg/ogg-skeleton-message-headers.wiki §Content-type,
+    //  docs/container/ogg/ogg-skeleton-{3,4}.0.md §fisbone "Content-Type:
+    //  audio/vorbis" worked example).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn content_type_returns_none_when_header_absent() {
+        let b = FisBone::new(1, Rational::new(48_000, 1));
+        assert!(b.content_type().is_none());
+    }
+
+    #[test]
+    fn content_type_parses_wiki_audio_vorbis_example() {
+        // docs/container/ogg/ogg-skeleton-4.0.md §3 worked example:
+        // "Content-Type: audio/vorbis".
+        let b = bone_with("Content-Type", "audio/vorbis");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.kind, ContentTypeKind::Audio);
+        assert!(ct.kind.is_audio());
+        assert!(!ct.kind.is_video());
+        assert!(!ct.kind.is_text());
+        assert_eq!(ct.subtype, "vorbis");
+        assert!(ct.subtype_eq("Vorbis"));
+        assert!(ct.parameters.is_empty());
+        assert_eq!(ct.kind.as_wire(), "audio");
+    }
+
+    #[test]
+    fn content_type_parses_wiki_video_theora_example() {
+        // docs/container/ogg/ogg-skeleton-4.0.md §3 worked example
+        // explicitly names "video/theora" alongside "audio/vorbis" as
+        // the canonical content types Skeleton's Content-Type field
+        // carries.
+        let b = bone_with("Content-Type", "video/theora");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.kind, ContentTypeKind::Video);
+        assert!(ct.kind.is_video());
+        assert_eq!(ct.subtype, "theora");
+        assert_eq!(ct.kind.as_wire(), "video");
+    }
+
+    #[test]
+    fn content_type_each_well_known_top_level_kind() {
+        let cases = [
+            ("audio/opus", ContentTypeKind::Audio, "opus"),
+            ("video/theora", ContentTypeKind::Video, "theora"),
+            ("text/caption", ContentTypeKind::Text, "caption"),
+            ("image/png", ContentTypeKind::Image, "png"),
+            ("application/kate", ContentTypeKind::Application, "kate"),
+        ];
+        for (wire, expected_kind, expected_subtype) in cases {
+            let b = bone_with("Content-Type", wire);
+            let ct = b.content_type().expect("present").expect("valid");
+            assert_eq!(ct.kind, expected_kind, "{wire}");
+            assert_eq!(ct.subtype, expected_subtype, "{wire}");
+        }
+    }
+
+    #[test]
+    fn content_type_unknown_top_level_maps_to_other_preserving_case() {
+        // Wiki §Role notes "mime types don't always provide the right
+        // main content type (e.g. application/kate is semantically a
+        // text format)" — same principle applies on the Content-Type
+        // side: an unrecognised top-level type still round-trips
+        // verbatim into ContentTypeKind::Other.
+        let b = bone_with("Content-Type", "Multipart/Mixed");
+        let ct = b.content_type().expect("present").expect("valid");
+        // Top-level type is case-insensitive on the bucket match, but
+        // the as-written value survives inside Other for unknown types
+        // — and Mixed lives in `subtype` verbatim.
+        match ct.kind {
+            ContentTypeKind::Other(s) => assert_eq!(s, "Multipart"),
+            other => panic!("expected Other, got {:?}", other),
+        }
+        assert_eq!(ct.subtype, "Mixed");
+    }
+
+    #[test]
+    fn content_type_top_level_match_is_case_insensitive() {
+        // RFC 2045 § 5.1: "the type, subtype, and parameter names are
+        // not case sensitive". The bucket match folds case before the
+        // ContentTypeKind lookup, so AUDIO/Vorbis still classifies as
+        // ContentTypeKind::Audio.
+        let b = bone_with("Content-Type", "AUDIO/Vorbis");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.kind, ContentTypeKind::Audio);
+        // Subtype casing is preserved as-written; subtype_eq folds it.
+        assert_eq!(ct.subtype, "Vorbis");
+        assert!(ct.subtype_eq("vorbis"));
+        assert!(ct.subtype_eq("VORBIS"));
+    }
+
+    #[test]
+    fn content_type_parses_with_rfc2045_parameter() {
+        // RFC 2045 § 5.1 allows MIME parameters; encoders sometimes
+        // emit them on Skeleton fisbones (e.g. "audio/ogg;codecs=opus").
+        let b = bone_with("Content-Type", "audio/ogg;codecs=opus");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.kind, ContentTypeKind::Audio);
+        assert_eq!(ct.subtype, "ogg");
+        assert_eq!(ct.parameters.len(), 1);
+        assert_eq!(ct.parameter("codecs"), Some("opus"));
+    }
+
+    #[test]
+    fn content_type_parameter_lookup_is_case_insensitive() {
+        // RFC 2045 § 5.1: "parameter names are not case sensitive".
+        let b = bone_with("Content-Type", "audio/ogg;Codecs=opus");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.parameter("codecs"), Some("opus"));
+        assert_eq!(ct.parameter("CODECS"), Some("opus"));
+        assert_eq!(ct.parameter("Codecs"), Some("opus"));
+        assert_eq!(ct.parameter("missing"), None);
+    }
+
+    #[test]
+    fn content_type_multiple_parameters_preserve_order_and_lookup() {
+        let b = bone_with("Content-Type", "video/mp4;codecs=avc1.42E01E;profiles=mp42");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.kind, ContentTypeKind::Video);
+        assert_eq!(ct.subtype, "mp4");
+        assert_eq!(ct.parameters.len(), 2);
+        // Order preserved as written.
+        assert_eq!(ct.parameters[0].0, "codecs");
+        assert_eq!(ct.parameters[0].1, "avc1.42E01E");
+        assert_eq!(ct.parameters[1].0, "profiles");
+        assert_eq!(ct.parameters[1].1, "mp42");
+    }
+
+    #[test]
+    fn content_type_parameter_without_equals_yields_empty_value() {
+        // Mirrors `Role::parse` parameter handling: parameter token
+        // without an `=` becomes (key, "").
+        let b = bone_with("Content-Type", "audio/ogg;flag");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.parameters.len(), 1);
+        assert_eq!(ct.parameter("flag"), Some(""));
+    }
+
+    #[test]
+    fn content_type_empty_parameter_segments_are_dropped() {
+        // Trailing `;` or doubled `;;` should not become empty
+        // parameter entries — the parser tolerates loose serialisation.
+        let b = bone_with("Content-Type", "audio/ogg;;codecs=opus;");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.parameters.len(), 1);
+        assert_eq!(ct.parameter("codecs"), Some("opus"));
+    }
+
+    #[test]
+    fn content_type_trims_surrounding_whitespace_on_value_and_params() {
+        // HTTP-style framing tolerance — same as the other typed accessors.
+        let b = bone_with("Content-Type", "   audio/vorbis ;  codecs = ogg  ");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.kind, ContentTypeKind::Audio);
+        assert_eq!(ct.subtype, "vorbis");
+        assert_eq!(ct.parameter("codecs"), Some("ogg"));
+    }
+
+    #[test]
+    fn content_type_skeleton_self_application_subtype() {
+        // Skeleton's own bitstream is sometimes carried with
+        // "application/x-ogg-skeleton" or similar vendor subtypes.
+        // Verify the application/* bucket plus x- subtype prefix.
+        let b = bone_with("Content-Type", "application/x-ogg-skeleton");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert!(ct.kind.is_application());
+        assert_eq!(ct.subtype, "x-ogg-skeleton");
+    }
+
+    #[test]
+    fn content_type_missing_slash_yields_inner_err() {
+        // "audio" alone is not a valid MIME type; without a subtype
+        // there's no way to tell vorbis apart from opus, so the parser
+        // refuses to guess.
+        let b = bone_with("Content-Type", "audio");
+        let parsed = b.content_type().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn content_type_empty_value_yields_inner_err() {
+        let b = bone_with("Content-Type", "");
+        let parsed = b.content_type().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn content_type_empty_subtype_yields_inner_err() {
+        let b = bone_with("Content-Type", "audio/");
+        let parsed = b.content_type().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn content_type_empty_top_level_yields_inner_err() {
+        let b = bone_with("Content-Type", "/vorbis");
+        let parsed = b.content_type().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn content_type_blank_value_with_whitespace_yields_inner_err() {
+        // Surrounding whitespace is trimmed, so "   " collapses to ""
+        // and triggers the empty-value rejection.
+        let b = bone_with("Content-Type", "   ");
+        let parsed = b.content_type().expect("present");
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn content_type_lookup_is_case_insensitive_on_header_name() {
+        // FisBone::header is case-insensitive; verify the typed accessor
+        // inherits that behaviour.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("content-type", "audio/opus");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.kind, ContentTypeKind::Audio);
+        assert_eq!(ct.subtype, "opus");
+
+        let mut b2 = FisBone::new(1, Rational::new(48_000, 1));
+        b2.set_header("CONTENT-TYPE", "video/theora");
+        let ct2 = b2.content_type().expect("present").expect("valid");
+        assert_eq!(ct2.kind, ContentTypeKind::Video);
+        assert_eq!(ct2.subtype, "theora");
+    }
+
+    #[test]
+    fn content_type_through_set_header_replace() {
+        // Most-recent set_header value wins, via case-insensitive
+        // replacement on the underlying storage.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Content-Type", "audio/vorbis");
+        b.set_header("content-type", "audio/opus");
+        let ct = b.content_type().expect("present").expect("valid");
+        assert_eq!(ct.kind, ContentTypeKind::Audio);
+        assert_eq!(ct.subtype, "opus");
+        assert_eq!(b.headers.len(), 1, "set_header should replace, not append");
+    }
+
+    #[test]
+    fn content_type_kind_predicates_are_exclusive() {
+        // Sanity: exactly one of is_{audio,video,text,image,application}
+        // is true for the well-known kinds.
+        let cases = [
+            ContentTypeKind::Audio,
+            ContentTypeKind::Video,
+            ContentTypeKind::Text,
+            ContentTypeKind::Image,
+            ContentTypeKind::Application,
+        ];
+        for k in cases {
+            let votes = [
+                k.is_audio(),
+                k.is_video(),
+                k.is_text(),
+                k.is_image(),
+                k.is_application(),
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count();
+            assert_eq!(votes, 1, "{:?} matched multiple predicates", k);
+        }
+        // ContentTypeKind::Other returns false for every predicate.
+        let other = ContentTypeKind::Other("multipart".to_string());
+        assert!(!other.is_audio());
+        assert!(!other.is_video());
+        assert!(!other.is_text());
+        assert!(!other.is_image());
+        assert!(!other.is_application());
     }
 }
