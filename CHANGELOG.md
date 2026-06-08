@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `Title` accessor on Skeleton-4 `FisBone`.** A new
+  `FisBone::title() -> Option<Title>` parses the free-text
+  track-description message header documented in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Title
+  ("A free text field to provide a description of the track content.")
+  into a new `Title` struct. The wiki's worked example
+  `Title: "the French audio track for the movie"` is shown wrapped in
+  literal double-quote characters; the wiki neither requires nor
+  forbids them elsewhere in the message-header block, so `Title`
+  exposes two complementary views to keep both readings reachable
+  without losing information: `Title::raw` returns the trimmed value
+  exactly as the header carries it (quotes preserved, surrounding
+  whitespace dropped — same HTTP-style framing tolerance as `role()`,
+  `languages()`, `altitude()`, `display_hint()`, and `content_type()`)
+  so callers that round-trip back through `set_header` get the same
+  on-wire bytes, and `Title::display` strips a single balanced pair
+  of surrounding `"…"` quotes when present so callers that follow the
+  wiki's worked-example reading get a quote-free string. A small
+  `Title::is_empty` predicate covers the present-but-blank shape a
+  malformed encoder might emit. Title is optional per the wiki —
+  only `Content-Type` is mandatory — so the accessor returns
+  `Option<Title>` (rather than `Option<Result<Title>>` like
+  `content_type()`): every well-formed `Title:` header parses
+  successfully because the field is unstructured by spec. 12 new
+  lib unit tests cover the wiki worked example (outer-quote strip),
+  an unquoted free-text value (display === raw), surrounding-
+  whitespace trimming, the empty `""` collapse to an empty display
+  string, an inner quote that must survive verbatim, unbalanced
+  open-only / close-only quotes that must NOT be stripped, a
+  single-byte `"` value (below the two-byte balanced-pair threshold),
+  header-absent returning `None`, case-insensitive header-name
+  lookup (`TITLE:` resolves through the same accessor),
+  round-tripping through `FisBone::to_bytes` / `parse`, `set_header`
+  case-insensitive replace semantics reflected in the typed view, and
+  the all-whitespace blank-value case yielding empty raw + display +
+  `is_empty()`.
+
 - **Typed `Content-Type` accessor on Skeleton-4 `FisBone`.** A new
   `FisBone::content_type() -> Option<Result<ContentType>>` parses the
   only **mandatory** Skeleton 4 per-track message-header field

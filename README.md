@@ -286,7 +286,7 @@ For encode-side use, every type round-trips through `to_bytes` /
   `header` provide case-insensitive lookup for the spec's compulsory
   4.0 fields (`Content-Type`, `Role`, `Name`) plus the larger field
   registry in `docs/container/ogg/ogg-skeleton-message-headers.wiki`.
-- **Typed message-header accessors** parse five of those wiki-documented
+- **Typed message-header accessors** parse six of those wiki-documented
   fields into structured values:
   `FisBone::content_type()` returns an `Option<Result<ContentType>>` for the
   only **mandatory** Skeleton-4 per-track field
@@ -341,6 +341,22 @@ For encode-side use, every type round-trips through `to_bytes` /
   argument count for a documented tag, non-numeric coordinate, or a
   `transparent` percent outside `0..=100`) so the caller can decide
   whether to skip the field or reject the packet.
+  `FisBone::title()` returns an `Option<Title>` for the free-text
+  track-description field documented in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Title
+  ("A free text field to provide a description of the track content.",
+  worked example `Title: "the French audio track for the movie"`).
+  The wiki's example shows the value wrapped in literal double quotes
+  without prescribing whether they belong to the on-wire value or are
+  a typographic convention; `Title::raw` returns the trimmed value
+  verbatim (quotes preserved) for round-trip use, and `Title::display`
+  strips a single balanced pair of surrounding `"…"` quotes when
+  present so callers that follow the wiki-example reading get a
+  quote-free string. Title is optional per the wiki (only
+  `Content-Type` is mandatory), so the accessor returns
+  `Option<Title>` rather than `Option<Result<Title>>` — every
+  well-formed `Title:` header parses successfully because the field
+  is unstructured by spec.
 - `SkelIndex::to_bytes` re-deltifies keypoint offsets and timestamps
   relative to the previous entry and emits each as a Skeleton 4.0
   variable-byte integer (7 bits per byte, high bit set on the

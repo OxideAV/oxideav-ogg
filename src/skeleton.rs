@@ -940,6 +940,80 @@ impl ContentType {
     }
 }
 
+/// Parsed value of the `Title` Skeleton message-header field.
+///
+/// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Title designates
+/// `Title` as "A free text field to provide a description of the track
+/// content." with the worked example
+/// `Title: "the French audio track for the movie"` — the value is shown
+/// wrapped in literal double-quote characters. The wiki does not specify
+/// whether those quotes are part of the on-wire value or a typographic
+/// convention of the wiki rendering itself; surrounding `"…"` quotes are
+/// neither mandated nor forbidden by any other §Title rule. To preserve
+/// both readings without losing information:
+///
+/// * [`Title::raw`] returns the value with surrounding whitespace trimmed
+///   (matching the HTTP-style framing tolerance the other typed accessors
+///   apply) and any surrounding quote characters left intact, so callers
+///   that round-trip the value back into a fisbone get the exact same
+///   on-wire shape they started with;
+/// * [`Title::display`] strips a single balanced pair of surrounding
+///   `"…"` quotes when present, so callers that follow the wiki's
+///   worked-example reading get a quote-free string.
+///
+/// Both views are computed lazily — the `Title` struct stores the trimmed
+/// raw bytes once at parse time and projects either view on demand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Title {
+    raw: String,
+}
+
+impl Title {
+    /// Parse a `Title` header value into a [`Title`]. Surrounding
+    /// whitespace on the value is trimmed — same HTTP-style framing
+    /// tolerance as `role()`, `languages()`, `altitude()`, `display_hint()`,
+    /// and `content_type()`.
+    pub fn parse(raw: &str) -> Title {
+        Title {
+            raw: raw.trim().to_string(),
+        }
+    }
+
+    /// Trimmed value exactly as it appears on the wire (after dropping
+    /// HTTP-style surrounding whitespace). Surrounding quote characters,
+    /// if any, are retained so a round-trip back through `set_header`
+    /// preserves the original shape byte-for-byte.
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// Display-oriented value with a single balanced pair of surrounding
+    /// `"…"` quotes stripped when present. The wiki's worked example
+    /// (`Title: "the French audio track for the movie"`) is shown with
+    /// literal quotes; this view yields `the French audio track for the
+    /// movie` matching what a media player would render.
+    ///
+    /// Only an outermost pair of straight double-quote characters is
+    /// removed; inner quotes are kept verbatim, and a value that opens
+    /// but doesn't close with a quote (or vice versa) is returned as-is.
+    /// An empty value (`""`) collapses to an empty string after the
+    /// strip — the caller can distinguish the two cases by checking
+    /// `raw()` directly if needed.
+    pub fn display(&self) -> &str {
+        let s = self.raw.as_str();
+        if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        }
+    }
+
+    /// True if [`Self::raw`] is empty after trimming.
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+}
+
 /// `fisbone` secondary header packet describing one logical bitstream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FisBone {
@@ -1132,6 +1206,31 @@ impl FisBone {
     /// case-insensitive via the underlying `FisBone::header` path.
     pub fn content_type(&self) -> Option<Result<ContentType>> {
         self.header("Content-Type").map(ContentType::parse)
+    }
+
+    /// Typed `Title` accessor.
+    ///
+    /// Parses the `Title` message header per
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Title:
+    /// "A free text field to provide a description of the track content."
+    /// The wiki gives the worked example
+    /// `Title: "the French audio track for the movie"` — the value is
+    /// shown wrapped in literal double-quote characters, which the wiki
+    /// neither requires nor forbids elsewhere in the message-header block.
+    /// The accessor surfaces both shapes through a dedicated [`Title`]
+    /// type: [`Title::raw`] retains the value exactly as the
+    /// header carries it (whitespace trimmed only — same HTTP-style
+    /// framing tolerance as the other typed accessors) and
+    /// [`Title::display`] strips a single balanced pair of surrounding
+    /// `"…"` quotes so callers that want the wiki-example reading get a
+    /// quote-free string without losing the original.
+    ///
+    /// Returns `None` if no `Title` header is present. The field is
+    /// optional per the wiki (only `Content-Type` is mandatory, per
+    /// §Content-type "Right now, there is one mandatory message header
+    /// field for all of the logical bitstreams").
+    pub fn title(&self) -> Option<Title> {
+        self.header("Title").map(Title::parse)
     }
 
     /// Parse a `fisbone` packet (the full Skeleton secondary header
@@ -3013,5 +3112,161 @@ mod tests {
         assert!(!other.is_text());
         assert!(!other.is_image());
         assert!(!other.is_application());
+    }
+
+    // -------- Title typed accessor --------------------------------------
+    //
+    // Worked-example coverage for the wiki §Title section
+    // (`docs/container/ogg/ogg-skeleton-message-headers.wiki`): the
+    // sole on-record example is `Title: "the French audio track for
+    // the movie"` and the field is a free-text track-content
+    // description. The tests below pin every shape the wiki leaves
+    // open: with and without surrounding quotes, with and without
+    // surrounding whitespace, the empty `""` collapse case, an inner
+    // quote that must survive verbatim, an unbalanced quote that must
+    // *not* be stripped, header-absent vs. header-present, and the
+    // round-trip behaviour through `set_header` / `to_bytes` / `parse`.
+
+    #[test]
+    fn title_wiki_worked_example_strips_outer_quotes() {
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Title", "\"the French audio track for the movie\"");
+        let t = b.title().expect("title header present");
+        assert_eq!(t.raw(), "\"the French audio track for the movie\"");
+        assert_eq!(t.display(), "the French audio track for the movie");
+        assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn title_unquoted_value_round_trips_through_both_views() {
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Title", "track 3 — Verbier 2019");
+        let t = b.title().expect("title header present");
+        assert_eq!(t.raw(), "track 3 — Verbier 2019");
+        // No surrounding quotes → display() === raw().
+        assert_eq!(t.display(), "track 3 — Verbier 2019");
+    }
+
+    #[test]
+    fn title_trims_surrounding_whitespace_on_value() {
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        // Pretend an upstream encoder padded the value with stray spaces
+        // (the HTTP-style framing allows a leading space after the
+        // colon already; this exercises the extra trim on either side).
+        b.set_header("Title", "   padded title   ");
+        let t = b.title().expect("title header present");
+        assert_eq!(t.raw(), "padded title");
+    }
+
+    #[test]
+    fn title_empty_quoted_value_collapses_to_empty_display() {
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Title", "\"\"");
+        let t = b.title().expect("title header present");
+        assert_eq!(t.raw(), "\"\"");
+        assert_eq!(t.display(), "");
+    }
+
+    #[test]
+    fn title_inner_quote_is_preserved_through_display() {
+        // Wiki gives no quoting / escaping rule; an inner quote must
+        // round-trip verbatim regardless of whether the outer pair is
+        // present. The accessor strips at most one outermost pair.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Title", "\"the \"main\" audio\"");
+        let t = b.title().expect("title header present");
+        assert_eq!(t.raw(), "\"the \"main\" audio\"");
+        // Outer pair stripped; inner pair retained in the middle.
+        assert_eq!(t.display(), "the \"main\" audio");
+    }
+
+    #[test]
+    fn title_unbalanced_quote_is_not_stripped() {
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Title", "\"only opens");
+        let t = b.title().expect("title header present");
+        assert_eq!(t.raw(), "\"only opens");
+        assert_eq!(t.display(), "\"only opens");
+
+        b.set_header("Title", "only closes\"");
+        let t = b.title().expect("title header present");
+        assert_eq!(t.display(), "only closes\"");
+    }
+
+    #[test]
+    fn title_single_quote_character_is_not_a_balanced_pair() {
+        // A lone `"` is one byte: less than 2, so the strip path is
+        // never reached. The value must round-trip verbatim.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Title", "\"");
+        let t = b.title().expect("title header present");
+        assert_eq!(t.raw(), "\"");
+        assert_eq!(t.display(), "\"");
+    }
+
+    #[test]
+    fn title_returns_none_when_header_absent() {
+        // No Title header at all → None (vs. None inside Some(_) for
+        // an empty header value).
+        let b = FisBone::new(1, Rational::new(48_000, 1));
+        assert!(b.title().is_none());
+    }
+
+    #[test]
+    fn title_lookup_is_case_insensitive_on_header_name() {
+        // FisBone::header is case-insensitive; Title accessor inherits
+        // that. Encoders that emit `title:` or `TITLE:` must still
+        // resolve through `title()`.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("TITLE", "Lower vs Upper");
+        let t = b.title().expect("uppercase header still resolves");
+        assert_eq!(t.raw(), "Lower vs Upper");
+    }
+
+    #[test]
+    fn title_round_trips_through_fisbone_serialization() {
+        // FisBone::to_bytes emits CRLF-delimited headers; FisBone::parse
+        // re-reads them. The Title accessor must give the same value
+        // across the round trip — verifies the typed accessor sits on
+        // top of the existing message-header serializer correctly.
+        let mut bone = FisBone::new(0xCAFE, Rational::new(48_000, 1));
+        bone.num_headers = 3;
+        bone.set_header("Content-Type", "audio/vorbis");
+        bone.set_header("Title", "\"the French audio track for the movie\"");
+        let bytes = bone.to_bytes();
+        let back = FisBone::parse(&bytes).expect("fisbone round-trips");
+        let t = back.title().expect("Title survives round trip");
+        assert_eq!(t.raw(), "\"the French audio track for the movie\"");
+        assert_eq!(t.display(), "the French audio track for the movie");
+    }
+
+    #[test]
+    fn title_set_header_replace_semantics_update_the_typed_view() {
+        // set_header with a case-insensitive match replaces the
+        // existing value; title() must reflect the new value.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Title", "old value");
+        b.set_header("title", "new value");
+        let t = b.title().expect("present");
+        assert_eq!(t.raw(), "new value");
+        // No duplicate header was appended.
+        assert_eq!(
+            b.headers.len(),
+            1,
+            "case-insensitive replace must keep the header count at 1"
+        );
+    }
+
+    #[test]
+    fn title_blank_value_yields_empty_raw_and_empty_display() {
+        // The wiki places no restriction on blank Title values; a
+        // header line `Title:   ` (only whitespace) must surface as
+        // an empty raw / display through the trim path.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Title", "   ");
+        let t = b.title().expect("present-but-blank");
+        assert_eq!(t.raw(), "");
+        assert_eq!(t.display(), "");
+        assert!(t.is_empty());
     }
 }
