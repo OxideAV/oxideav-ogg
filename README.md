@@ -286,7 +286,7 @@ For encode-side use, every type round-trips through `to_bytes` /
   `header` provide case-insensitive lookup for the spec's compulsory
   4.0 fields (`Content-Type`, `Role`, `Name`) plus the larger field
   registry in `docs/container/ogg/ogg-skeleton-message-headers.wiki`.
-- **Typed message-header accessors** parse six of those wiki-documented
+- **Typed message-header accessors** parse seven of those wiki-documented
   fields into structured values:
   `FisBone::content_type()` returns an `Option<Result<ContentType>>` for the
   only **mandatory** Skeleton-4 per-track field
@@ -357,6 +357,25 @@ For encode-side use, every type round-trips through `to_bytes` /
   `Option<Title>` rather than `Option<Result<Title>>` — every
   well-formed `Title:` header parses successfully because the field
   is unstructured by spec.
+  `FisBone::name()` returns an `Option<Name>` for the stable
+  per-track identifier documented in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Name
+  ("This field provides the opportunity to associate a free text
+  string with the track to allow direct addressing of the track
+  through its name", worked example `track[name="Madonna_singing"]`).
+  The wiki specifies an XML 1.0 `NCName`-shaped grammar verbatim
+  for the allowed character set: `Name::raw` returns the trimmed
+  value exactly as the header carries it (whitespace dropped — same
+  HTTP-style framing tolerance as the other typed accessors) for
+  round-trip use, and `Name::is_well_formed` returns the grammar
+  check against the two §Name allow-lists (first-character set and
+  following-character set). Callers that want to surface the value
+  to a `track[name=…]` resolver gate on `is_well_formed` before
+  publishing the name. The wiki's per-stream uniqueness rule ("The
+  name needs to be unique between all the track names, otherwise it
+  is undefined which of the tracks is retrieved when addressing by
+  name") is a file-level invariant enforced by callers via
+  `Skeleton::bone_for_serial`, not inside this per-value parser.
 - `SkelIndex::to_bytes` re-deltifies keypoint offsets and timestamps
   relative to the previous entry and emits each as a Skeleton 4.0
   variable-byte integer (7 bits per byte, high bit set on the

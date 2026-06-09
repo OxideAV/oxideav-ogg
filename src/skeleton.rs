@@ -1014,6 +1014,135 @@ impl Title {
     }
 }
 
+/// Parsed value of the `Name` Skeleton message-header field.
+///
+/// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Name designates
+/// `Name` as a stable per-track identifier used "to allow direct addressing
+/// of the track through its name", with the worked example
+/// `track[name="Madonna_singing"]` showing how a media player can locate
+/// the track by its declared name.
+///
+/// The wiki specifies the allowed character set verbatim — it is the
+/// XML 1.0 `NCName` production:
+///
+/// * The first character must be one of `[A-Z] | "_" | [a-z] |
+///   [#xC0-#xD6] | [#xD8-#xF6] | [#xF8-#x2FF] | [#x370-#x37D] |
+///   [#x37F-#x1FFF] | [#x200C-#x200D] | [#x2070-#x218F] |
+///   [#x2C00-#x2FEF] | [#x3001-#xD7FF] | [#xF900-#xFDCF] |
+///   [#xFDF0-#xFFFD] | [#x10000-#xEFFFF]`.
+/// * Any following character may additionally be one of `"-" | "." |
+///   [0-9] | #xB7 | [#x0300-#x036F] | [#x203F-#x2040]`.
+///
+/// The wiki also states "The name needs to be unique between all the
+/// track names, otherwise it is undefined which of the tracks is
+/// retrieved when addressing by name." That uniqueness check is a
+/// file-level invariant (it requires looking at every `fisbone\0`
+/// in the same Skeleton stream) and lives outside this per-value
+/// parser — callers walk `Skeleton::bone_for_serial` to enforce it.
+///
+/// This struct stores the trimmed raw bytes once at parse time and
+/// surfaces both the original on-wire string ([`Name::raw`]) and a
+/// boolean grammar check ([`Name::is_well_formed`]) so the caller can
+/// decide whether to surface the value to a `track[name=…]` resolver
+/// or reject the field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Name {
+    raw: String,
+}
+
+impl Name {
+    /// Parse a `Name` header value into a [`Name`]. Surrounding
+    /// whitespace on the value is trimmed — same HTTP-style framing
+    /// tolerance as `role()`, `languages()`, `altitude()`,
+    /// `display_hint()`, `content_type()`, and `title()`.
+    pub fn parse(raw: &str) -> Name {
+        Name {
+            raw: raw.trim().to_string(),
+        }
+    }
+
+    /// Trimmed value exactly as it appears on the wire (after dropping
+    /// HTTP-style surrounding whitespace).
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// True iff [`Self::raw`] matches the XML 1.0 `NCName`-shaped grammar
+    /// the wiki specifies for the `Name` field.
+    ///
+    /// The grammar is checked verbatim against the two §Name allow-lists
+    /// (first-character set and following-character set). An empty value,
+    /// or one whose first code point is outside the first-character set,
+    /// or one whose remaining code points step outside the following-
+    /// character set, returns `false`.
+    ///
+    /// The wiki places no length cap on `Name`, so this predicate is
+    /// purely a character-class check; encoders that emit, say,
+    /// `Name: Madonna_singing` get `true` while encoders that emit
+    /// `Name: 9-track` (digit prefix) get `false`. Callers that want
+    /// to surface the value to a `track[name=…]` resolver should gate
+    /// on `is_well_formed` before publishing the name.
+    pub fn is_well_formed(&self) -> bool {
+        let mut chars = self.raw.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !is_xml_name_start_char(first) {
+            return false;
+        }
+        chars.all(is_xml_name_char)
+    }
+
+    /// True if [`Self::raw`] is empty after trimming.
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+}
+
+/// Member of the §Name first-character allow-list per
+/// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Name.
+///
+/// Mirrors the XML 1.0 `NameStartChar` production verbatim. Kept inline
+/// (no external dep) because the allow-list is closed and machine-
+/// readable from the wiki.
+fn is_xml_name_start_char(c: char) -> bool {
+    matches!(c,
+        'A'..='Z'
+        | '_'
+        | 'a'..='z'
+        | '\u{C0}'..='\u{D6}'
+        | '\u{D8}'..='\u{F6}'
+        | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}'
+        | '\u{37F}'..='\u{1FFF}'
+        | '\u{200C}'..='\u{200D}'
+        | '\u{2070}'..='\u{218F}'
+        | '\u{2C00}'..='\u{2FEF}'
+        | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}'
+        | '\u{FDF0}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{EFFFF}')
+}
+
+/// Member of the §Name following-character allow-list — the
+/// first-character allow-list plus the extra `"-" | "." | [0-9] | #xB7
+/// | [#x0300-#x036F] | [#x203F-#x2040]` code points per
+/// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Name.
+///
+/// Mirrors the XML 1.0 `NameChar` production verbatim.
+fn is_xml_name_char(c: char) -> bool {
+    if is_xml_name_start_char(c) {
+        return true;
+    }
+    matches!(c,
+        '-'
+        | '.'
+        | '0'..='9'
+        | '\u{B7}'
+        | '\u{0300}'..='\u{036F}'
+        | '\u{203F}'..='\u{2040}')
+}
+
 /// `fisbone` secondary header packet describing one logical bitstream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FisBone {
@@ -1231,6 +1360,40 @@ impl FisBone {
     /// field for all of the logical bitstreams").
     pub fn title(&self) -> Option<Title> {
         self.header("Title").map(Title::parse)
+    }
+
+    /// Typed `Name` accessor.
+    ///
+    /// Parses the `Name` message header per
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Name:
+    /// "This field provides the opportunity to associate a free text
+    /// string with the track to allow direct addressing of the track
+    /// through its name." The wiki's worked example
+    /// `track[name="Madonna_singing"]` shows how a media player resolves
+    /// a track by its declared name.
+    ///
+    /// The wiki specifies an XML 1.0 `NCName`-shaped grammar verbatim
+    /// for the allowed character set ("the first character has to be
+    /// one of … any following characters can be one of …"). The accessor
+    /// surfaces the value through a dedicated [`Name`] struct: [`Name::raw`]
+    /// retains the value exactly as the header carries it (whitespace
+    /// trimmed only — same HTTP-style framing tolerance as the other typed
+    /// accessors) and [`Name::is_well_formed`] returns the grammar check.
+    /// Callers that want to surface the value to a `track[name=…]`
+    /// resolver gate on `is_well_formed` before publishing the name.
+    ///
+    /// Returns `None` if no `Name` header is present. The field is
+    /// optional per the wiki (only `Content-Type` is mandatory, per
+    /// §Content-type "Right now, there is one mandatory message header
+    /// field for all of the logical bitstreams"). The wiki additionally
+    /// states "The name needs to be unique between all the track
+    /// names, otherwise it is undefined which of the tracks is retrieved
+    /// when addressing by name" — that uniqueness invariant is a
+    /// file-level check across every fisbone in the same Skeleton stream
+    /// and is enforced by callers via [`crate::skeleton::Skeleton::bone_for_serial`], not
+    /// inside this per-value parser.
+    pub fn name(&self) -> Option<Name> {
+        self.header("Name").map(Name::parse)
     }
 
     /// Parse a `fisbone` packet (the full Skeleton secondary header
@@ -3268,5 +3431,206 @@ mod tests {
         assert_eq!(t.raw(), "");
         assert_eq!(t.display(), "");
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn name_wiki_worked_example_round_trips_and_is_well_formed() {
+        // Wiki §Name worked example: `track[name="Madonna_singing"]` —
+        // the on-wire Name value is `Madonna_singing`, which matches
+        // the first-character rule ([a-z]) and the following-character
+        // rule (letters + `_`).
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "Madonna_singing");
+        let n = b.name().expect("name header present");
+        assert_eq!(n.raw(), "Madonna_singing");
+        assert!(n.is_well_formed());
+        assert!(!n.is_empty());
+    }
+
+    #[test]
+    fn name_trims_surrounding_whitespace_on_value() {
+        // HTTP-style framing tolerance — same as the other typed
+        // accessors. Stray surrounding spaces on the value get dropped
+        // before the grammar check runs (otherwise a leading space
+        // would always fail the first-character rule).
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "   track_a   ");
+        let n = b.name().expect("present");
+        assert_eq!(n.raw(), "track_a");
+        assert!(n.is_well_formed());
+    }
+
+    #[test]
+    fn name_rejects_digit_prefix() {
+        // The wiki's first-character allow-list does NOT include digits;
+        // they only appear in the following-character allow-list. A
+        // value like `9-track` must therefore fail the grammar check
+        // while still round-tripping through raw() so the caller can
+        // surface the rejection reason intact.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "9-track");
+        let n = b.name().expect("present");
+        assert_eq!(n.raw(), "9-track");
+        assert!(!n.is_well_formed());
+    }
+
+    #[test]
+    fn name_rejects_hyphen_prefix() {
+        // `-` only appears in the following-character allow-list. A
+        // value starting with `-` therefore fails the grammar check.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "-track");
+        let n = b.name().expect("present");
+        assert!(!n.is_well_formed());
+    }
+
+    #[test]
+    fn name_rejects_dot_prefix() {
+        // `.` only appears in the following-character allow-list.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", ".hidden");
+        let n = b.name().expect("present");
+        assert!(!n.is_well_formed());
+    }
+
+    #[test]
+    fn name_accepts_underscore_prefix() {
+        // `_` IS in the first-character allow-list per the wiki.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "_internal");
+        let n = b.name().expect("present");
+        assert!(n.is_well_formed());
+    }
+
+    #[test]
+    fn name_accepts_following_chars_after_letter_start() {
+        // Letters + digits + `-` + `.` are all valid as following chars
+        // when preceded by a letter / underscore start.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "track-2.audio_main");
+        let n = b.name().expect("present");
+        assert!(n.is_well_formed());
+    }
+
+    #[test]
+    fn name_rejects_internal_space() {
+        // Space is in neither allow-list. An internal whitespace
+        // character is rejected by the grammar check (Name is supposed
+        // to be addressable as a stable identifier).
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "two words");
+        let n = b.name().expect("present");
+        assert_eq!(n.raw(), "two words");
+        assert!(!n.is_well_formed());
+    }
+
+    #[test]
+    fn name_rejects_special_punctuation() {
+        // `@`, `:`, `/`, `(`, `)`, `,`, `=`, `"` are all outside both
+        // allow-lists.
+        for raw in ["a@b", "a:b", "a/b", "a(b)", "a,b", "a=b", "a\"b"] {
+            let mut b = FisBone::new(1, Rational::new(48_000, 1));
+            b.set_header("Name", raw);
+            let n = b.name().expect("present");
+            assert!(!n.is_well_formed(), "{raw:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn name_rejects_empty_value_after_trim() {
+        // An empty trimmed value has no first character → fails the
+        // first-character rule.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "   ");
+        let n = b.name().expect("present-but-blank");
+        assert_eq!(n.raw(), "");
+        assert!(n.is_empty());
+        assert!(!n.is_well_formed());
+    }
+
+    #[test]
+    fn name_accepts_unicode_letter_start() {
+        // Wiki's first-character allow-list includes broad Unicode
+        // ranges. é (U+00E9) sits inside [#xD8-#xF6] and is therefore
+        // a valid first character per the spec.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "épisode");
+        let n = b.name().expect("present");
+        assert_eq!(n.raw(), "épisode");
+        assert!(n.is_well_formed());
+    }
+
+    #[test]
+    fn name_accepts_middle_dot_as_following_char() {
+        // U+00B7 MIDDLE DOT is explicitly listed in the following-
+        // character allow-list (the §Name `#xB7` reference, used in
+        // Catalan orthography like `Bel·la`).
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "Bel\u{B7}la");
+        let n = b.name().expect("present");
+        assert!(n.is_well_formed());
+    }
+
+    #[test]
+    fn name_rejects_middle_dot_prefix() {
+        // U+00B7 is only in the following-character allow-list, NOT
+        // the first-character one. A value starting with `·` fails.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "\u{B7}leading");
+        let n = b.name().expect("present");
+        assert!(!n.is_well_formed());
+    }
+
+    #[test]
+    fn name_returns_none_when_header_absent() {
+        // No Name header at all → None.
+        let b = FisBone::new(1, Rational::new(48_000, 1));
+        assert!(b.name().is_none());
+    }
+
+    #[test]
+    fn name_lookup_is_case_insensitive_on_header_name() {
+        // FisBone::header is case-insensitive; Name accessor inherits
+        // that. Encoders that emit `name:` or `NAME:` must still
+        // resolve through `name()`.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("NAME", "track_a");
+        let n = b.name().expect("uppercase header still resolves");
+        assert_eq!(n.raw(), "track_a");
+        assert!(n.is_well_formed());
+    }
+
+    #[test]
+    fn name_round_trips_through_fisbone_serialization() {
+        // FisBone::to_bytes emits CRLF-delimited headers; FisBone::parse
+        // re-reads them. The Name accessor must give the same value
+        // across the round trip — verifies the typed accessor sits on
+        // top of the existing message-header serializer correctly.
+        let mut bone = FisBone::new(0xCAFE, Rational::new(48_000, 1));
+        bone.num_headers = 3;
+        bone.set_header("Content-Type", "audio/vorbis");
+        bone.set_header("Name", "Madonna_singing");
+        let bytes = bone.to_bytes();
+        let back = FisBone::parse(&bytes).expect("fisbone round-trips");
+        let n = back.name().expect("Name survives round trip");
+        assert_eq!(n.raw(), "Madonna_singing");
+        assert!(n.is_well_formed());
+    }
+
+    #[test]
+    fn name_set_header_replace_semantics_update_the_typed_view() {
+        // set_header with a case-insensitive match replaces the
+        // existing value; name() must reflect the new value.
+        let mut b = FisBone::new(1, Rational::new(48_000, 1));
+        b.set_header("Name", "old_name");
+        b.set_header("name", "new_name");
+        let n = b.name().expect("present");
+        assert_eq!(n.raw(), "new_name");
+        // No duplicate header was appended.
+        assert_eq!(
+            b.headers.len(),
+            1,
+            "case-insensitive replace must keep the header count at 1"
+        );
     }
 }

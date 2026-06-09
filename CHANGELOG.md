@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `Name` accessor on Skeleton-4 `FisBone`.** A new
+  `FisBone::name() -> Option<Name>` parses the stable per-track
+  identifier message header documented in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Name
+  ("This field provides the opportunity to associate a free text
+  string with the track to allow direct addressing of the track
+  through its name", worked example `track[name="Madonna_singing"]`)
+  into a new `Name` struct. The wiki specifies the allowed character
+  set verbatim — it is the XML 1.0 `NCName` production: the first
+  character has to be one of `[A-Z] | "_" | [a-z] | [#xC0-#xD6] |
+  [#xD8-#xF6] | [#xF8-#x2FF] | [#x370-#x37D] | [#x37F-#x1FFF] |
+  [#x200C-#x200D] | [#x2070-#x218F] | [#x2C00-#x2FEF] |
+  [#x3001-#xD7FF] | [#xF900-#xFDCF] | [#xFDF0-#xFFFD] |
+  [#x10000-#xEFFFF]`, and any following character may additionally
+  be one of `"-" | "." | [0-9] | #xB7 | [#x0300-#x036F] |
+  [#x203F-#x2040]`. `Name::raw` returns the trimmed on-wire value
+  (whitespace dropped — same HTTP-style framing tolerance as the
+  other typed accessors) so the value round-trips back through
+  `set_header` byte-for-byte, and `Name::is_well_formed` returns the
+  grammar check against the two §Name allow-lists so callers that
+  want to surface the value to a `track[name=…]` resolver can gate
+  on validity before publishing the name. A small `Name::is_empty`
+  predicate covers the present-but-blank shape a malformed encoder
+  might emit. Name is optional per the wiki — only `Content-Type`
+  is mandatory — so the accessor returns `Option<Name>`. The wiki's
+  per-stream uniqueness rule ("The name needs to be unique between
+  all the track names, otherwise it is undefined which of the tracks
+  is retrieved when addressing by name") is a file-level invariant
+  enforced by callers via `Skeleton::bone_for_serial`, not inside
+  this per-value parser. 17 new lib unit tests cover the wiki worked
+  example (`Madonna_singing` round-trip + well-formed predicate),
+  surrounding-whitespace trimming, rejection of every documented
+  first-character violation (digit prefix `9-track`, hyphen prefix
+  `-track`, dot prefix `.hidden`, middle-dot prefix), acceptance of
+  underscore-start (`_internal`) + letter-start with following-
+  character mix (`track-2.audio_main`), internal-space rejection,
+  every special punctuation rejection (`@ : / ( ) , = "`), the
+  empty-after-trim shape returning `false`, a non-ASCII letter
+  start (`épisode`, U+00E9 inside `[#xD8-#xF6]`), the
+  following-character middle dot (`Bel·la`, U+00B7), header-absent
+  returning `None`, case-insensitive header-name lookup (`NAME:`
+  resolves through the same accessor), round-tripping through
+  `FisBone::to_bytes` / `parse`, and `set_header` case-insensitive
+  replace semantics reflected in the typed view.
+
 - **Typed `Title` accessor on Skeleton-4 `FisBone`.** A new
   `FisBone::title() -> Option<Title>` parses the free-text
   track-description message header documented in
