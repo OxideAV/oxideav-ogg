@@ -760,6 +760,96 @@ impl OggDemuxer {
             .map(|(serial, _)| *serial)
     }
 
+    /// Number of tracks under the Skeleton "Track order" addressing
+    /// scheme (`docs/container/ogg/ogg-skeleton-message-headers.wiki`
+    /// §"Track order").
+    ///
+    /// The wiki defines a stable way to address tracks by an index:
+    /// "the means to number through the tracks is by the order in which
+    /// the bos pages of the tracks appear in the Ogg stream", with the
+    /// worked example listing `track[0]: Skeleton BOS`, `track[1]:
+    /// Theora BOS for main video`, `track[2]: Vorbis BOS for main
+    /// audio`, and so on. The count therefore includes the Skeleton
+    /// logical bitstream (when present) plus every content stream.
+    ///
+    /// Equals [`streams().len()`](oxideav_core::Demuxer::streams) for a
+    /// Skeleton-free file, and one more than that when a `fishead\0`
+    /// Skeleton BOS is present (the Skeleton occupies `track[0]` but is
+    /// not a content stream, so it never appears in `streams()`).
+    pub fn track_order_len(&self) -> u32 {
+        let content = self.streams.len() as u32;
+        if self.skeleton_serial.is_some() {
+            content.saturating_add(1)
+        } else {
+            content
+        }
+    }
+
+    /// Resolve a Skeleton "Track order" index to the logical bitstream's
+    /// on-wire `bitstream_serial_number`
+    /// (`docs/container/ogg/ogg-skeleton-message-headers.wiki`
+    /// §"Track order").
+    ///
+    /// Per the wiki's worked example, `track[0]` is the Skeleton BOS
+    /// (when the file carries one), then each content track follows in
+    /// the order its BOS page appears. Because this crate assigns each
+    /// content stream's dense [`StreamInfo::index`](oxideav_core::StreamInfo)
+    /// in BOS-discovery order, a Skeleton-bearing file maps
+    /// `track[0] -> Skeleton serial` and `track[n] -> content stream
+    /// index n-1` for `n >= 1`; a Skeleton-free file maps
+    /// `track[n] -> content stream index n` directly (the wiki only
+    /// reserves `track[0]` for Skeleton when Skeleton is present).
+    ///
+    /// Returns `None` for an out-of-range index (`>= track_order_len`).
+    ///
+    /// The returned serial round-trips through
+    /// [`Skeleton::bone_for_serial`](crate::skeleton::Skeleton::bone_for_serial)
+    /// so a caller walking `0..track_order_len()` can recover each
+    /// track's per-track fisbone metadata in the spec-defined order.
+    pub fn track_order_serial(&self, track_index: u32) -> Option<u32> {
+        if track_index >= self.track_order_len() {
+            return None;
+        }
+        match self.skeleton_serial {
+            Some(skel) => {
+                if track_index == 0 {
+                    Some(skel)
+                } else {
+                    self.stream_serial(track_index - 1)
+                }
+            }
+            None => self.stream_serial(track_index),
+        }
+    }
+
+    /// Reverse of [`track_order_serial`](Self::track_order_serial): map a
+    /// logical bitstream's on-wire serial back to its Skeleton
+    /// "Track order" index
+    /// (`docs/container/ogg/ogg-skeleton-message-headers.wiki`
+    /// §"Track order").
+    ///
+    /// Passing the Skeleton stream's own serial returns `Some(0)` when a
+    /// `fishead\0` Skeleton BOS is present; passing a content stream's
+    /// serial returns its `track[n]` index. Returns `None` for a serial
+    /// the demuxer never observed as a BOS.
+    pub fn track_order_index(&self, serial: u32) -> Option<u32> {
+        if self.skeleton_serial == Some(serial) {
+            return Some(0);
+        }
+        // Content stream: find its dense public index, then offset by one
+        // when a Skeleton occupies track[0].
+        let public_index = self
+            .state_by_serial
+            .iter()
+            .find(|(s, _)| **s == serial)
+            .map(|(_, st)| self.streams[st.public_index].index)?;
+        if self.skeleton_serial.is_some() {
+            Some(public_index + 1)
+        } else {
+            Some(public_index)
+        }
+    }
+
     /// Number of seek requests this demuxer satisfied directly from a
     /// Skeleton 4.0 `index\0` keyframe-index packet, bypassing both the
     /// per-page seek-index `index_floor` check and the bisection

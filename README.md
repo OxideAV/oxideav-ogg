@@ -473,6 +473,29 @@ recommends emitting 4.0 in preference to 3.0 when possible, and notes
 that decoders must always fall back to bisection when the index is
 absent or fails validation (length / page-boundary checks).
 
+#### Track-order addressing (`SkeletonHeaders` §"Track order")
+
+The Skeleton message-headers wiki defines a stable way to address
+tracks by an index: tracks are numbered "by the order in which the bos
+pages of the tracks appear in the Ogg stream", with the Skeleton BOS
+occupying `track[0]` when present (`track[1]` the first content track,
+and so on per the wiki's worked example). `OggDemuxer` exposes this as
+three accessors: `track_order_len()` returns the number of addressable
+slots (content streams plus the Skeleton bitstream, which is not in
+`streams()`); `track_order_serial(n)` maps a `track[n]` index to its
+logical bitstream's on-wire `bitstream_serial_number`; and
+`track_order_index(serial)` is the reverse. Because content streams'
+dense `StreamInfo::index` is already assigned in BOS-discovery order,
+the mapping is `track[n] -> content stream index n-1` for a
+Skeleton-bearing file and `track[n] -> content stream index n` for a
+Skeleton-free file (the wiki only reserves `track[0]` for Skeleton when
+Skeleton is present). The returned serial round-trips through
+`Skeleton::bone_for_serial`, so a caller walking
+`0..track_order_len()` recovers each track's fisbone metadata in the
+spec-defined order — the basis for a `track[name=…]` / `track[n]`
+resolver. Spec reference:
+`docs/container/ogg/ogg-skeleton-message-headers.wiki` §"Track order".
+
 ### Page-loss detection (RFC 3533 §6)
 
 Every Ogg page header carries a `page_sequence_number` that "is

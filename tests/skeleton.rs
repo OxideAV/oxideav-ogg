@@ -1171,3 +1171,146 @@ fn skeleton_index_seek_falls_back_when_primary_has_no_index() {
         "seek on stream B fires the fast path"
     );
 }
+
+// ---- Skeleton "Track order" addressing -----------------------------
+//
+// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §"Track order":
+// tracks are addressed by the order their BOS pages appear in the Ogg
+// stream, with the Skeleton BOS occupying `track[0]` when present.
+
+#[test]
+fn track_order_single_stream_with_skeleton() {
+    // File layout: Skeleton BOS, then one Vorbis content BOS.
+    // Per the wiki worked example: track[0] = Skeleton, track[1] = the
+    // content stream.
+    let (bytes, _, _, _) = build_skeleton_4_0_ogg();
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+
+    // Skeleton (1 metadata track) + 1 content stream = 2 track slots,
+    // even though streams() reports only the 1 content stream.
+    assert_eq!(dmx.track_order_len(), 2);
+    assert_eq!(oxideav_core::Demuxer::streams(&dmx).len(), 1);
+
+    // track[0] is the Skeleton bitstream.
+    assert_eq!(dmx.track_order_serial(0), Some(SKEL_SERIAL));
+    // track[1] is the Vorbis content stream.
+    assert_eq!(dmx.track_order_serial(1), Some(VORBIS_SERIAL));
+    // Out of range.
+    assert_eq!(dmx.track_order_serial(2), None);
+
+    // Reverse map round-trips.
+    assert_eq!(dmx.track_order_index(SKEL_SERIAL), Some(0));
+    assert_eq!(dmx.track_order_index(VORBIS_SERIAL), Some(1));
+    // A serial never seen as a BOS resolves to nothing.
+    assert_eq!(dmx.track_order_index(0xDEAD_BEEF), None);
+
+    // The content track's track-order serial round-trips back to its
+    // fisbone metadata in the Skeleton (the spec's reason for the
+    // ordering: addressing tracks by a stable index).
+    let sk = dmx.skeleton().expect("Skeleton present");
+    let serial = dmx.track_order_serial(1).unwrap();
+    let bone = sk.bone_for_serial(serial).expect("bone for track[1]");
+    assert_eq!(bone.header("Name"), Some("main_audio"));
+}
+
+#[test]
+fn track_order_multi_stream_with_skeleton() {
+    // File layout: Skeleton BOS, then Vorbis A BOS, then Vorbis B BOS.
+    // Mirrors the wiki worked example where track[0] is Skeleton and
+    // the content tracks follow in BOS-page order.
+    let (bytes, _, _) = build_skeleton_multi_stream_indexed_ogg();
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+
+    // Skeleton + 2 content streams = 3 track slots.
+    assert_eq!(dmx.track_order_len(), 3);
+    assert_eq!(oxideav_core::Demuxer::streams(&dmx).len(), 2);
+
+    assert_eq!(dmx.track_order_serial(0), Some(SKEL_SERIAL));
+    assert_eq!(dmx.track_order_serial(1), Some(VORBIS_SERIAL_A));
+    assert_eq!(dmx.track_order_serial(2), Some(VORBIS_SERIAL_B));
+    assert_eq!(dmx.track_order_serial(3), None);
+
+    assert_eq!(dmx.track_order_index(SKEL_SERIAL), Some(0));
+    assert_eq!(dmx.track_order_index(VORBIS_SERIAL_A), Some(1));
+    assert_eq!(dmx.track_order_index(VORBIS_SERIAL_B), Some(2));
+
+    // Every track index walks back to its fisbone in spec order.
+    let sk = dmx.skeleton().expect("Skeleton present");
+    let s1 = dmx.track_order_serial(1).unwrap();
+    let s2 = dmx.track_order_serial(2).unwrap();
+    assert_eq!(
+        sk.bone_for_serial(s1).and_then(|b| b.header("Name")),
+        Some("stream_a")
+    );
+    assert_eq!(
+        sk.bone_for_serial(s2).and_then(|b| b.header("Name")),
+        Some("stream_b")
+    );
+}
+
+#[test]
+fn track_order_skeleton_free_file() {
+    // Without a Skeleton, the wiki only reserves track[0] for Skeleton
+    // when it is present — so a Skeleton-free file maps track[n]
+    // directly onto content stream index n.
+    let v_id = vorbis_id_packet(2, 48_000);
+    let v_comment = vorbis_comment_packet();
+    let v_setup = vorbis_setup_packet();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&single_packet_page(
+        &v_id,
+        flags::FIRST_PAGE,
+        VORBIS_SERIAL,
+        0,
+        0,
+    ));
+    out.extend_from_slice(&single_packet_page(&v_comment, 0, VORBIS_SERIAL, 1, 0));
+    out.extend_from_slice(&single_packet_page(&v_setup, 0, VORBIS_SERIAL, 2, 0));
+    let data_packet: Vec<u8> = (0..50u8).collect();
+    out.extend_from_slice(&single_packet_page(
+        &data_packet,
+        flags::LAST_PAGE,
+        VORBIS_SERIAL,
+        3,
+        960,
+    ));
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(out));
+    let codecs = NullCodecResolver;
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+
+    assert!(dmx.skeleton().is_none(), "test premise: no Skeleton");
+    // No Skeleton track[0] slot: the single content stream is track[0].
+    assert_eq!(dmx.track_order_len(), 1);
+    assert_eq!(dmx.track_order_serial(0), Some(VORBIS_SERIAL));
+    assert_eq!(dmx.track_order_serial(1), None);
+    assert_eq!(dmx.track_order_index(VORBIS_SERIAL), Some(0));
+    assert_eq!(dmx.track_order_index(0xDEAD_BEEF), None);
+}
+
+#[test]
+fn track_order_full_walk_round_trips() {
+    // Walking 0..track_order_len() and mapping each serial back to its
+    // index must be the identity permutation — the property a JS-style
+    // `track[n]` resolver depends on.
+    let (bytes, _, _) = build_skeleton_multi_stream_indexed_ogg();
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+
+    for n in 0..dmx.track_order_len() {
+        let serial = dmx
+            .track_order_serial(n)
+            .expect("in-range track has serial");
+        assert_eq!(
+            dmx.track_order_index(serial),
+            Some(n),
+            "track[{n}] serial {serial:#010x} must round-trip back to index {n}"
+        );
+    }
+}

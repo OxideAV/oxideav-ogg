@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton "Track order" addressing on `OggDemuxer`.** Three new
+  accessors implement the stable per-track index addressing scheme
+  documented in `docs/container/ogg/ogg-skeleton-message-headers.wiki`
+  §"Track order" ("the means to number through the tracks is by the
+  order in which the bos pages of the tracks appear in the Ogg
+  stream", with the worked example listing `track[0]: Skeleton BOS`,
+  `track[1]: Theora BOS for main video`, `track[2]: Vorbis BOS for
+  main audio`, …):
+  `OggDemuxer::track_order_len() -> u32` returns the number of
+  addressable track slots — the content streams plus the Skeleton
+  bitstream when a `fishead\0` BOS is present (the Skeleton occupies
+  `track[0]` but is not a content stream, so it never appears in
+  `streams()`); `OggDemuxer::track_order_serial(track_index) ->
+  Option<u32>` resolves a `track[n]` index to the logical bitstream's
+  on-wire `bitstream_serial_number`, mapping `track[0]` to the
+  Skeleton serial and each subsequent index to the content stream
+  whose BOS page appears next (the dense `StreamInfo::index` is
+  already assigned in BOS-discovery order, so the mapping is
+  `track[n] -> content stream index n-1` for a Skeleton-bearing file
+  and `track[n] -> content stream index n` for a Skeleton-free file —
+  the wiki only reserves `track[0]` for Skeleton when Skeleton is
+  present); and `OggDemuxer::track_order_index(serial) -> Option<u32>`
+  is the reverse map (the Skeleton serial → `Some(0)`, a content
+  serial → its `track[n]` index, an unseen serial → `None`). The
+  returned serial round-trips through `Skeleton::bone_for_serial` so a
+  caller walking `0..track_order_len()` recovers each track's fisbone
+  metadata in the spec-defined order — the property a JavaScript-style
+  `track[name=…]` / `track[n]` resolver depends on. 4 new integration
+  tests cover the single-stream-with-Skeleton layout (track[0] =
+  Skeleton, track[1] = content + fisbone-`Name` round-trip), the
+  multi-stream layout (Skeleton + two Vorbis tracks in BOS order, each
+  walking back to its `stream_a` / `stream_b` fisbone), the
+  Skeleton-free file (no reserved `track[0]` slot — the content stream
+  is `track[0]`), out-of-range / unseen-serial returning `None`, and a
+  full-walk round-trip asserting `track_order_index ∘
+  track_order_serial` is the identity permutation over
+  `0..track_order_len()`.
+
 - **Typed `Name` accessor on Skeleton-4 `FisBone`.** A new
   `FisBone::name() -> Option<Name>` parses the stable per-track
   identifier message header documented in
