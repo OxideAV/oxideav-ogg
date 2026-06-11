@@ -273,6 +273,25 @@ largest content-stream serial (so it cannot collide). The
 `open` factory continues to produce Skeleton-free output byte-for-byte
 by delegating to `open_with_skeleton(_, _, None)`.
 
+When the attached fishead is 4.0, `write_trailer` **backfills** the
+*Segment length in bytes* and *Content byte offset* fields with the
+measured values and rewrites the BOS page in place (same page length,
+CRC recomputed per RFC 3533 §6 field 7): segment length is the
+physical size of the finished segment — the value decoders compare
+against the file to detect a stale index — and content byte offset is
+the offset of the first non-header page, recorded as the control
+section closes. The backfill is per-field and conservative: a value
+the caller pre-set to non-zero passes through verbatim, only
+`None`/`0` ("unknown") fields are filled in, and a 3.0 fishead (whose
+64-byte layout has no such fields) is never touched. As a result the
+demuxer's own Skeleton-index validity check #1 (below) passes in
+enforcing mode — rather than via the `segment_length == 0` opt-out —
+on files this muxer produces. The trailer-time patch also drains each
+content stream's held-back header page before the Skeleton EOS is
+written, so every content secondary-header page (e.g. the Vorbis
+setup page) physically precedes the Skeleton EOS per the 4.0 spec's
+§"Further restrictions" encapsulation order.
+
 For encode-side use, every type round-trips through `to_bytes` /
 `parse`:
 

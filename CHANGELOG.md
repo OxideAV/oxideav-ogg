@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Mux-side Skeleton 4.0 fishead backfill (segment length + content
+  byte offset) and control-section ordering fix.** Two changes to
+  `mux::open_with_skeleton`, both grounded in
+  `docs/container/ogg/ogg-skeleton-4.0.md`:
+  1. **Trailer-time backfill.** The 4.0 fishead carries a *Segment
+     length in bytes* field ("if it doesn't match the length stored in
+     the Skeleton header packet, you know that either the index is out
+     of date, or the file has been chained since indexing") and a
+     *Content byte offset* field ("the offset of the first non header
+     page in the Ogg segment", letting a player "skip forward to that
+     offset, and start decoding from that offset forwards" when it
+     delays index loading). Neither value is knowable before the
+     segment is fully written, so the muxer previously emitted
+     whatever the caller set — typically the constructor's `0`
+     ("unknown"), which forced the demuxer's own Skeleton-index
+     validity check #1 into its opt-out path on every file this muxer
+     produced. `write_trailer` now measures both values (content byte
+     offset is recorded as the control section closes in
+     `write_header`; segment length is the final stream position) and
+     rewrites the fishead BOS page in place — same page length, CRC
+     recomputed per RFC 3533 §6 field 7. The backfill is per-field and
+     conservative: caller-pre-set non-zero values pass through
+     verbatim (a pre-measured remux knows better), only `None`/`0`
+     fields are filled, a 3.0 fishead (64-byte layout, no such fields)
+     is never touched, and when nothing needs filling the BOS page is
+     not rewritten at all.
+  2. **Secondary-header pages all precede the Skeleton EOS.** The
+     spec's §"Further restrictions" orders the segment as "the
+     secondary header pages of all logical bitstreams come next,
+     including Skeleton's secondary header packets" and only then "the
+     Skeleton EOS page ends the control section of the Ogg stream
+     before any content pages of any of the other logical bitstreams
+     appear". The muxer's EOS-deferral mechanism (`pending_bytes`)
+     held back the last header page of each content stream (e.g. the
+     Vorbis setup page) and flushed it only when the first content
+     data page arrived — physically *after* the Skeleton EOS, inside
+     the content section. `write_header` now drains every content
+     stream's held-back page before writing the Skeleton fisbones +
+     EOS, so the on-wire order matches the spec and the measured
+     content byte offset really is the first non-header page.
+  5 new integration tests in `tests/skeleton_mux.rs` cover the wire
+  ordering (setup + comment pages before the Skeleton EOS, only
+  content data pages after it), the backfilled values round-tripping
+  through the demuxer (`segment_length` == physical size,
+  `content_byte_offset` == offset of the first page after the Skeleton
+  EOS, verified against a raw page walk), caller-pre-set non-zero
+  fields surviving verbatim, the 3.0 fishead staying a byte-identical
+  64-byte packet, and every page CRC (including the rewritten BOS)
+  validating via `crc::validate_page_crc` after the patch.
+
 - **Skeleton "Track order" addressing on `OggDemuxer`.** Three new
   accessors implement the stable per-track index addressing scheme
   documented in `docs/container/ogg/ogg-skeleton-message-headers.wiki`

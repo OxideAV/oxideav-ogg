@@ -131,6 +131,10 @@ struct PageInfo {
     granule: i64,
     serial: u32,
     body: Vec<u8>,
+    /// Byte offset of the page's `OggS` capture pattern in the buffer.
+    offset: usize,
+    /// Byte offset one past the end of the page (start of the next page).
+    end: usize,
 }
 
 /// Naive walker: split the muxed buffer into pages and return their
@@ -175,6 +179,8 @@ fn walk_pages(bytes: &[u8]) -> Vec<PageInfo> {
             granule,
             serial,
             body: bytes[data_start..body_end].to_vec(),
+            offset: off,
+            end: body_end,
         });
         off = body_end;
     }
@@ -424,4 +430,201 @@ fn open_without_skeleton_emits_no_skeleton_bytes() {
     let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
         .expect("demux skel-less output");
     assert!(dmx.skeleton().is_none());
+}
+
+/// Build the standard one-Vorbis-stream fixture used by the fishead
+/// backfill tests below.
+fn vorbis_stream_fixture() -> StreamInfo {
+    let id = vorbis_id_packet(2, 48_000);
+    let com = vorbis_comment_packet();
+    let setup = vorbis_setup_packet();
+    let extradata = xiph_lace_three(&[&id, &com, &setup]);
+    single_stream(0, "vorbis", extradata, TimeBase::new(1, 48_000))
+}
+
+#[test]
+fn secondary_header_pages_all_precede_skeleton_eos() {
+    // ogg-skeleton-4.0.md §"Further restrictions": "the secondary header
+    // pages of all logical bitstreams come next, including Skeleton's
+    // secondary header packets (the fisbone and index packets)" and only
+    // then "the Skeleton EOS page ends the control section of the Ogg
+    // stream before any content pages of any of the other logical
+    // bitstreams appear". The Vorbis setup-header page (packet type 0x05)
+    // is the last content secondary header the muxer writes; it must sit
+    // before the Skeleton EOS page on the wire, not be deferred into the
+    // content section.
+    let stream = vorbis_stream_fixture();
+    let mut skel = Skeleton::new();
+    skel.set_head(FisHead::new(Version::V4_0));
+    skel.push_bone(FisBone::new(0, Rational::new(48_000, 1)));
+
+    let bytes = mux_with_skeleton(vec![stream], skel, 3);
+    let pages = walk_pages(&bytes);
+    let skel_serial = pages[0].serial;
+
+    let eos_index = pages
+        .iter()
+        .position(|p| p.serial == skel_serial && p.flags & 0x04 != 0)
+        .expect("Skeleton EOS page emitted");
+    let setup_index = pages
+        .iter()
+        .position(|p| p.body.first() == Some(&0x05) && p.body[1..].starts_with(b"vorbis"))
+        .expect("Vorbis setup-header page emitted");
+    let comment_index = pages
+        .iter()
+        .position(|p| p.body.first() == Some(&0x03) && p.body[1..].starts_with(b"vorbis"))
+        .expect("Vorbis comment-header page emitted");
+    assert!(
+        setup_index < eos_index,
+        "Vorbis setup page (#{setup_index}) must precede the Skeleton EOS (#{eos_index})"
+    );
+    assert!(
+        comment_index < eos_index,
+        "Vorbis comment page (#{comment_index}) must precede the Skeleton EOS (#{eos_index})"
+    );
+    // Every page after the Skeleton EOS belongs to a content stream and
+    // finishes a data packet (granule > 0 in this fixture).
+    for (i, p) in pages.iter().enumerate().skip(eos_index + 1) {
+        assert_ne!(p.serial, skel_serial, "no Skeleton page after the EOS");
+        assert!(
+            p.granule > 0,
+            "page #{i} after the Skeleton EOS must be a content data page"
+        );
+    }
+}
+
+#[test]
+fn fishead_backfills_segment_length_and_content_byte_offset() {
+    // ogg-skeleton-4.0.md: the 4.0 fishead carries "the length of the
+    // indexed segment in bytes" (used to detect a stale index: "if it
+    // doesn't match the length stored in the Skeleton header packet, you
+    // know that either the index is out of date, or the file has been
+    // chained since indexing") and "the offset of the first non header
+    // page in the Ogg segment". Leaving both at the constructor's 0
+    // ("unknown") must make the muxer backfill the measured values at
+    // trailer time.
+    let stream = vorbis_stream_fixture();
+    let mut skel = Skeleton::new();
+    skel.set_head(FisHead::new(Version::V4_0));
+    skel.push_bone(FisBone::new(0, Rational::new(48_000, 1)));
+
+    let bytes = mux_with_skeleton(vec![stream], skel, 3);
+    let pages = walk_pages(&bytes);
+    let skel_serial = pages[0].serial;
+
+    // Expected content byte offset: the first byte after the Skeleton
+    // EOS page (the EOS closes the control section, so the next page is
+    // the first non-header page).
+    let eos = pages
+        .iter()
+        .find(|p| p.serial == skel_serial && p.flags & 0x04 != 0)
+        .expect("Skeleton EOS page emitted");
+    let expected_offset = eos.end as u64;
+    // Sanity: a page really starts there and it is a content data page.
+    let first_content = pages
+        .iter()
+        .find(|p| p.offset as u64 == expected_offset)
+        .expect("a page starts at the content byte offset");
+    assert_ne!(first_content.serial, skel_serial);
+    assert!(first_content.granule > 0);
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.clone()));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux backfilled output");
+    let head = dmx
+        .skeleton()
+        .expect("Skeleton recovered")
+        .head
+        .as_ref()
+        .expect("fishead parsed")
+        .clone();
+    assert_eq!(
+        head.segment_length,
+        Some(bytes.len() as u64),
+        "segment length must equal the physical segment size"
+    );
+    assert_eq!(
+        head.content_byte_offset,
+        Some(expected_offset),
+        "content byte offset must point at the first non-header page"
+    );
+}
+
+#[test]
+fn fishead_caller_preset_fields_are_preserved() {
+    // A caller that pre-measured the fields (e.g. a remux of a known
+    // segment) wins over the muxer's own measurement: non-zero values
+    // pass through verbatim, byte-for-byte.
+    let stream = vorbis_stream_fixture();
+    let mut head = FisHead::new(Version::V4_0);
+    head.segment_length = Some(99_999);
+    head.content_byte_offset = Some(777);
+    let mut skel = Skeleton::new();
+    skel.set_head(head);
+    skel.push_bone(FisBone::new(0, Rational::new(48_000, 1)));
+
+    let bytes = mux_with_skeleton(vec![stream], skel, 2);
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux preset output");
+    let recovered = dmx
+        .skeleton()
+        .expect("Skeleton recovered")
+        .head
+        .as_ref()
+        .expect("fishead parsed")
+        .clone();
+    assert_eq!(recovered.segment_length, Some(99_999));
+    assert_eq!(recovered.content_byte_offset, Some(777));
+}
+
+#[test]
+fn fishead_3_0_is_never_patched() {
+    // The 3.0 fishead layout is 64 bytes and has no segment-length /
+    // content-byte-offset fields — the backfill must leave it alone.
+    let stream = vorbis_stream_fixture();
+    let mut skel = Skeleton::new();
+    skel.set_head(FisHead::new(Version::V3_0));
+    skel.push_bone(FisBone::new(0, Rational::new(48_000, 1)));
+
+    let bytes = mux_with_skeleton(vec![stream], skel, 2);
+    let pages = walk_pages(&bytes);
+    assert!(pages[0].body.starts_with(FISHEAD_MAGIC));
+    assert_eq!(pages[0].body.len(), 64, "3.0 fishead stays 64 bytes");
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux 3.0 output");
+    let recovered = dmx
+        .skeleton()
+        .expect("Skeleton recovered")
+        .head
+        .as_ref()
+        .expect("fishead parsed")
+        .clone();
+    assert_eq!(recovered.version, Version::V3_0);
+    assert_eq!(recovered.segment_length, None);
+    assert_eq!(recovered.content_byte_offset, None);
+}
+
+#[test]
+fn backfilled_fishead_page_crc_is_valid() {
+    // The in-place rewrite recomputes the page CRC over the patched
+    // packet (RFC 3533 §6 field 7) — verify with the standalone
+    // validator over every page in the output.
+    let stream = vorbis_stream_fixture();
+    let mut skel = Skeleton::new();
+    skel.set_head(FisHead::new(Version::V4_0));
+    skel.push_bone(FisBone::new(0, Rational::new(48_000, 1)));
+
+    let bytes = mux_with_skeleton(vec![stream], skel, 3);
+    for p in walk_pages(&bytes) {
+        assert_eq!(
+            oxideav_ogg::crc::validate_page_crc(&bytes[p.offset..p.end]),
+            Some(true),
+            "page at offset {} must carry a valid CRC after the backfill",
+            p.offset
+        );
+    }
 }

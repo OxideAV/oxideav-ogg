@@ -6,7 +6,7 @@
 //! time. Granule positions come from `Packet::pts` for non-header packets.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 
 use oxideav_core::{CodecId, Error, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
@@ -79,6 +79,8 @@ pub fn open_with_skeleton(
             skel: sk,
             serial,
             seq_no: 0,
+            emitted_head: None,
+            content_byte_offset_measured: None,
         }
     });
     Ok(Box::new(OggMuxer {
@@ -120,6 +122,19 @@ struct SkeletonWriter {
     skel: Skeleton,
     serial: u32,
     seq_no: u32,
+    /// The fishead actually written into the BOS page — the caller's
+    /// head, or the default-constructed 4.0 head when the attached
+    /// `Skeleton` carried none. Retained so `write_trailer` can
+    /// backfill the 4.0 *Segment length in bytes* / *Content byte
+    /// offset* fields in place once the whole segment is measured.
+    emitted_head: Option<crate::skeleton::FisHead>,
+    /// Byte offset of the first non-header page, recorded at the end of
+    /// `write_header` (immediately after the Skeleton EOS page closes
+    /// the control section). This is the value the 4.0 fishead's
+    /// *Content byte offset* field declares per
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` ("the offset of the
+    /// first non header page in the Ogg segment").
+    content_byte_offset_measured: Option<u64>,
 }
 
 struct StreamWriter {
@@ -193,21 +208,22 @@ impl OggMuxer {
     /// Emit the Skeleton fishead BOS page. Must run before any content
     /// stream's BOS page, per the Skeleton 3.0 / 4.0 encapsulation order.
     fn write_skeleton_fishead_bos(&mut self) -> Result<()> {
-        let head_bytes = {
+        let head = {
             let sk = self.skeleton.as_ref().expect("skeleton writer present");
-            sk.skel
-                .head
-                .as_ref()
-                .map(|h| h.to_bytes())
-                .unwrap_or_else(|| {
-                    // Caller attached a Skeleton with no fishead — emit a
-                    // minimal 4.0 fishead (zero-valued presentation time /
-                    // basetime / segment-length / content-byte-offset)
-                    // so the BOS is structurally valid for downstream
-                    // parsers.
-                    crate::skeleton::FisHead::new(crate::skeleton::Version::V4_0).to_bytes()
-                })
+            sk.skel.head.clone().unwrap_or_else(|| {
+                // Caller attached a Skeleton with no fishead — emit a
+                // minimal 4.0 fishead (zero-valued presentation time /
+                // basetime / segment-length / content-byte-offset)
+                // so the BOS is structurally valid for downstream
+                // parsers.
+                crate::skeleton::FisHead::new(crate::skeleton::Version::V4_0)
+            })
         };
+        let head_bytes = head.to_bytes();
+        self.skeleton
+            .as_mut()
+            .expect("skeleton writer present")
+            .emitted_head = Some(head);
         self.write_skeleton_page(&head_bytes, flags::FIRST_PAGE)
     }
 
@@ -280,6 +296,86 @@ impl OggMuxer {
         writer.pending_bytes = Some(new_bytes);
         Ok(())
     }
+
+    /// Backfill the Skeleton 4.0 fishead *Segment length in bytes* and
+    /// *Content byte offset* fields with the measured values, rewriting
+    /// the BOS page in place at trailer time.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
+    /// faster seeking" has decoders "check the length of the physical
+    /// segment, and if it doesn't match the length stored in the
+    /// Skeleton header packet, you know that either the index is out of
+    /// date, or the file has been chained since indexing"; the BOS
+    /// "also contains the offset of the first non header page in the
+    /// Ogg segment" so a player "can skip forward to that offset, and
+    /// start decoding from that offset forwards" when it wants to delay
+    /// index loading. Neither value is knowable before the whole
+    /// segment is written, hence the in-place patch here.
+    ///
+    /// The backfill is per-field and conservative:
+    /// * a field the caller already set to a non-zero value is
+    ///   preserved verbatim (a pre-measured remux knows better than we
+    ///   do), only `None` / `0` ("unknown") values are filled in;
+    /// * a 3.0 fishead is never touched — its 64-byte layout has no
+    ///   such fields;
+    /// * when nothing needs backfilling the BOS page is not rewritten
+    ///   at all, keeping the output bytes identical to a straight
+    ///   sequential write.
+    ///
+    /// The rewrite reconstructs the BOS page exactly as
+    /// `write_skeleton_fishead_bos` emitted it (same flags / granule /
+    /// serial / sequence number 0 / lacing) with the patched packet
+    /// body, so the page length is unchanged and `Page::to_bytes`
+    /// recomputes the CRC over the new bytes (RFC 3533 §6 field 7).
+    fn backfill_skeleton_fishead(&mut self) -> Result<()> {
+        let (serial, mut head, measured_offset) = {
+            let Some(sk) = self.skeleton.as_ref() else {
+                return Ok(());
+            };
+            let Some(head) = sk.emitted_head.as_ref() else {
+                return Ok(());
+            };
+            if !head.version.at_least(crate::skeleton::Version::V4_0) {
+                return Ok(());
+            }
+            (sk.serial, head.clone(), sk.content_byte_offset_measured)
+        };
+        let end_pos = self.output.stream_position()?;
+        let mut changed = false;
+        if head.segment_length.unwrap_or(0) == 0 && end_pos != 0 {
+            head.segment_length = Some(end_pos);
+            changed = true;
+        }
+        if head.content_byte_offset.unwrap_or(0) == 0 {
+            if let Some(off) = measured_offset {
+                head.content_byte_offset = Some(off);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        let data = head.to_bytes();
+        let page = Page {
+            flags: flags::FIRST_PAGE,
+            granule_position: 0,
+            serial,
+            seq_no: 0,
+            lacing: lace(data.len()),
+            data,
+        };
+        let bytes = page.to_bytes();
+        // The fishead BOS is always the very first page of the physical
+        // stream (it is the first thing write_header emits when a
+        // Skeleton is attached), so the patch target offset is 0.
+        self.output.seek(SeekFrom::Start(0))?;
+        self.output.write_all(&bytes)?;
+        self.output.seek(SeekFrom::Start(end_pos))?;
+        if let Some(sk) = self.skeleton.as_mut() {
+            sk.emitted_head = Some(head);
+        }
+        Ok(())
+    }
 }
 
 impl Muxer for OggMuxer {
@@ -350,7 +446,37 @@ impl Muxer for OggMuxer {
         // other logical bitstreams appear"). Subsequent write_packet
         // calls supply those content data pages.
         if self.skeleton.is_some() {
+            // Step 2.5: drain every content stream's held-back page so
+            // all content secondary-header pages physically precede the
+            // Skeleton EOS page. `docs/container/ogg/ogg-skeleton-4.0.md`
+            // §"Further restrictions" orders the segment as "the
+            // secondary header pages of all logical bitstreams come
+            // next, including Skeleton's secondary header packets" and
+            // then "the Skeleton EOS page ends the control section of
+            // the Ogg stream before any content pages of any of the
+            // other logical bitstreams appear". Without this drain the
+            // EOS-deferral mechanism (pending_bytes) would hold the last
+            // header page of each content stream (e.g. the Vorbis setup
+            // page) and flush it only when the first content data page
+            // arrives — after the Skeleton EOS, inside the content
+            // section.
+            let order = self.stream_order.clone();
+            for idx in order {
+                let writer = self.writer_for(idx)?;
+                if let Some(bytes) = writer.pending_bytes.take() {
+                    self.output.write_all(&bytes)?;
+                }
+            }
             self.write_skeleton_fisbones_and_eos()?;
+            // Everything in the control section is now on the wire, so
+            // the current position is the offset of the first non-header
+            // page — the 4.0 fishead's *Content byte offset* value,
+            // backfilled at trailer time.
+            let pos = self.output.stream_position()?;
+            self.skeleton
+                .as_mut()
+                .expect("skeleton writer present")
+                .content_byte_offset_measured = Some(pos);
         }
         Ok(())
     }
@@ -426,6 +552,7 @@ impl Muxer for OggMuxer {
                 self.output.write_all(&bytes)?;
             }
         }
+        self.backfill_skeleton_fishead()?;
         self.output.flush()?;
         self.trailer_written = true;
         Ok(())
