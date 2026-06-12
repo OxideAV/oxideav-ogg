@@ -292,6 +292,37 @@ written, so every content secondary-header page (e.g. the Vorbis
 setup page) physically precedes the Skeleton EOS per the 4.0 spec's
 §"Further restrictions" encapsulation order.
 
+#### Mux-side: muxer-built keyframe indexes
+
+`oxideav_ogg::mux::open_with_skeleton_indexed(output, streams, skel,
+AutoIndexConfig::default())` makes the muxer build the Skeleton 4.0
+`index\0` packet for each content stream itself, instead of requiring
+the caller to know every keypoint up front. The 4.0 spec places index
+packets in the segment's header pages ("all the keyframe indexes are
+immediately available once the header packets have been read"), but a
+keypoint's byte offset and the segment's first/last sample times are
+only knowable after the content is written — so the muxer reserves a
+fixed-size placeholder `index\0` page per stream at `write_header`
+(between the fisbones and the Skeleton EOS, per §"Further
+restrictions"), records a keypoint whenever a page carrying a
+keyframe-flagged packet (`PacketFlags::keyframe`) hits the wire, and
+rewrites each placeholder in place at `write_trailer` — same page
+length, CRC recomputed per RFC 3533 §6 field 7, the same mechanism as
+the fishead segment-length/content-byte-offset backfill above.
+Keypoint timestamps are numerators over the stream time-base
+denominator; the index's first/last-sample-time fields are filled
+from the first/last content-packet pts. `AutoIndexConfig` carries the
+spec's thinning recommendation ("at most one key point per every 64KB
+of data, or every 1000ms, whichever is least frequent") as
+`min_keypoint_byte_gap` / `min_keypoint_time_gap_ms` defaults plus a
+`max_keypoints` reservation cap (`42 + 20·n` bytes per stream; a
+partial index is explicitly allowed by the spec). Bytes past the
+final encoded keypoint stay zero — they lie beyond the *n* keypoints
+the layout defines, so readers never consume them. Streams whose
+serial already carries a caller-supplied `SkelIndex` pass through
+verbatim. The result feeds the demuxer's own fast-path `seek_to`
+below end-to-end, with validity check #1 passing in enforcing mode.
+
 For encode-side use, every type round-trips through `to_bytes` /
 `parse`:
 

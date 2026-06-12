@@ -608,6 +608,331 @@ fn fishead_3_0_is_never_patched() {
     assert_eq!(recovered.content_byte_offset, None);
 }
 
+// ---------------------------------------------------------------------
+// Muxer-built Skeleton 4.0 keyframe indexes
+// (`oxideav_ogg::mux::open_with_skeleton_indexed`).
+//
+// ogg-skeleton-4.0.md §"Keyframe index packets": index packets live in
+// the segment's header pages, but keypoint offsets / first-last sample
+// times are only knowable after the content is written — the muxer
+// reserves a fixed-size placeholder page in write_header and rewrites
+// it in place at write_trailer (same page length, CRC recomputed),
+// exactly like the fishead segment-length / content-byte-offset
+// backfill.
+// ---------------------------------------------------------------------
+
+/// Mux `packets` (`(stream_index, pts, keyframe)` triples, each a
+/// unit-boundary content packet) through `open_with_skeleton_indexed`.
+fn mux_indexed(
+    streams: Vec<StreamInfo>,
+    skel: Skeleton,
+    cfg: oxideav_ogg::mux::AutoIndexConfig,
+    packets: &[(u32, i64, bool)],
+) -> Vec<u8> {
+    let shared = SharedBuf::default();
+    let writer: Box<dyn WriteSeek> = Box::new(shared.clone());
+    let mut muxer = oxideav_ogg::mux::open_with_skeleton_indexed(writer, &streams, skel, cfg)
+        .expect("open_with_skeleton_indexed");
+    muxer.write_header().unwrap();
+    for &(stream_index, pts, keyframe) in packets {
+        let tb = streams[stream_index as usize].time_base;
+        let mut pkt = Packet::new(stream_index, tb, vec![0xAA, pts as u8]);
+        pkt.pts = Some(pts);
+        pkt.dts = pkt.pts;
+        pkt.flags.keyframe = keyframe;
+        pkt.flags.unit_boundary = true;
+        muxer.write_packet(&pkt).unwrap();
+    }
+    muxer.write_trailer().unwrap();
+    drop(muxer);
+    let guard = shared.0.lock().unwrap();
+    guard.get_ref().clone()
+}
+
+/// Permissive gating for tests: every keyframe page becomes a keypoint
+/// (subject only to `max_keypoints`).
+fn permissive_cfg(max_keypoints: usize) -> oxideav_ogg::mux::AutoIndexConfig {
+    oxideav_ogg::mux::AutoIndexConfig {
+        max_keypoints,
+        min_keypoint_byte_gap: 0,
+        min_keypoint_time_gap_ms: 0,
+    }
+}
+
+fn skel_with_bone() -> Skeleton {
+    let mut skel = Skeleton::new();
+    skel.set_head(FisHead::new(Version::V4_0));
+    let mut bone = FisBone::new(0, Rational::new(48_000, 1));
+    bone.set_header("Content-Type", "audio/vorbis");
+    skel.push_bone(bone);
+    skel
+}
+
+#[test]
+fn auto_index_records_keypoints_and_demux_fast_path_seeks() {
+    let stream = vorbis_stream_fixture();
+    let packets: Vec<(u32, i64, bool)> = (1..=6).map(|i| (0u32, 960 * i, true)).collect();
+    let bytes = mux_indexed(vec![stream], skel_with_bone(), permissive_cfg(16), &packets);
+
+    // On-wire expectations: the content stream's data pages, in order.
+    let pages = walk_pages(&bytes);
+    let skel_serial = pages[0].serial;
+    let content_data_offsets: Vec<u64> = pages
+        .iter()
+        .filter(|p| p.serial != skel_serial && p.granule > 0)
+        .map(|p| p.offset as u64)
+        .collect();
+    assert_eq!(content_data_offsets.len(), 6);
+
+    // The recovered index carries one keypoint per keyframe page, in
+    // increasing-offset order, timestamped over the stream time-base
+    // denominator.
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes.clone()));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux auto-indexed output");
+    let sk = dmx.skeleton().expect("Skeleton recovered");
+    assert_eq!(sk.indexes.len(), 1);
+    let idx = &sk.indexes[0];
+    assert_eq!(idx.serial, 0, "content stream serial");
+    assert_eq!(idx.timestamp_denominator, 48_000);
+    assert_eq!(idx.first_sample_time, 960);
+    assert_eq!(idx.last_sample_time, 5_760);
+    assert_eq!(idx.keypoints.len(), 6);
+    for (i, kp) in idx.keypoints.iter().enumerate() {
+        assert_eq!(kp.timestamp, 960 * (i as i64 + 1));
+        assert_eq!(
+            kp.offset, content_data_offsets[i],
+            "keypoint {i} must point at the first byte of its content page"
+        );
+    }
+    // The backfilled fishead makes validity check #1 run in enforcing
+    // mode (segment length == physical size), not via the 0 opt-out.
+    let head = sk.head.as_ref().unwrap();
+    assert_eq!(head.segment_length, Some(bytes.len() as u64));
+
+    // End-to-end: seek_to resolves via the Skeleton index fast path and
+    // decoding resumes at the keypoint's packet.
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux for seek");
+    use oxideav_core::Demuxer as _;
+    let landed = dmx.seek_to(0, 2_880).expect("indexed seek");
+    assert_eq!(landed, 2_880);
+    assert_eq!(dmx.skeleton_index_seek_count(), 1, "fast path must fire");
+    assert_eq!(dmx.skeleton_index_invalid_count(), 0);
+    let pkt = dmx.next_packet().expect("packet after seek");
+    assert_eq!(pkt.stream_index, 0);
+    assert_eq!(pkt.pts, Some(2_880));
+}
+
+#[test]
+fn auto_index_thins_keypoints_per_byte_and_time_gaps() {
+    // Byte gating: a gap larger than any page in this tiny fixture
+    // accepts only the first candidate.
+    let stream = vorbis_stream_fixture();
+    let packets: Vec<(u32, i64, bool)> = (1..=6).map(|i| (0u32, 960 * i, true)).collect();
+    let cfg = oxideav_ogg::mux::AutoIndexConfig {
+        max_keypoints: 16,
+        min_keypoint_byte_gap: 1 << 20,
+        min_keypoint_time_gap_ms: 0,
+    };
+    let bytes = mux_indexed(vec![stream], skel_with_bone(), cfg, &packets);
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(dmx.skeleton().unwrap().indexes[0].keypoints.len(), 1);
+
+    // Time gating: packets 20 ms apart against a 1000 ms minimum gap —
+    // again only the first candidate survives.
+    let stream = vorbis_stream_fixture();
+    let packets: Vec<(u32, i64, bool)> = (1..=6).map(|i| (0u32, 960 * i, true)).collect();
+    let cfg = oxideav_ogg::mux::AutoIndexConfig {
+        max_keypoints: 16,
+        min_keypoint_byte_gap: 0,
+        min_keypoint_time_gap_ms: 1000,
+    };
+    let bytes = mux_indexed(vec![stream], skel_with_bone(), cfg, &packets);
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(dmx.skeleton().unwrap().indexes[0].keypoints.len(), 1);
+
+    // Same 1000 ms minimum but packets a full second apart: every
+    // candidate clears the gate.
+    let stream = vorbis_stream_fixture();
+    let packets: Vec<(u32, i64, bool)> = (1..=4).map(|i| (0u32, 48_000 * i, true)).collect();
+    let bytes = mux_indexed(vec![stream], skel_with_bone(), cfg, &packets);
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver).unwrap();
+    assert_eq!(dmx.skeleton().unwrap().indexes[0].keypoints.len(), 4);
+}
+
+#[test]
+fn auto_index_reservation_caps_keypoints_and_keeps_page_length() {
+    // max_keypoints = 2 reserves a 42 + 2·20 = 82-byte packet; the
+    // five keyframe pages must be thinned to the reservation, and the
+    // backfilled page must keep the placeholder's byte length (the
+    // in-place rewrite cannot move the pages that follow). Every page
+    // CRC — including the two rewritten ones — must still validate.
+    let stream = vorbis_stream_fixture();
+    let packets: Vec<(u32, i64, bool)> = (1..=5).map(|i| (0u32, 960 * i, true)).collect();
+    let bytes = mux_indexed(vec![stream], skel_with_bone(), permissive_cfg(2), &packets);
+
+    let pages = walk_pages(&bytes);
+    let skel_serial = pages[0].serial;
+    let index_page = pages
+        .iter()
+        .find(|p| p.serial == skel_serial && p.body.starts_with(b"index\0"))
+        .expect("index page emitted");
+    assert_eq!(
+        index_page.body.len(),
+        82,
+        "backfilled packet keeps the reserved length (zero tail past the n-th keypoint)"
+    );
+    let idx = SkelIndex::parse(&index_page.body).expect("padded index packet parses");
+    assert_eq!(idx.keypoints.len(), 2);
+    assert!(idx.is_sorted_by_offset());
+
+    for p in walk_pages(&bytes) {
+        assert_eq!(
+            oxideav_ogg::crc::validate_page_crc(&bytes[p.offset..p.end]),
+            Some(true),
+            "page at offset {} must carry a valid CRC after the index backfill",
+            p.offset
+        );
+    }
+}
+
+#[test]
+fn auto_index_skips_stream_with_caller_supplied_index() {
+    // A caller-supplied index for the stream's serial passes through
+    // verbatim — no placeholder, no auto keypoints.
+    let stream = vorbis_stream_fixture();
+    let mut skel = skel_with_bone();
+    let mut custom = SkelIndex::new(0, 1_000);
+    custom.first_sample_time = 7;
+    custom.last_sample_time = 9_001;
+    custom.keypoints.push(KeyPoint {
+        offset: 123,
+        timestamp: 456,
+    });
+    skel.push_index(custom.clone());
+    let packets: Vec<(u32, i64, bool)> = (1..=4).map(|i| (0u32, 960 * i, true)).collect();
+    let bytes = mux_indexed(vec![stream], skel, permissive_cfg(8), &packets);
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver).unwrap();
+    let sk = dmx.skeleton().unwrap();
+    assert_eq!(sk.indexes.len(), 1, "no second auto-built index");
+    assert_eq!(sk.indexes[0], custom);
+}
+
+#[test]
+fn auto_index_without_keyframes_backfills_empty_index() {
+    // No keyframe-flagged packets: the index packet is still emitted
+    // (n = 0) with the first/last-sample-time fields filled from the
+    // observed pts, and seeking falls back to bisection per the spec's
+    // graceful-fallback rule.
+    let stream = vorbis_stream_fixture();
+    let packets: Vec<(u32, i64, bool)> = (1..=5).map(|i| (0u32, 960 * i, false)).collect();
+    let bytes = mux_indexed(vec![stream], skel_with_bone(), permissive_cfg(8), &packets);
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut dmx =
+        oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver).unwrap();
+    {
+        let idx = &dmx.skeleton().unwrap().indexes[0];
+        assert!(idx.keypoints.is_empty());
+        assert_eq!(idx.first_sample_time, 960);
+        assert_eq!(idx.last_sample_time, 4_800);
+        assert_eq!(idx.timestamp_denominator, 48_000);
+    }
+    use oxideav_core::Demuxer as _;
+    let landed = dmx.seek_to(0, 2_880).expect("bisection fallback seek");
+    assert!(landed <= 2_880);
+    assert_eq!(
+        dmx.skeleton_index_seek_count(),
+        0,
+        "empty index has no floor keypoint — fast path must not fire"
+    );
+}
+
+#[test]
+fn auto_index_multi_stream_emits_one_index_per_content_stream() {
+    let stream_a = vorbis_stream_fixture();
+    let mut stream_b = vorbis_stream_fixture();
+    stream_b.index = 1;
+    let mut skel = Skeleton::new();
+    skel.set_head(FisHead::new(Version::V4_0));
+    skel.push_bone(FisBone::new(0, Rational::new(48_000, 1)));
+    skel.push_bone(FisBone::new(1, Rational::new(48_000, 1)));
+
+    let mut packets: Vec<(u32, i64, bool)> = Vec::new();
+    for i in 1..=3 {
+        packets.push((0, 960 * i, true));
+        packets.push((1, 960 * i, true));
+    }
+    let bytes = mux_indexed(vec![stream_a, stream_b], skel, permissive_cfg(8), &packets);
+
+    let pages = walk_pages(&bytes);
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver).unwrap();
+    let sk = dmx.skeleton().unwrap();
+    assert_eq!(sk.indexes.len(), 2);
+    for serial in [0u32, 1u32] {
+        let idx = sk
+            .index_for_serial(serial)
+            .unwrap_or_else(|| panic!("index for serial {serial}"));
+        assert_eq!(idx.keypoints.len(), 3);
+        for kp in &idx.keypoints {
+            let page = pages
+                .iter()
+                .find(|p| p.offset as u64 == kp.offset)
+                .expect("keypoint lands on a page boundary");
+            assert_eq!(
+                page.serial, serial,
+                "keypoint offset must start a page of its own stream"
+            );
+        }
+    }
+}
+
+#[test]
+fn auto_index_rejects_invalid_configurations() {
+    // index packets are a Skeleton 4.0 feature — a 3.0 fishead has no
+    // segment-length field to validate them against.
+    let stream = vorbis_stream_fixture();
+    let mut skel = Skeleton::new();
+    skel.set_head(FisHead::new(Version::V3_0));
+    let writer: Box<dyn WriteSeek> = Box::new(SharedBuf::default());
+    assert!(oxideav_ogg::mux::open_with_skeleton_indexed(
+        writer,
+        std::slice::from_ref(&stream),
+        skel,
+        permissive_cfg(8),
+    )
+    .is_err());
+
+    // max_keypoints = 0 reserves nothing to backfill.
+    let writer: Box<dyn WriteSeek> = Box::new(SharedBuf::default());
+    assert!(oxideav_ogg::mux::open_with_skeleton_indexed(
+        writer,
+        std::slice::from_ref(&stream),
+        skel_with_bone(),
+        permissive_cfg(0),
+    )
+    .is_err());
+
+    // A reservation past the single-page body limit (255×255 bytes)
+    // cannot ride on one Skeleton page.
+    let writer: Box<dyn WriteSeek> = Box::new(SharedBuf::default());
+    assert!(oxideav_ogg::mux::open_with_skeleton_indexed(
+        writer,
+        std::slice::from_ref(&stream),
+        skel_with_bone(),
+        permissive_cfg(4_000),
+    )
+    .is_err());
+}
+
 #[test]
 fn backfilled_fishead_page_crc_is_valid() {
     // The in-place rewrite recomputes the page CRC over the patched

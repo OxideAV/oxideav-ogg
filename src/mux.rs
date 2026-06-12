@@ -13,10 +13,10 @@ use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
 use crate::page::{self, flags, lace, Page};
-use crate::skeleton::Skeleton;
+use crate::skeleton::{KeyPoint, SkelIndex, Skeleton};
 
 pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
-    open_with_skeleton(output, streams, None)
+    open_inner(output, streams, None, None)
 }
 
 /// Open an Ogg muxer with an optional Skeleton metadata bitstream.
@@ -55,6 +55,154 @@ pub fn open_with_skeleton(
     streams: &[StreamInfo],
     skeleton: Option<Skeleton>,
 ) -> Result<Box<dyn Muxer>> {
+    open_inner(output, streams, skeleton, None)
+}
+
+/// Per-stream limits for muxer-built Skeleton 4.0 keyframe indexes
+/// (see [`open_with_skeleton_indexed`]).
+///
+/// `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe index packets":
+/// "The exact number of keyframes used to construct key points in the
+/// index is up to the indexer, but to limit the index size, we recommend
+/// including at most one key point per every 64KB of data, or every
+/// 1000ms, whichever is least frequent." The defaults implement exactly
+/// that recommendation; tests and high-keypoint-density use cases can
+/// relax both gaps.
+#[derive(Clone, Copy, Debug)]
+pub struct AutoIndexConfig {
+    /// Maximum number of keypoints recorded per content stream. The
+    /// placeholder `index\0` packet written in the header section
+    /// reserves `42 + 20 * max_keypoints` bytes (42-byte fixed prefix
+    /// per the 4.0 spec, plus the worst-case two 10-byte variable-byte
+    /// integers per keypoint), so this bounds the on-wire size paid up
+    /// front. Keyframes past the cap are silently not indexed — the
+    /// spec allows a partial index ("a keyframe index may not index
+    /// all keyframes in the Ogg segment").
+    ///
+    /// Must be at least 1 and at most 3249 (the largest reservation
+    /// that still fits a single maximal Ogg page of 255×255 body
+    /// bytes, since every Skeleton packet rides on its own page).
+    pub max_keypoints: usize,
+    /// Minimum number of bytes between two consecutive keypoints of
+    /// the same stream. Spec-recommended default: 64 KiB.
+    pub min_keypoint_byte_gap: u64,
+    /// Minimum presentation-time distance, in milliseconds, between
+    /// two consecutive keypoints of the same stream. Spec-recommended
+    /// default: 1000 ms.
+    pub min_keypoint_time_gap_ms: u64,
+}
+
+impl Default for AutoIndexConfig {
+    fn default() -> Self {
+        Self {
+            max_keypoints: 128,
+            min_keypoint_byte_gap: 64 * 1024,
+            min_keypoint_time_gap_ms: 1000,
+        }
+    }
+}
+
+/// Largest permitted `AutoIndexConfig::max_keypoints`: the reserved
+/// packet (42 + 20·n bytes) must fit the 255×255-byte body of a single
+/// Ogg page because every Skeleton packet is emitted on its own page.
+const AUTO_INDEX_MAX_KEYPOINTS_LIMIT: usize = (255 * 255 - 42) / 20;
+
+/// Open an Ogg muxer that emits a Skeleton metadata bitstream AND
+/// builds a Skeleton 4.0 keyframe `index\0` packet per content stream
+/// while muxing.
+///
+/// The 4.0 spec places every index packet in the segment's header
+/// pages ("all the Skeleton track's index packets appear in the header
+/// pages of the Ogg segment", so "all the keyframe indexes are
+/// immediately available once the header packets have been read"), but
+/// a keypoint's byte offset and the segment's first/last sample times
+/// are only knowable after the content has been written. The muxer
+/// therefore reserves a fixed-size placeholder `index\0` page per
+/// auto-indexed stream in `write_header` (between the fisbones and the
+/// Skeleton EOS, per the §"Further restrictions" ordering), records a
+/// keypoint whenever a page carrying a keyframe-flagged packet
+/// ([`oxideav_core::packet::PacketFlags::keyframe`]) hits the wire, and
+/// rewrites each placeholder page in place at `write_trailer` time —
+/// same page length, CRC recomputed per RFC 3533 §6 field 7, exactly
+/// like the fishead segment-length / content-byte-offset backfill.
+///
+/// Keypoint semantics (per §"Keyframe indexes for faster seeking" /
+/// §"Keyframe index packets"):
+/// * a keypoint's offset is the first byte of a page of the indexed
+///   stream — here, the page on which the keyframe packet *starts*,
+///   which is "the last page which lies before all data required to
+///   decode the keyframe" for a packet-aligned muxer;
+/// * its timestamp numerator is the presentation time of the first
+///   keyframe starting on that page, expressed over the stream
+///   time-base denominator (`timestamp_denominator = time_base.den`,
+///   numerator = `pts × time_base.num`);
+/// * keypoints are thinned per [`AutoIndexConfig`]: a candidate is
+///   accepted only when BOTH the byte gap and the time gap since the
+///   previously accepted keypoint are met ("whichever is least
+///   frequent"), and never beyond `max_keypoints`;
+/// * the index's first/last-sample-time numerators are taken from the
+///   first and last content-packet pts observed on the stream (Ogg
+///   granule semantics make the final granule the segment's end
+///   position for the audio mappings this muxer writes).
+///
+/// For streams without the concept of a keyframe (Vorbis &c.), set
+/// the keyframe flag on every independently decodable packet — the
+/// gap gating then produces exactly the spec's "periodic samples"
+/// indexing for keyframe-less streams.
+///
+/// Streams whose serial already has a caller-supplied [`SkelIndex`]
+/// attached to `skeleton.indexes` are passed through verbatim and not
+/// auto-indexed (a pre-measured remux knows better).
+///
+/// Because the rewritten packet must keep the placeholder's byte
+/// length (in-place page rewrites cannot move the pages that follow),
+/// the bytes after the final encoded keypoint remain zero. Those tail
+/// bytes lie outside every field the 4.0 index layout defines — a
+/// reader consumes exactly *n* keypoints starting at byte 42 — so any
+/// conforming parser ignores them.
+///
+/// Errors: the attached fishead (when present) must be version 4.0 or
+/// later (`index\0` packets are a 4.0 feature; a 3.0 fishead has no
+/// segment-length field to validate them against), `max_keypoints`
+/// must be in `1..=3249`, and every content stream's time base must
+/// be positive (the spec's "presentation time denominator … must not
+/// be 0" rule for field 4 of the index packet).
+pub fn open_with_skeleton_indexed(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    skeleton: Skeleton,
+    config: AutoIndexConfig,
+) -> Result<Box<dyn Muxer>> {
+    if config.max_keypoints == 0 || config.max_keypoints > AUTO_INDEX_MAX_KEYPOINTS_LIMIT {
+        return Err(Error::invalid(format!(
+            "Ogg muxer: AutoIndexConfig::max_keypoints must be in 1..={AUTO_INDEX_MAX_KEYPOINTS_LIMIT} (got {})",
+            config.max_keypoints
+        )));
+    }
+    if let Some(head) = skeleton.head.as_ref() {
+        if !head.version.at_least(crate::skeleton::Version::V4_0) {
+            return Err(Error::invalid(
+                "Ogg muxer: Skeleton keyframe index packets require a 4.0 fishead",
+            ));
+        }
+    }
+    for s in streams {
+        if s.time_base.0.num <= 0 || s.time_base.0.den <= 0 {
+            return Err(Error::invalid(format!(
+                "Ogg muxer: stream {} has a non-positive time base; the Skeleton index timestamp denominator must not be 0",
+                s.index
+            )));
+        }
+    }
+    open_inner(output, streams, Some(skeleton), Some(config))
+}
+
+fn open_inner(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    skeleton: Option<Skeleton>,
+    auto_index: Option<AutoIndexConfig>,
+) -> Result<Box<dyn Muxer>> {
     let mut per_stream = HashMap::with_capacity(streams.len());
     let mut max_serial: u32 = 0;
     for s in streams {
@@ -83,6 +231,31 @@ pub fn open_with_skeleton(
             content_byte_offset_measured: None,
         }
     });
+    // Build one auto-index collector per content stream that does not
+    // already carry a caller-supplied index for its serial. Only
+    // meaningful when a Skeleton is attached (the index packets ride
+    // the Skeleton logical bitstream).
+    let mut auto_states: Vec<AutoIndexState> = Vec::new();
+    if let (Some(cfg), Some(sw)) = (auto_index, skeleton_writer.as_ref()) {
+        for s in streams {
+            let serial = derive_serial(s);
+            if sw.skel.indexes.iter().any(|idx| idx.serial == serial) {
+                continue;
+            }
+            auto_states.push(AutoIndexState {
+                stream_index: s.index,
+                serial,
+                timestamp_denominator: s.time_base.0.den,
+                tb_num: s.time_base.0.num,
+                reserved_packet_len: 42 + 20 * cfg.max_keypoints,
+                config: cfg,
+                placeholder: None,
+                keypoints: Vec::new(),
+                first_ts: None,
+                last_ts: None,
+            });
+        }
+    }
     Ok(Box::new(OggMuxer {
         output,
         streams: streams.to_vec(),
@@ -91,6 +264,7 @@ pub fn open_with_skeleton(
         header_written: false,
         trailer_written: false,
         skeleton: skeleton_writer,
+        auto_index: auto_states,
     }))
 }
 
@@ -116,6 +290,103 @@ struct OggMuxer {
     /// content data page is written — per the encapsulation order in
     /// `docs/container/ogg/ogg-skeleton-{3,4}.0.md`.
     skeleton: Option<SkeletonWriter>,
+    /// Per-stream Skeleton 4.0 keyframe-index collectors (one per
+    /// content stream when [`open_with_skeleton_indexed`] was used;
+    /// empty otherwise). Each reserves a placeholder `index\0` page in
+    /// the header section and is backfilled in place at trailer time.
+    auto_index: Vec<AutoIndexState>,
+}
+
+/// Keyframe-index collector for one content stream — the WRITE-side
+/// counterpart of the demuxer's Skeleton 4.0 `index\0` fast-path seek.
+struct AutoIndexState {
+    stream_index: u32,
+    /// On-wire `bitstream_serial_number` of the indexed content stream
+    /// (Skeleton index packets are keyed by serial, field 2 of the
+    /// `index\0` layout).
+    serial: u32,
+    /// Field 4 of the index packet: "The presentation time denominator
+    /// for this stream … All timestamps, including keypoint timestamps,
+    /// first and last sample timestamps are fractions of seconds over
+    /// this denominator. This must not be 0." Taken from the stream
+    /// time base denominator so that `pts × tb.num` is directly the
+    /// numerator.
+    timestamp_denominator: i64,
+    tb_num: i64,
+    /// Byte length of the placeholder packet reserved in the header
+    /// section: 42-byte fixed prefix + 20 bytes per `max_keypoints`
+    /// (two worst-case 10-byte variable-byte integers per keypoint).
+    reserved_packet_len: usize,
+    config: AutoIndexConfig,
+    /// `(wire offset, page sequence number)` of the placeholder page,
+    /// recorded when `write_header` emits it.
+    placeholder: Option<(u64, u32)>,
+    /// Accepted keypoints in increasing-offset order (the spec's
+    /// "stored in increasing order by offset" invariant holds by
+    /// construction — pages of one stream hit the wire in order).
+    keypoints: Vec<KeyPoint>,
+    /// First/last content-packet pts observed, in numerator units
+    /// (`pts × tb_num`); fills the index packet's first-sample-time /
+    /// last-sample-time fields at trailer time.
+    first_ts: Option<i64>,
+    last_ts: Option<i64>,
+}
+
+impl AutoIndexState {
+    /// Record a content-packet pts (numerator units) for the
+    /// first/last-sample-time fields.
+    fn note_pts(&mut self, ts: i64) {
+        if self.first_ts.is_none() {
+            self.first_ts = Some(ts);
+        }
+        self.last_ts = Some(ts);
+    }
+
+    /// Offer a keypoint candidate: a page of this stream just hit the
+    /// wire at `offset` and the first keyframe-flagged packet starting
+    /// on it has presentation-time numerator `ts`. Accepts the first
+    /// candidate unconditionally; subsequent candidates must satisfy
+    /// BOTH the byte gap and the time gap relative to the previously
+    /// accepted keypoint (the spec's "at most one key point per every
+    /// 64KB of data, or every 1000ms, whichever is least frequent"
+    /// recommendation), and the `max_keypoints` reservation cap.
+    fn offer_keypoint(&mut self, offset: u64, ts: i64) {
+        if self.keypoints.len() >= self.config.max_keypoints {
+            return;
+        }
+        if let Some(last) = self.keypoints.last() {
+            // Defensive monotonicity: never record a keypoint that
+            // would violate the increasing-offset (and thus
+            // increasing-time) ordering invariant.
+            if offset <= last.offset || ts < last.timestamp {
+                return;
+            }
+            if offset - last.offset < self.config.min_keypoint_byte_gap {
+                return;
+            }
+            // (ts - last.ts) / den seconds >= gap_ms / 1000
+            // ⇔ (ts - last.ts) × 1000 >= gap_ms × den   (den > 0)
+            let dt = (ts - last.timestamp) as i128;
+            if dt * 1000
+                < self.config.min_keypoint_time_gap_ms as i128 * self.timestamp_denominator as i128
+            {
+                return;
+            }
+        }
+        self.keypoints.push(KeyPoint {
+            offset,
+            timestamp: ts,
+        });
+    }
+}
+
+/// A finalized page held back by the EOS-deferral mechanism, plus the
+/// metadata the auto-indexer needs once the page's wire offset is known.
+struct PendingPage {
+    bytes: Vec<u8>,
+    /// pts of the first keyframe-flagged packet that *starts* on this
+    /// page, if any — the keypoint timestamp source.
+    first_keyframe_pts: Option<i64>,
 }
 
 struct SkeletonWriter {
@@ -143,11 +414,11 @@ struct StreamWriter {
     buffered: PageBuilder,
     headers_remaining: usize,
     bos_emitted: bool,
-    /// Bytes of the most recently finalized page, held back until either
+    /// The most recently finalized page, held back until either
     /// another page is flushed (in which case it's written) or the trailer
     /// runs (in which case it gets EOS set and its CRC patched). This makes
     /// the EOS marker sit on a real data page instead of an empty trailing one.
-    pending_bytes: Option<Vec<u8>>,
+    pending_bytes: Option<PendingPage>,
 }
 
 #[derive(Default)]
@@ -162,6 +433,12 @@ struct PageBuilder {
     /// Granule position to record on this page — set to the most recent
     /// completed packet's pts. -1 means "no packet ends here".
     granule_position: i64,
+    /// pts of the first keyframe-flagged content packet appended to this
+    /// page. Feeds the Skeleton 4.0 auto-index keypoint candidate once
+    /// the page's wire offset is known (a keypoint's timestamp is "the
+    /// presentation time … of the first key frame which starts on the
+    /// page at the keypoint's offset").
+    first_keyframe_pts: Option<i64>,
 }
 
 impl PageBuilder {
@@ -249,11 +526,93 @@ impl OggMuxer {
         for payload in &payloads {
             self.write_skeleton_page(payload, 0)?;
         }
+        // Auto-index placeholders: one fixed-size `index\0` page per
+        // auto-indexed content stream, emitted in the secondary-header
+        // section per the 4.0 spec ("Before the Skeleton EOS page in
+        // the segment header pages come the Skeleton 4.0 keyframe index
+        // packets"). The placeholder declares zero keypoints over the
+        // stream's timestamp denominator and pads the body to the full
+        // reservation; `backfill_auto_indexes` rewrites it in place at
+        // trailer time once the keypoints are known. Wire offset and
+        // page sequence number are recorded so the rewrite reproduces
+        // an identical-length page.
+        for i in 0..self.auto_index.len() {
+            let placeholder = {
+                let state = &self.auto_index[i];
+                let mut data = SkelIndex::new(state.serial, state.timestamp_denominator).to_bytes();
+                data.resize(state.reserved_packet_len, 0);
+                data
+            };
+            let offset = self.output.stream_position()?;
+            let seq_no = self
+                .skeleton
+                .as_ref()
+                .expect("skeleton writer present")
+                .seq_no;
+            self.write_skeleton_page(&placeholder, 0)?;
+            self.auto_index[i].placeholder = Some((offset, seq_no));
+        }
         // Empty packet on its own EOS page closes the Skeleton control
         // section (per spec). A zero-byte packet lacing-encodes as a
         // single `0` lacing value (lace(0) → [0]); the on-wire page
         // therefore carries one segment whose body length is zero.
         self.write_skeleton_page(&[], flags::LAST_PAGE)
+    }
+
+    /// Rewrite every auto-index placeholder page in place with the
+    /// keypoints collected while muxing.
+    ///
+    /// Mirrors [`Self::backfill_skeleton_fishead`]: the page is
+    /// reconstructed exactly as the placeholder was emitted (same
+    /// flags / granule 0 / serial / recorded sequence number) with the
+    /// finished packet body, so the page byte length is unchanged and
+    /// `Page::to_bytes` recomputes the CRC over the new bytes
+    /// (RFC 3533 §6 field 7). The finished packet keeps the
+    /// reservation length — bytes past the final encoded keypoint stay
+    /// zero; they sit beyond the *n* keypoints the 4.0 layout defines
+    /// (field 7: "*n* key points, starting with the first keypoint at
+    /// byte 42"), so readers never consume them.
+    fn backfill_auto_indexes(&mut self) -> Result<()> {
+        if self.auto_index.is_empty() {
+            return Ok(());
+        }
+        let skel_serial = match self.skeleton.as_ref() {
+            Some(sk) => sk.serial,
+            None => return Ok(()),
+        };
+        let end_pos = self.output.stream_position()?;
+        for i in 0..self.auto_index.len() {
+            let (page_off, seq_no, data) = {
+                let state = &self.auto_index[i];
+                let Some((page_off, seq_no)) = state.placeholder else {
+                    continue;
+                };
+                let mut idx = SkelIndex::new(state.serial, state.timestamp_denominator);
+                idx.first_sample_time = state.first_ts.unwrap_or(0);
+                idx.last_sample_time = state.last_ts.unwrap_or(0);
+                idx.keypoints = state.keypoints.clone();
+                let mut data = idx.to_bytes();
+                debug_assert!(
+                    data.len() <= state.reserved_packet_len,
+                    "auto-index reservation must hold max_keypoints worst-case encodings"
+                );
+                data.resize(state.reserved_packet_len, 0);
+                (page_off, seq_no, data)
+            };
+            let page = Page {
+                flags: 0,
+                granule_position: 0,
+                serial: skel_serial,
+                seq_no,
+                lacing: lace(data.len()),
+                data,
+            };
+            let bytes = page.to_bytes();
+            self.output.seek(SeekFrom::Start(page_off))?;
+            self.output.write_all(&bytes)?;
+        }
+        self.output.seek(SeekFrom::Start(end_pos))?;
+        Ok(())
     }
 
     /// Finalize the buffered page for `stream_index`. The newly built page
@@ -286,14 +645,43 @@ impl OggMuxer {
         writer.seq_no = writer.seq_no.wrapping_add(1);
         writer.buffered.starts_continued = page.lacing.last().copied() == Some(255);
         writer.buffered.granule_position = -1;
+        let first_keyframe_pts = writer.buffered.first_keyframe_pts.take();
         let new_bytes = page.to_bytes();
 
         // Write whatever was pending before, then queue the new bytes.
-        if let Some(prev) = writer.pending_bytes.take() {
-            self.output.write_all(&prev)?;
+        let prev = writer.pending_bytes.take();
+        if let Some(prev) = prev {
+            self.write_pending_page(stream_index, prev)?;
         }
         let writer = self.writer_for(stream_index)?;
-        writer.pending_bytes = Some(new_bytes);
+        writer.pending_bytes = Some(PendingPage {
+            bytes: new_bytes,
+            first_keyframe_pts,
+        });
+        Ok(())
+    }
+
+    /// Write a previously held-back page to the sink, recording its wire
+    /// offset as a Skeleton 4.0 keypoint candidate when the page starts
+    /// a keyframe-flagged packet and the stream is being auto-indexed.
+    fn write_pending_page(&mut self, stream_index: u32, pending: PendingPage) -> Result<()> {
+        let offset = self.output.stream_position()?;
+        self.output.write_all(&pending.bytes)?;
+        if let Some(pts) = pending.first_keyframe_pts {
+            if let Some(state) = self
+                .auto_index
+                .iter_mut()
+                .find(|s| s.stream_index == stream_index)
+            {
+                // Presentation-time numerator over the stream's
+                // time-base denominator: pts × tb.num (saturating —
+                // tb.num is 1 for every sample-rate-style base, so
+                // the multiply is exact in practice).
+                let ts = (pts as i128 * state.tb_num as i128)
+                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+                state.offer_keypoint(offset, ts);
+            }
+        }
         Ok(())
     }
 
@@ -462,9 +850,9 @@ impl Muxer for OggMuxer {
             // section.
             let order = self.stream_order.clone();
             for idx in order {
-                let writer = self.writer_for(idx)?;
-                if let Some(bytes) = writer.pending_bytes.take() {
-                    self.output.write_all(&bytes)?;
+                let pending = self.writer_for(idx)?.pending_bytes.take();
+                if let Some(pending) = pending {
+                    self.write_pending_page(idx, pending)?;
                 }
             }
             self.write_skeleton_fisbones_and_eos()?;
@@ -516,6 +904,27 @@ impl Muxer for OggMuxer {
         // from *page boundaries* (Ogg cares).
         if let Some(pts) = packet.pts {
             writer.buffered.granule_position = pts;
+            // Auto-index bookkeeping: the packet starts on the page the
+            // builder is currently filling, so a keyframe-flagged packet
+            // makes this page a keypoint candidate once it reaches the
+            // wire.
+            if packet.flags.keyframe && writer.buffered.first_keyframe_pts.is_none() {
+                writer.buffered.first_keyframe_pts = Some(pts);
+            }
+        }
+        // Every content pts feeds the index packet's first/last-sample-
+        // time fields (separate lookup — the per-stream writer borrow
+        // must end before `auto_index` is touched).
+        if let Some(pts) = packet.pts {
+            if let Some(state) = self
+                .auto_index
+                .iter_mut()
+                .find(|s| s.stream_index == stream_index)
+            {
+                let ts = (pts as i128 * state.tb_num as i128)
+                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+                state.note_pts(ts);
+            }
         }
         if packet.flags.unit_boundary {
             self.flush_page(stream_index, true)?;
@@ -540,18 +949,20 @@ impl Muxer for OggMuxer {
             }
             // Whatever's in pending_bytes is the truly last page — set EOS,
             // recompute its CRC, write it.
-            let writer = self.writer_for(idx)?;
-            if let Some(mut bytes) = writer.pending_bytes.take() {
+            let pending = self.writer_for(idx)?.pending_bytes.take();
+            if let Some(mut pending) = pending {
+                let bytes = &mut pending.bytes;
                 if bytes.len() >= 27 {
                     bytes[5] |= flags::LAST_PAGE;
                     // Zero out checksum field, recompute, patch back.
                     bytes[22..26].fill(0);
-                    let crc = crate::crc::checksum(&bytes);
+                    let crc = crate::crc::checksum(bytes);
                     bytes[22..26].copy_from_slice(&crc.to_le_bytes());
                 }
-                self.output.write_all(&bytes)?;
+                self.write_pending_page(idx, pending)?;
             }
         }
+        self.backfill_auto_indexes()?;
         self.backfill_skeleton_fishead()?;
         self.output.flush()?;
         self.trailer_written = true;

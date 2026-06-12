@@ -9,6 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Muxer-built Skeleton 4.0 keyframe indexes:
+  `mux::open_with_skeleton_indexed`.** The muxer can now construct the
+  `index\0` packet for each content stream itself — the WRITE-side
+  counterpart of the demuxer's index-accelerated `seek_to` — instead
+  of only passing through caller-prebuilt indexes. Grounded in
+  `docs/container/ogg/ogg-skeleton-4.0.md`: index packets must live in
+  the segment's header pages ("all the Skeleton track's index packets
+  appear in the header pages of the Ogg segment", so "all the keyframe
+  indexes are immediately available once the header packets have been
+  read"), but a keypoint's byte offset and the segment's first/last
+  sample times are only knowable after the content is written. The
+  muxer therefore (1) reserves a fixed-size placeholder `index\0` page
+  per auto-indexed stream in `write_header`, emitted between the
+  fisbones and the Skeleton EOS per the §"Further restrictions"
+  ordering ("Before the Skeleton EOS page in the segment header pages
+  come the Skeleton 4.0 keyframe index packets"); (2) records a
+  keypoint whenever a page carrying a keyframe-flagged packet
+  (`PacketFlags::keyframe`) hits the wire — offset = first byte of the
+  page the keyframe packet starts on, timestamp numerator = the
+  packet's pts over the stream time-base denominator (spec field 4's
+  "must not be 0" denominator is validated at open); and (3) rewrites
+  each placeholder page in place at `write_trailer` — same page byte
+  length, CRC recomputed per RFC 3533 §6 field 7 — exactly the
+  mechanism the r279 fishead segment-length / content-byte-offset
+  backfill introduced. The new `AutoIndexConfig` carries the spec's
+  thinning recommendation ("we recommend including at most one key
+  point per every 64KB of data, or every 1000ms, whichever is least
+  frequent") as `min_keypoint_byte_gap` / `min_keypoint_time_gap_ms`
+  defaults (64 KiB / 1000 ms; a candidate must clear BOTH gaps) plus a
+  `max_keypoints` cap sizing the reservation at `42 + 20·n` bytes
+  (worst-case two 10-byte variable-byte integers per keypoint;
+  bounded above at 3249 so the packet fits a single 255×255-byte
+  page). A partial index is explicitly spec-legal ("a keyframe index
+  may not index all keyframes in the Ogg segment"). Bytes past the
+  final encoded keypoint remain zero — they lie beyond the *n*
+  keypoints field 7 defines ("*n* key points, starting with the first
+  keypoint at byte 42"), so conforming readers never consume them.
+  The index's first/last-sample-time numerators are filled from the
+  first/last observed content-packet pts; streams whose serial already
+  carries a caller-supplied `SkelIndex` pass through verbatim and are
+  not auto-indexed; a 3.0 fishead or an out-of-range `max_keypoints`
+  is rejected at open. 7 new integration tests in
+  `tests/skeleton_mux.rs` cover the full producer→consumer loop (mux
+  with auto-index → demux → `seek_to` resolves via the Skeleton
+  fast path with `skeleton_index_seek_count() == 1`, zero rejects,
+  and validity check #1 running in enforcing mode thanks to the r279
+  segment-length backfill — then `next_packet` resumes at the
+  keypoint's packet), keypoint offsets landing byte-exactly on the
+  content stream's data pages, byte-gap and time-gap thinning (only
+  the first keypoint survives 20 ms-apart packets under the 1000 ms
+  gate; 1 s-apart packets all pass), the `max_keypoints` reservation
+  cap with the backfilled page keeping the placeholder's exact byte
+  length and every page CRC validating after the rewrite,
+  caller-supplied indexes passing through with no auto duplicate, a
+  keyframe-less stream backfilling an empty (n = 0) index whose
+  first/last-sample-time fields are still measured (seek then falls
+  back to bisection per the spec's graceful-fallback rule), the
+  multi-stream case emitting one index per content stream with every
+  keypoint starting a page of its own stream, and rejection of the
+  three invalid configurations (3.0 fishead, zero cap, cap past the
+  single-page limit).
+
 - **Mux-side Skeleton 4.0 fishead backfill (segment length + content
   byte offset) and control-section ordering fix.** Two changes to
   `mux::open_with_skeleton`, both grounded in
