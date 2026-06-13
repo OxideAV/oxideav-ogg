@@ -458,6 +458,45 @@ For encode-side use, every type round-trips through `to_bytes` /
   publicly so callers writing seek-tooling against raw `index\0`
   packets don't have to re-implement the encoding.
 
+#### Granulepos → playback time
+
+`docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+information is needed?" defines a two-step mapping from a content page's
+raw on-wire `granulepos` to a playback time: "the granulepos of a data
+page must first be parsed to extract a granule value … This value can
+then be mapped to time by calculating `granules / granulerate`." Three
+accessors implement it:
+
+- `FisBone::extract_granules(granulepos) -> i64` undoes this track's
+  granuleshift packing — "the number of lower bits from the granulepos
+  field that are used to provide position information for sub-seekable
+  units (like the keyframe shift in theora)". For a `granuleshift == 0`
+  track (Vorbis / Opus / FLAC / Speex — every audio mapping) the
+  granulepos *is* the granule value and passes through unchanged; for a
+  Theora-style packed granulepos the high bits hold the last keyframe
+  index and the low `granuleshift` bits the offset since it, so the
+  absolute granule value is `(g >> shift) + (g & ((1 << shift) - 1))`.
+  The RFC 3533 §6 `-1` "no packets finish on this page" sentinel passes
+  through verbatim and a degenerate `granuleshift >= 63` yields `0`
+  rather than overflowing the mask.
+- `FisBone::granule_to_seconds(granulepos) -> Option<f64>` is the
+  per-track value: `extract_granules` then a divide by the fisbone's
+  `granule_rate` rational (Hz for audio, fps for video). Returns `None`
+  for the `-1` sentinel or an unusable (non-positive numerator /
+  denominator) rate so the spec's zero-denominator "unknown" convention
+  surfaces as `None` rather than a NaN or a negative time. The value is
+  relative to granule 0 and excludes the fishead basetime.
+- `Skeleton::granule_to_seconds(serial, granulepos) -> Option<f64>` is
+  the **absolute** mapping: it looks up the fisbone for `serial`, takes
+  its per-track seconds, and adds the fishead's **basetime** — which
+  "provides a mapping for granule position 0 (for all logical
+  bitstreams) to a playback time" (the spec's pro-video "starts at
+  01:00:00" case). Basetime is a per-file rational shared by every
+  logical bitstream, so it is added once on top; an unknown
+  (denominator-0) or absent basetime contributes a `0.0` offset rather
+  than blocking the mapping. Returns `None` when no fisbone describes
+  `serial` or the per-track mapping is `None`.
+
 When a Skeleton 4.0 `index\0` packet is present for the requested
 stream, [`Demuxer::seek_to`] skips both the page-level bisection scan
 and even the [`OggDemuxer::build_seek_index`] full-file scan: the

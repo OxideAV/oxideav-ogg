@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton granulepos→playback-time mapping:
+  `FisBone::extract_granules` / `FisBone::granule_to_seconds` /
+  `Skeleton::granule_to_seconds`.** Implements the two-step granule-to-time
+  mapping `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+  information is needed?" spells out: a content page's raw `granulepos` is
+  first parsed to extract a granule value by undoing the per-track
+  granuleshift packing ("the number of lower bits from the granulepos
+  field that are used to provide position information for sub-seekable
+  units (like the keyframe shift in theora)"), then mapped to time as
+  `granules / granulerate`. `FisBone::extract_granules` returns the
+  granule value (`granulepos` unchanged when `granuleshift == 0`, the
+  audio case; `(g >> shift) + (g & ((1 << shift) - 1))` for Theora-style
+  packed granulepos; the RFC 3533 §6 `-1` "no packets finish on this
+  page" sentinel and a degenerate `shift >= 63` are handled without
+  overflow). `FisBone::granule_to_seconds` divides the granule value by
+  the fisbone's `granule_rate` rational, returning `None` for the `-1`
+  sentinel or an unusable (non-positive numerator/denominator) rate so
+  the spec's zero-denominator "unknown" convention surfaces as `None`
+  rather than a NaN. `Skeleton::granule_to_seconds(serial, granulepos)`
+  is the full absolute mapping: the per-track value plus the fishead
+  **basetime** ("provides a mapping for granule position 0 (for all
+  logical bitstreams) to a playback time" — the pro-video "starts at
+  01:00:00" case), added once on top because basetime is a per-file
+  rational shared by every logical bitstream; an unknown
+  (denominator-0) or absent basetime contributes a `0.0` offset rather
+  than blocking the mapping. 13 new tests (12 lib unit + 1 end-to-end
+  integration mapping a demuxed content page's on-wire granulepos
+  through the parsed-from-bytes `Skeleton`) cover the unshifted audio
+  passthrough, Theora shift-sum extraction, integer and non-integer
+  (`30000/1001` NTSC) granule rates, the `-1` sentinel, the
+  unusable-rate cases, the basetime offset (including unknown/absent
+  basetime), and the unknown-serial path.
+
 - **Muxer-built Skeleton 4.0 keyframe indexes:
   `mux::open_with_skeleton_indexed`.** The muxer can now construct the
   `index\0` packet for each content stream itself — the WRITE-side

@@ -1396,6 +1396,89 @@ impl FisBone {
         self.header("Name").map(Name::parse)
     }
 
+    /// Extract the *granule value* from a content page's raw `granulepos`
+    /// field by undoing this track's granuleshift packing.
+    ///
+    /// Per `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+    /// information is needed?", the granuleshift is "the number of lower
+    /// bits from the granulepos field that are used to provide position
+    /// information for sub-seekable units (like the keyframe shift in
+    /// theora)", and the spec notes that "the granulepos of a data page
+    /// must first be parsed to extract a granule value using the method
+    /// described in *GranulePosAndSeeking*. This value can then be mapped
+    /// to time by calculating `granules / granulerate`."
+    ///
+    /// For a track whose `granuleshift` is `0` (Vorbis, Opus, FLAC, Speex
+    /// — every audio mapping), the granulepos *is* the granule value and
+    /// this returns it unchanged. For Theora-style packed granulepos the
+    /// high bits hold the index of the last keyframe and the low
+    /// `granuleshift` bits hold the offset since that keyframe; the
+    /// absolute granule value is the sum of the two halves
+    /// (`(g >> shift) + (g & ((1 << shift) - 1))`), exactly the formula the
+    /// demuxer's Theora seek path uses to map a packed granulepos to an
+    /// absolute frame number.
+    ///
+    /// A negative `granulepos` (`-1` means "no packet finishes on this
+    /// page" per RFC 3533 §6) is returned verbatim so callers can treat it
+    /// as "no timing information on this page" rather than mis-splitting a
+    /// sentinel. A `granuleshift >= 63` (degenerate / attacker-edited:
+    /// every bit would be "offset" with no room for a keyframe index)
+    /// yields `0` rather than overflowing the `1 << shift` mask.
+    pub fn extract_granules(&self, granulepos: i64) -> i64 {
+        let shift = self.granuleshift as u32;
+        if granulepos < 0 {
+            return granulepos;
+        }
+        if shift == 0 {
+            return granulepos;
+        }
+        if shift >= 63 {
+            return 0;
+        }
+        let g = granulepos as u64;
+        let kf = (g >> shift) as i64;
+        let off = (g & ((1u64 << shift) - 1)) as i64;
+        kf.saturating_add(off)
+    }
+
+    /// Map a content page's raw `granulepos` to a playback time in
+    /// seconds, relative to this track's granule position 0.
+    ///
+    /// This is the two-step mapping `docs/container/ogg/ogg-skeleton-4.0.md`
+    /// §"What decoding-related information is needed?" spells out: first
+    /// [`Self::extract_granules`] undoes any granuleshift packing, then the
+    /// granule value is divided by the granule rate ("This value can then
+    /// be mapped to time by calculating `granules / granulerate`"). The
+    /// granule rate is the per-track rational the fisbone carries
+    /// (`granule_rate`, in Hz for audio / fps for video).
+    ///
+    /// Returns `None` when timing cannot be determined:
+    /// - the `granulepos` is negative (the RFC 3533 §6 `-1` "no packets
+    ///   finish on this page" sentinel carries no position), or
+    /// - the granule rate is unusable — a non-positive numerator or
+    ///   denominator. The Skeleton rationals are signed 64-bit pairs and a
+    ///   zero denominator is the spec's "unknown" marker; a real granule
+    ///   rate is a strictly positive samples-per-second / frames-per-second
+    ///   value, so anything else is reported as "unknown" rather than
+    ///   producing a NaN or a negative time.
+    ///
+    /// The returned value is **relative to granule 0** and does *not*
+    /// include the fishead's basetime offset; for the absolute playback
+    /// time (granule-0 mapped to the basetime) use
+    /// [`Skeleton::granule_to_seconds`], which adds the fishead basetime on
+    /// top of this per-track value.
+    pub fn granule_to_seconds(&self, granulepos: i64) -> Option<f64> {
+        if granulepos < 0 {
+            return None;
+        }
+        let rate = self.granule_rate;
+        if rate.numerator <= 0 || rate.denominator <= 0 {
+            return None;
+        }
+        let granules = self.extract_granules(granulepos);
+        Some(granules as f64 * rate.denominator as f64 / rate.numerator as f64)
+    }
+
     /// Parse a `fisbone` packet (the full Skeleton secondary header
     /// payload, starting with `fisbone\0`).
     pub fn parse(packet: &[u8]) -> Result<Self> {
@@ -1948,6 +2031,45 @@ impl Skeleton {
     /// given serial.
     pub fn index_for_serial(&self, serial: u32) -> Option<&SkelIndex> {
         self.indexes.iter().find(|i| i.serial == serial)
+    }
+
+    /// Map a content page's raw `granulepos` for the track identified by
+    /// `serial` to an **absolute** playback time in seconds.
+    ///
+    /// This is the full Skeleton time mapping per
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+    /// information is needed?": the per-track value
+    /// ([`FisBone::granule_to_seconds`], i.e. granuleshift extraction then
+    /// `granules / granulerate`) plus the fishead's **basetime**, which
+    /// "provides a mapping for granule position 0 (for all logical
+    /// bitstreams) to a playback time; an example use: most content in
+    /// professional analog video creation actually starts at a time of
+    /// 1 hour and thus adding this additional field allows them to retain
+    /// this mapping on digitizing their content". The basetime is a
+    /// per-file rational shared by all logical bitstreams (carried on the
+    /// fishead, not the fisbone), so it is added once on top of the
+    /// per-track granule-to-time result.
+    ///
+    /// Returns `None` when the absolute time cannot be determined:
+    /// - no fisbone describes `serial` (the track is not in this
+    ///   Skeleton), or
+    /// - the per-track mapping is `None` (negative `granulepos` sentinel,
+    ///   or an unusable granule rate — see [`FisBone::granule_to_seconds`]).
+    ///
+    /// When no fishead has been recorded, or the fishead basetime
+    /// denominator is `0` (the spec's "unknown" marker), the basetime
+    /// offset is treated as `0.0` and the result is the per-track value
+    /// alone — basetime is an optional offset, not a precondition for a
+    /// valid granule-to-time mapping.
+    pub fn granule_to_seconds(&self, serial: u32, granulepos: i64) -> Option<f64> {
+        let bone = self.bone_for_serial(serial)?;
+        let track_seconds = bone.granule_to_seconds(granulepos)?;
+        let basetime = self
+            .head
+            .as_ref()
+            .map(|h| h.basetime.to_seconds())
+            .unwrap_or(0.0);
+        Some(track_seconds + basetime)
     }
 }
 
@@ -3632,5 +3754,135 @@ mod tests {
             1,
             "case-insensitive replace must keep the header count at 1"
         );
+    }
+
+    // ---- granulepos -> time mapping (Skeleton 4.0 §"What decoding-
+    //      related information is needed?") ----
+
+    #[test]
+    fn extract_granules_unshifted_passthrough() {
+        // granuleshift 0 (every audio mapping): granulepos IS the granule.
+        let bone = FisBone::new(1, Rational::new(48_000, 1));
+        assert_eq!(bone.granuleshift, 0);
+        assert_eq!(bone.extract_granules(0), 0);
+        assert_eq!(bone.extract_granules(48_000), 48_000);
+        assert_eq!(bone.extract_granules(123_456_789), 123_456_789);
+    }
+
+    #[test]
+    fn extract_granules_theora_shift_sums_halves() {
+        // Theora-style packing: high bits = keyframe index, low `shift`
+        // bits = offset since the keyframe; the absolute granule is the
+        // sum of the two halves (spec GranulePosAndSeeking method).
+        let mut bone = FisBone::new(1, Rational::new(30, 1));
+        bone.granuleshift = 6;
+        // keyframe index 10, offset 5 -> granulepos (10 << 6) | 5 = 645.
+        let granulepos = (10i64 << 6) | 5;
+        assert_eq!(bone.extract_granules(granulepos), 15);
+        // exactly on a keyframe (offset 0).
+        let on_key = 7i64 << 6;
+        assert_eq!(bone.extract_granules(on_key), 7);
+    }
+
+    #[test]
+    fn extract_granules_negative_sentinel_passthrough() {
+        // RFC 3533 §6 -1 "no packets finish on this page" is returned
+        // verbatim, never split.
+        let mut bone = FisBone::new(1, Rational::new(48_000, 1));
+        bone.granuleshift = 6;
+        assert_eq!(bone.extract_granules(-1), -1);
+    }
+
+    #[test]
+    fn extract_granules_degenerate_shift_clamps_to_zero() {
+        let mut bone = FisBone::new(1, Rational::new(48_000, 1));
+        bone.granuleshift = 63;
+        // shift >= 63 is degenerate; yields 0 rather than overflowing.
+        assert_eq!(bone.extract_granules(i64::MAX), 0);
+    }
+
+    #[test]
+    fn granule_to_seconds_audio_rate() {
+        // 48 kHz audio: granulepos 48_000 -> exactly 1.0 s.
+        let bone = FisBone::new(1, Rational::new(48_000, 1));
+        let s = bone.granule_to_seconds(48_000).expect("rate is usable");
+        assert!((s - 1.0).abs() < 1e-9, "got {s}");
+        let half = bone.granule_to_seconds(24_000).expect("usable");
+        assert!((half - 0.5).abs() < 1e-9, "got {half}");
+        assert_eq!(bone.granule_to_seconds(0), Some(0.0));
+    }
+
+    #[test]
+    fn granule_to_seconds_video_fps_with_shift() {
+        // 30 fps Theora: packed granulepos at frame 15 -> 0.5 s.
+        let mut bone = FisBone::new(1, Rational::new(30, 1));
+        bone.granuleshift = 6;
+        let granulepos = (10i64 << 6) | 5; // frame 15
+        let s = bone.granule_to_seconds(granulepos).expect("usable");
+        assert!((s - 0.5).abs() < 1e-9, "got {s}");
+    }
+
+    #[test]
+    fn granule_to_seconds_rational_rate_non_integer_fps() {
+        // 30000/1001 fps (NTSC): frame 30000 -> 1001 s exactly.
+        let bone = FisBone::new(1, Rational::new(30_000, 1001));
+        let s = bone.granule_to_seconds(30_000).expect("usable");
+        assert!((s - 1001.0).abs() < 1e-6, "got {s}");
+    }
+
+    #[test]
+    fn granule_to_seconds_none_on_negative_or_unusable_rate() {
+        let bone = FisBone::new(1, Rational::new(48_000, 1));
+        // -1 sentinel: no timing.
+        assert_eq!(bone.granule_to_seconds(-1), None);
+        // zero / negative numerator or denominator -> "unknown".
+        let zero_den = FisBone::new(1, Rational::new(48_000, 0));
+        assert_eq!(zero_den.granule_to_seconds(48_000), None);
+        let zero_num = FisBone::new(1, Rational::new(0, 1));
+        assert_eq!(zero_num.granule_to_seconds(48_000), None);
+        let neg = FisBone::new(1, Rational::new(-48_000, 1));
+        assert_eq!(neg.granule_to_seconds(48_000), None);
+    }
+
+    #[test]
+    fn skeleton_granule_to_seconds_adds_basetime() {
+        // basetime maps granule 0 to 3600 s (the pro-video "starts at
+        // 01:00:00" case the spec calls out); per-track time is added.
+        let mut head = FisHead::new(Version::V4_0);
+        head.basetime = Rational::new(3600, 1);
+        let mut sk = Skeleton::new();
+        sk.set_head(head);
+        sk.push_bone(FisBone::new(0x1234, Rational::new(48_000, 1)));
+        // granule 48_000 -> 1.0 s track time + 3600 s basetime.
+        let s = sk.granule_to_seconds(0x1234, 48_000).expect("usable");
+        assert!((s - 3601.0).abs() < 1e-6, "got {s}");
+    }
+
+    #[test]
+    fn skeleton_granule_to_seconds_unknown_basetime_is_zero_offset() {
+        // basetime denominator 0 ("unknown") contributes 0.0, not NaN.
+        let mut head = FisHead::new(Version::V4_0);
+        head.basetime = Rational::new(0, 0);
+        let mut sk = Skeleton::new();
+        sk.set_head(head);
+        sk.push_bone(FisBone::new(0x1234, Rational::new(48_000, 1)));
+        let s = sk.granule_to_seconds(0x1234, 48_000).expect("usable");
+        assert!((s - 1.0).abs() < 1e-9, "got {s}");
+    }
+
+    #[test]
+    fn skeleton_granule_to_seconds_no_fishead_is_zero_offset() {
+        // No fishead recorded: basetime offset defaults to 0.0.
+        let mut sk = Skeleton::new();
+        sk.push_bone(FisBone::new(0x1234, Rational::new(48_000, 1)));
+        let s = sk.granule_to_seconds(0x1234, 96_000).expect("usable");
+        assert!((s - 2.0).abs() < 1e-9, "got {s}");
+    }
+
+    #[test]
+    fn skeleton_granule_to_seconds_unknown_serial_is_none() {
+        let mut sk = Skeleton::new();
+        sk.push_bone(FisBone::new(0x1234, Rational::new(48_000, 1)));
+        assert_eq!(sk.granule_to_seconds(0xBEEF, 48_000), None);
     }
 }

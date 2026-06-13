@@ -215,6 +215,39 @@ fn skeleton_lookup_helpers_round_trip() {
 }
 
 #[test]
+fn skeleton_granule_to_seconds_maps_content_page_granulepos() {
+    // End-to-end: demux the synthetic 4.0 file, then map the Vorbis
+    // content page's on-wire granulepos (960 @ 48 kHz) to a playback
+    // time through the parsed-from-bytes Skeleton state. Per
+    // docs/container/ogg/ogg-skeleton-4.0.md §"What decoding-related
+    // information is needed?": granule value / granule rate, plus the
+    // fishead basetime (0 here) -> 960 / 48000 = 0.02 s.
+    let (bytes, _, _, _) = build_skeleton_4_0_ogg();
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    let sk = dmx.skeleton().expect("Skeleton present");
+
+    // Per-track mapping on the fisbone directly.
+    let bone = sk.bone_for_serial(VORBIS_SERIAL).expect("bone present");
+    let track_secs = bone.granule_to_seconds(960).expect("usable rate");
+    assert!((track_secs - 0.02).abs() < 1e-9, "got {track_secs}");
+    // granuleshift 0 here, so extract_granules is the identity.
+    assert_eq!(bone.extract_granules(960), 960);
+
+    // Full mapping via the Skeleton (adds the fishead basetime, 0 here).
+    let abs_secs = sk
+        .granule_to_seconds(VORBIS_SERIAL, 960)
+        .expect("serial + rate usable");
+    assert!((abs_secs - 0.02).abs() < 1e-9, "got {abs_secs}");
+
+    // A serial not in the Skeleton yields None.
+    assert_eq!(sk.granule_to_seconds(0xDEAD, 960), None);
+    // The RFC 3533 §6 -1 sentinel carries no timing.
+    assert_eq!(sk.granule_to_seconds(VORBIS_SERIAL, -1), None);
+}
+
+#[test]
 fn skeleton_absent_streams_still_demux() {
     // A plain Vorbis-only Ogg without Skeleton — the demuxer must still
     // open it cleanly, and `skeleton()` returns `None`.
