@@ -248,6 +248,88 @@ fn skeleton_granule_to_seconds_maps_content_page_granulepos() {
 }
 
 #[test]
+fn skeleton_substream_cut_in_mapping_end_to_end() {
+    // End-to-end exercise of the substream / cut-in mapping per
+    // docs/container/ogg/ogg-skeleton-4.0.md §"How to allow the creation
+    // of substreams from an Ogg physical bitstream?". We build a Skeleton
+    // 4.0 stream that models the spec's ?t=7-59 cut: the fishead carries a
+    // presentation time of 7 s (the cut-in), the fisbone carries a
+    // basegranule of 336_000 (= 7 s @ 48 kHz, the granule the kept data
+    // starts at), and a content page sits one second further in at granule
+    // 384_000. The whole packet set is serialized, demuxed back from bytes,
+    // and the parsed-from-wire Skeleton state is queried.
+    let mut head = FisHead::new(Version::V4_0);
+    head.presentation_time = Rational::new(7, 1);
+    // A basetime is also set to prove it does NOT leak into the substream
+    // (cut-in) timeline — only into granule_to_seconds / stream_start.
+    head.basetime = Rational::new(3600, 1);
+    let head_packet = head.to_bytes();
+
+    let v_id = vorbis_id_packet(2, 48_000);
+
+    let mut bone = FisBone::new(VORBIS_SERIAL, Rational::new(48_000, 1));
+    bone.num_headers = 3;
+    bone.basegranule = 336_000; // 7 s of data start on the original line
+    bone.set_header("Content-Type", "audio/vorbis");
+    let bone_packet = bone.to_bytes();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&single_packet_page(
+        &head_packet,
+        flags::FIRST_PAGE,
+        SKEL_SERIAL,
+        0,
+        0,
+    ));
+    out.extend_from_slice(&single_packet_page(
+        &v_id,
+        flags::FIRST_PAGE,
+        VORBIS_SERIAL,
+        0,
+        0,
+    ));
+    out.extend_from_slice(&single_packet_page(&bone_packet, 0, SKEL_SERIAL, 1, 0));
+    out.extend_from_slice(&single_packet_page(
+        &[],
+        flags::LAST_PAGE,
+        SKEL_SERIAL,
+        2,
+        0,
+    ));
+    // Content page one second into the kept segment: granule 384_000.
+    let data: Vec<u8> = (0..100u8).collect();
+    out.extend_from_slice(&single_packet_page(
+        &data,
+        flags::LAST_PAGE,
+        VORBIS_SERIAL,
+        1,
+        384_000,
+    ));
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(out));
+    let codecs = NullCodecResolver;
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    let sk = dmx.skeleton().expect("Skeleton present");
+
+    // Cut-in time of the whole segment.
+    assert!((sk.presentation_seconds().unwrap() - 7.0).abs() < 1e-9);
+
+    // The track's data starts at 7 s relative, 3607 s file-absolute.
+    let bone = sk.bone_for_serial(VORBIS_SERIAL).expect("bone present");
+    assert!((bone.start_seconds().unwrap() - 7.0).abs() < 1e-9);
+    assert!((sk.stream_start_seconds(VORBIS_SERIAL).unwrap() - 3607.0).abs() < 1e-6);
+
+    // The content page presents at 7 (cut-in) + 1 (elapsed) = 8 s on the
+    // substream timeline — basetime intentionally excluded.
+    let s = sk
+        .substream_granule_to_seconds(VORBIS_SERIAL, 384_000)
+        .expect("usable");
+    assert!((s - 8.0).abs() < 1e-6, "got {s}");
+    // The page elapsed since the stream's data start is 1 s on the bone.
+    assert!((bone.granule_to_seconds_since_start(384_000).unwrap() - 1.0).abs() < 1e-9);
+}
+
+#[test]
 fn skeleton_absent_streams_still_demux() {
     // A plain Vorbis-only Ogg without Skeleton — the demuxer must still
     // open it cleanly, and `skeleton()` returns `None`.

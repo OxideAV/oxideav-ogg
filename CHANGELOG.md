@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton substream / cut-in time mapping:
+  `FisBone::start_seconds` / `FisBone::granule_to_seconds_since_start` /
+  `Skeleton::presentation_seconds` / `Skeleton::stream_start_seconds` /
+  `Skeleton::substream_granule_to_seconds`.** Implements the substream
+  model `docs/container/ogg/ogg-skeleton-4.0.md` §"How to allow the
+  creation of substreams from an Ogg physical bitstream?" describes: when
+  a subpart is cut out of a larger Ogg file (the spec's `?t=7-59` Web cut
+  example), the kept content pages retain their original `granulepos`
+  values, the fisbone records the **basegranule** ("the granule number
+  with which this logical bitstream starts in the remuxed stream …
+  provides for each logical bitstream the accurate start time of its
+  data stream"), and the fishead records the **presentation time** ("the
+  actual cut-in time and all logical bitstreams are meant to start
+  presenting from this time onwards, not from the time their data
+  starts"). Both fields were already parsed and round-tripped but had no
+  time-mapping accessor. `FisBone::start_seconds` returns the per-track
+  data start time `basegranule / granulerate` (un-packed — the
+  basegranule names a granule number, not a granuleshift-packed
+  `granulepos`); `FisBone::granule_to_seconds_since_start` returns a
+  page's elapsed time within the kept segment
+  `(extract_granules(granulepos) - basegranule) / granulerate` (negative
+  for a surviving preroll page that precedes the cut). At the file level,
+  `Skeleton::presentation_seconds` surfaces the fishead cut-in time;
+  `Skeleton::stream_start_seconds` adds the fishead **basetime** to the
+  per-track start for the file-absolute data-start time; and
+  `Skeleton::substream_granule_to_seconds(serial, granulepos)` returns a
+  page's position on the cut segment's own playback timeline
+  `presentation_time + (extract_granules(granulepos) - basegranule) /
+  granulerate` — distinct from `Skeleton::granule_to_seconds`, which
+  answers the basetime/granule-0 mapping. Zero-denominator ("unknown")
+  rationals contribute `0.0` offsets per the spec convention; a missing
+  fishead makes `presentation_seconds` (and thus
+  `substream_granule_to_seconds`) `None` because the cut-in time is then
+  unknown; the `-1` `granulepos` sentinel and unusable granule rates
+  return `None`. 12 new tests (11 lib unit + 1 end-to-end integration that
+  models the `?t=7-59` cut, serializes the Skeleton, demuxes it back from
+  bytes, and checks every accessor against the parsed-from-wire state,
+  including that basetime does not leak into the substream timeline).
+
 - **Skeleton granulepos→playback-time mapping:
   `FisBone::extract_granules` / `FisBone::granule_to_seconds` /
   `Skeleton::granule_to_seconds`.** Implements the two-step granule-to-time

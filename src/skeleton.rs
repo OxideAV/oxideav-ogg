@@ -1479,6 +1479,77 @@ impl FisBone {
         Some(granules as f64 * rate.denominator as f64 / rate.numerator as f64)
     }
 
+    /// The playback time, in seconds, at which this logical bitstream's
+    /// own data begins in a (possibly remuxed) Ogg segment — i.e. the
+    /// time that corresponds to this track's *basegranule*.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"How to allow the
+    /// creation of substreams from an Ogg physical bitstream?" defines
+    /// the basegranule as "the granule number with which this logical
+    /// bitstream starts in the remuxed stream", and says it "provides for
+    /// each logical bitstream the accurate start time of its data stream".
+    /// For a freshly-muxed (un-cut) stream the basegranule is `0` and the
+    /// data start time is therefore `0.0`; for a substream cut out of a
+    /// larger file it carries the original-timeline granule the kept data
+    /// began at, so the start time is non-zero.
+    ///
+    /// Computed exactly as the granule-to-time mapping of §"What
+    /// decoding-related information is needed?" applied to the basegranule:
+    /// `basegranule / granulerate`. The basegranule is a plain granule
+    /// value (it is *not* granuleshift-packed — it names a granule number,
+    /// not an on-wire `granulepos`), so no [`Self::extract_granules`] step
+    /// is applied. The value is relative to granule 0 and does *not*
+    /// include the fishead basetime; for the file-absolute data-start time
+    /// (basetime added on top) use [`Skeleton::stream_start_seconds`].
+    ///
+    /// Returns `None` when the granule rate is unusable (non-positive
+    /// numerator or denominator — the spec's zero-denominator "unknown"
+    /// marker), matching [`Self::granule_to_seconds`]. A negative
+    /// basegranule is preserved with its sign so a stream whose kept data
+    /// begins before the original granule 0 maps to a negative start time
+    /// rather than being silently clamped.
+    pub fn start_seconds(&self) -> Option<f64> {
+        let rate = self.granule_rate;
+        if rate.numerator <= 0 || rate.denominator <= 0 {
+            return None;
+        }
+        Some(self.basegranule as f64 * rate.denominator as f64 / rate.numerator as f64)
+    }
+
+    /// Map a content page's raw `granulepos` to a playback time in seconds
+    /// measured *relative to where this track's data starts* in a remuxed
+    /// segment, rather than relative to the track's granule 0.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"How to allow the
+    /// creation of substreams from an Ogg physical bitstream?" keeps the
+    /// content pages — "including the framing and granule positions" —
+    /// byte-for-byte intact when cutting a subpart out of a larger file,
+    /// and records the basegranule so a decoder can recover "the accurate
+    /// start time of its data stream". The elapsed time of a page within
+    /// the kept segment is therefore the granule value minus the
+    /// basegranule, divided by the granule rate:
+    /// `(extract_granules(granulepos) - basegranule) / granulerate`. For an
+    /// un-cut stream (basegranule `0`) this equals
+    /// [`Self::granule_to_seconds`].
+    ///
+    /// Returns `None` on the same conditions as [`Self::granule_to_seconds`]
+    /// — a negative `granulepos` (the RFC 3533 §6 `-1` sentinel) or an
+    /// unusable granule rate. The result may be negative for a page whose
+    /// granule precedes the basegranule (e.g. a preroll page that survived
+    /// the cut), since that page presents before the cut-in point.
+    pub fn granule_to_seconds_since_start(&self, granulepos: i64) -> Option<f64> {
+        if granulepos < 0 {
+            return None;
+        }
+        let rate = self.granule_rate;
+        if rate.numerator <= 0 || rate.denominator <= 0 {
+            return None;
+        }
+        let granules = self.extract_granules(granulepos);
+        let elapsed = granules.saturating_sub(self.basegranule);
+        Some(elapsed as f64 * rate.denominator as f64 / rate.numerator as f64)
+    }
+
     /// Parse a `fisbone` packet (the full Skeleton secondary header
     /// payload, starting with `fisbone\0`).
     pub fn parse(packet: &[u8]) -> Result<Self> {
@@ -2070,6 +2141,98 @@ impl Skeleton {
             .map(|h| h.basetime.to_seconds())
             .unwrap_or(0.0);
         Some(track_seconds + basetime)
+    }
+
+    /// The Skeleton's **presentation time** (cut-in time) in seconds, the
+    /// time from which all logical bitstreams are meant to start presenting.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"How to allow the creation
+    /// of substreams from an Ogg physical bitstream?" defines the
+    /// presentation time as "the actual cut-in time and all logical
+    /// bitstreams are meant to start presenting from this time onwards, not
+    /// from the time their data starts, which may be some time before that
+    /// (because this time may have mapped right into the middle of a packet,
+    /// or because the logical bitstream has a preroll or a keyframe shift)".
+    /// The motivating example (§intro) is the `?t=7-59` Web cut: a segment
+    /// carved between the 7th and 59th second "would be nice to continue to
+    /// start … with a playback time of 7 seconds and not of 0".
+    ///
+    /// Carried once per file on the fishead (not per fisbone), so this is a
+    /// `Skeleton`-level accessor. Returns `None` when no fishead has been
+    /// recorded yet; a fishead whose presentation-time denominator is `0`
+    /// (the spec's "unknown" marker) yields `Some(0.0)` via
+    /// [`Rational::to_seconds`], matching the un-cut default where content
+    /// presents from time 0.
+    pub fn presentation_seconds(&self) -> Option<f64> {
+        self.head.as_ref().map(|h| h.presentation_time.to_seconds())
+    }
+
+    /// The **file-absolute** playback time, in seconds, at which the track
+    /// identified by `serial` begins its data in a (possibly remuxed) Ogg
+    /// segment: the per-track [`FisBone::start_seconds`] (basegranule /
+    /// granulerate) plus the fishead **basetime**.
+    ///
+    /// Per `docs/container/ogg/ogg-skeleton-4.0.md`, the basegranule
+    /// "provides for each logical bitstream the accurate start time of its
+    /// data stream", and the basetime "provides a mapping for granule
+    /// position 0 (for all logical bitstreams) to a playback time". The data
+    /// of a track therefore starts, on the file's absolute timeline, at
+    /// `basetime + basegranule / granulerate`. For an un-cut stream
+    /// (basegranule `0`, basetime `0`) this is `0.0`.
+    ///
+    /// Returns `None` when no fisbone describes `serial`, or when the
+    /// track's [`FisBone::start_seconds`] is `None` (unusable granule rate).
+    /// An absent or zero-denominator basetime contributes a `0.0` offset
+    /// rather than blocking the mapping, consistent with
+    /// [`Self::granule_to_seconds`].
+    pub fn stream_start_seconds(&self, serial: u32) -> Option<f64> {
+        let bone = self.bone_for_serial(serial)?;
+        let start = bone.start_seconds()?;
+        let basetime = self
+            .head
+            .as_ref()
+            .map(|h| h.basetime.to_seconds())
+            .unwrap_or(0.0);
+        Some(start + basetime)
+    }
+
+    /// Map a content page's raw `granulepos` for the track identified by
+    /// `serial` to its **substream presentation time** in seconds: the time
+    /// on the cut segment's playback timeline at which the page presents.
+    ///
+    /// This is the substream mapping of
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"How to allow the creation
+    /// of substreams from an Ogg physical bitstream?". When a subpart is cut
+    /// out of a larger file, the kept content pages retain their original
+    /// granule positions, the fisbone records the **basegranule** (the
+    /// granule the kept data starts at), and the fishead records the
+    /// **presentation time** (the cut-in time all bitstreams present from,
+    /// e.g. 7 s for a `?t=7-59` cut). A page's time on that timeline is the
+    /// elapsed time since the stream's own data start
+    /// ([`FisBone::granule_to_seconds_since_start`]) added to the shared
+    /// cut-in presentation time:
+    /// `presentation_time + (extract_granules(granulepos) - basegranule)
+    /// / granulerate`.
+    ///
+    /// For an un-cut stream (basegranule `0`, presentation time `0`) this
+    /// equals [`Self::granule_to_seconds`] without the basetime term —
+    /// substream timing is expressed on the cut-in timeline (which begins at
+    /// the presentation time), distinct from the basetime/granule-0 mapping
+    /// that [`Self::granule_to_seconds`] returns. Choose
+    /// [`Self::granule_to_seconds`] for "what wall-/base-time does granule 0
+    /// correspond to"; choose this for "where on the cut segment's own
+    /// playback bar does this page land".
+    ///
+    /// Returns `None` when no fisbone describes `serial`, when the per-track
+    /// elapsed mapping is `None` (negative `granulepos` sentinel or unusable
+    /// granule rate), or when no fishead has been recorded (the presentation
+    /// time is then unknown). A fishead present but with a zero-denominator
+    /// presentation time contributes a `0.0` cut-in offset.
+    pub fn substream_granule_to_seconds(&self, serial: u32, granulepos: i64) -> Option<f64> {
+        let bone = self.bone_for_serial(serial)?;
+        let elapsed = bone.granule_to_seconds_since_start(granulepos)?;
+        let presentation = self.presentation_seconds()?;
+        Some(presentation + elapsed)
     }
 }
 
@@ -3884,5 +4047,163 @@ mod tests {
         let mut sk = Skeleton::new();
         sk.push_bone(FisBone::new(0x1234, Rational::new(48_000, 1)));
         assert_eq!(sk.granule_to_seconds(0xBEEF, 48_000), None);
+    }
+
+    #[test]
+    fn fisbone_start_seconds_basegranule_over_rate() {
+        // basegranule 336_000 at 48 kHz -> the kept data started at 7 s
+        // on the original timeline (the spec's ?t=7-59 cut example).
+        let mut bone = FisBone::new(1, Rational::new(48_000, 1));
+        bone.basegranule = 336_000;
+        let s = bone.start_seconds().expect("usable rate");
+        assert!((s - 7.0).abs() < 1e-9, "got {s}");
+        // Un-cut stream: basegranule 0 -> starts at 0.0.
+        let uncut = FisBone::new(1, Rational::new(48_000, 1));
+        assert_eq!(uncut.start_seconds(), Some(0.0));
+    }
+
+    #[test]
+    fn fisbone_start_seconds_negative_basegranule_preserves_sign() {
+        // A preroll page kept across the cut can sit before granule 0.
+        let mut bone = FisBone::new(1, Rational::new(48_000, 1));
+        bone.basegranule = -48_000;
+        let s = bone.start_seconds().expect("usable");
+        assert!((s + 1.0).abs() < 1e-9, "got {s}");
+    }
+
+    #[test]
+    fn fisbone_start_seconds_unusable_rate_is_none() {
+        let zero_den = FisBone::new(1, Rational::new(48_000, 0));
+        assert_eq!(zero_den.start_seconds(), None);
+        let zero_num = FisBone::new(1, Rational::new(0, 1));
+        assert_eq!(zero_num.start_seconds(), None);
+    }
+
+    #[test]
+    fn fisbone_granule_since_start_subtracts_basegranule() {
+        // Data starts at granule 336_000 (7 s); a page at granule 384_000
+        // is 1 s into the kept segment ((384_000 - 336_000) / 48_000).
+        let mut bone = FisBone::new(1, Rational::new(48_000, 1));
+        bone.basegranule = 336_000;
+        let s = bone
+            .granule_to_seconds_since_start(384_000)
+            .expect("usable");
+        assert!((s - 1.0).abs() < 1e-9, "got {s}");
+        // The basegranule page itself is at elapsed 0.0.
+        assert_eq!(bone.granule_to_seconds_since_start(336_000), Some(0.0));
+        // For an un-cut stream this equals granule_to_seconds.
+        let uncut = FisBone::new(1, Rational::new(48_000, 1));
+        assert_eq!(
+            uncut.granule_to_seconds_since_start(96_000),
+            uncut.granule_to_seconds(96_000)
+        );
+    }
+
+    #[test]
+    fn fisbone_granule_since_start_negative_for_preroll_page() {
+        // A page whose granule precedes the basegranule (a surviving
+        // preroll page) presents before the cut-in -> negative elapsed.
+        let mut bone = FisBone::new(1, Rational::new(48_000, 1));
+        bone.basegranule = 96_000;
+        let s = bone.granule_to_seconds_since_start(48_000).expect("usable");
+        assert!((s + 1.0).abs() < 1e-9, "got {s}");
+    }
+
+    #[test]
+    fn fisbone_granule_since_start_none_on_sentinel_or_unusable() {
+        let mut bone = FisBone::new(1, Rational::new(48_000, 1));
+        bone.basegranule = 336_000;
+        assert_eq!(bone.granule_to_seconds_since_start(-1), None);
+        let zero = FisBone::new(1, Rational::new(48_000, 0));
+        assert_eq!(zero.granule_to_seconds_since_start(384_000), None);
+    }
+
+    #[test]
+    fn skeleton_presentation_seconds_reads_fishead() {
+        let mut head = FisHead::new(Version::V4_0);
+        head.presentation_time = Rational::new(7, 1);
+        let mut sk = Skeleton::new();
+        sk.set_head(head);
+        let s = sk.presentation_seconds().expect("fishead present");
+        assert!((s - 7.0).abs() < 1e-9, "got {s}");
+        // Zero-denominator presentation time is the "unknown" / un-cut
+        // default of 0.0, not None.
+        let mut head0 = FisHead::new(Version::V4_0);
+        head0.presentation_time = Rational::new(0, 0);
+        let mut sk0 = Skeleton::new();
+        sk0.set_head(head0);
+        assert_eq!(sk0.presentation_seconds(), Some(0.0));
+        // No fishead at all -> None (presentation time is unknown).
+        assert_eq!(Skeleton::new().presentation_seconds(), None);
+    }
+
+    #[test]
+    fn skeleton_stream_start_seconds_adds_basetime() {
+        // basegranule 336_000 @ 48 kHz = 7 s of data start, plus a
+        // basetime of 3600 s -> file-absolute data start 3607 s.
+        let mut head = FisHead::new(Version::V4_0);
+        head.basetime = Rational::new(3600, 1);
+        let mut bone = FisBone::new(0x1234, Rational::new(48_000, 1));
+        bone.basegranule = 336_000;
+        let mut sk = Skeleton::new();
+        sk.set_head(head);
+        sk.push_bone(bone);
+        let s = sk.stream_start_seconds(0x1234).expect("usable");
+        assert!((s - 3607.0).abs() < 1e-6, "got {s}");
+        // Unknown serial -> None.
+        assert_eq!(sk.stream_start_seconds(0xBEEF), None);
+    }
+
+    #[test]
+    fn skeleton_substream_granule_to_seconds_cut_in_timeline() {
+        // The ?t=7-59 cut: presentation_time 7 s, basegranule 336_000
+        // (the kept data's start granule at 48 kHz). A page 1 s into the
+        // kept segment (granule 384_000) presents at 7 + 1 = 8 s.
+        let mut head = FisHead::new(Version::V4_0);
+        head.presentation_time = Rational::new(7, 1);
+        // basetime must NOT leak into the substream timeline.
+        head.basetime = Rational::new(3600, 1);
+        let mut bone = FisBone::new(0x1234, Rational::new(48_000, 1));
+        bone.basegranule = 336_000;
+        let mut sk = Skeleton::new();
+        sk.set_head(head);
+        sk.push_bone(bone);
+        let s = sk
+            .substream_granule_to_seconds(0x1234, 384_000)
+            .expect("usable");
+        assert!((s - 8.0).abs() < 1e-6, "got {s}");
+        // The cut-in page itself presents exactly at the presentation time.
+        let at_cut = sk
+            .substream_granule_to_seconds(0x1234, 336_000)
+            .expect("usable");
+        assert!((at_cut - 7.0).abs() < 1e-6, "got {at_cut}");
+    }
+
+    #[test]
+    fn skeleton_substream_granule_none_without_fishead_or_serial() {
+        // No fishead -> presentation time unknown -> None.
+        let mut sk = Skeleton::new();
+        sk.push_bone(FisBone::new(0x1234, Rational::new(48_000, 1)));
+        assert_eq!(sk.substream_granule_to_seconds(0x1234, 48_000), None);
+        // Fishead present, unknown serial -> None.
+        let mut sk2 = Skeleton::new();
+        sk2.set_head(FisHead::new(Version::V4_0));
+        sk2.push_bone(FisBone::new(0x1234, Rational::new(48_000, 1)));
+        assert_eq!(sk2.substream_granule_to_seconds(0xBEEF, 48_000), None);
+        // Fishead present, -1 sentinel granulepos -> None.
+        assert_eq!(sk2.substream_granule_to_seconds(0x1234, -1), None);
+    }
+
+    #[test]
+    fn skeleton_substream_uncut_equals_presentation_plus_track() {
+        // For an un-cut stream (basegranule 0, presentation_time 0) the
+        // substream time is just the per-track elapsed time.
+        let mut sk = Skeleton::new();
+        sk.set_head(FisHead::new(Version::V4_0));
+        sk.push_bone(FisBone::new(0x1234, Rational::new(48_000, 1)));
+        let s = sk
+            .substream_granule_to_seconds(0x1234, 96_000)
+            .expect("usable");
+        assert!((s - 2.0).abs() < 1e-9, "got {s}");
     }
 }

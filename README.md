@@ -497,6 +497,52 @@ accessors implement it:
   than blocking the mapping. Returns `None` when no fisbone describes
   `serial` or the per-track mapping is `None`.
 
+#### Substream / cut-in time mapping
+
+`docs/container/ogg/ogg-skeleton-4.0.md` §"How to allow the creation of
+substreams from an Ogg physical bitstream?" describes how a subpart cut
+out of a larger Ogg file (the spec's `?t=7-59` Web cut) keeps its content
+pages — "including the framing and granule positions" — byte-for-byte
+intact, and records two extra fields so a player can reconstruct the
+*original* timeline rather than restarting at 0: the fisbone's
+**basegranule** ("the granule number with which this logical bitstream
+starts in the remuxed stream … provides … the accurate start time of its
+data stream") and the fishead's **presentation time** ("the actual cut-in
+time and all logical bitstreams are meant to start presenting from this
+time onwards"). Both were already parsed and round-tripped; five
+accessors now consume them:
+
+- `FisBone::start_seconds() -> Option<f64>` — the per-track data start
+  time `basegranule / granulerate`. The basegranule names a granule
+  *number*, not an on-wire `granulepos`, so no granuleshift extraction is
+  applied; a negative basegranule (kept data preceding granule 0) keeps
+  its sign; an unusable rate yields `None`.
+- `FisBone::granule_to_seconds_since_start(granulepos) -> Option<f64>` —
+  a page's elapsed time within the kept segment,
+  `(extract_granules(granulepos) - basegranule) / granulerate`. For an
+  un-cut stream (basegranule 0) this equals `granule_to_seconds`; a page
+  whose granule precedes the basegranule (a surviving preroll page) maps
+  to a negative elapsed time. `None` on the `-1` sentinel / unusable rate.
+- `Skeleton::presentation_seconds() -> Option<f64>` — the fishead cut-in
+  time. `None` when no fishead has been recorded (the cut-in is then
+  unknown); a zero-denominator presentation time is the un-cut default of
+  `0.0`.
+- `Skeleton::stream_start_seconds(serial) -> Option<f64>` — the
+  **file-absolute** data start: `FisBone::start_seconds` plus the fishead
+  **basetime**. `None` for an unknown serial or unusable rate; an
+  absent/zero-denominator basetime contributes a `0.0` offset.
+- `Skeleton::substream_granule_to_seconds(serial, granulepos) ->
+  Option<f64>` — a page's position on the cut segment's own playback
+  timeline, `presentation_time + (extract_granules(granulepos) -
+  basegranule) / granulerate`. This is distinct from
+  `Skeleton::granule_to_seconds`, which answers the basetime/granule-0
+  mapping: choose `granule_to_seconds` for "what base-time does granule 0
+  correspond to", and this for "where on the cut segment's playback bar
+  does this page land". The basetime intentionally does *not* leak into
+  the substream timeline. `None` when no fishead describes the cut-in,
+  the serial is uncovered, the granulepos is the `-1` sentinel, or the
+  rate is unusable.
+
 When a Skeleton 4.0 `index\0` packet is present for the requested
 stream, [`Demuxer::seek_to`] skips both the page-level bisection scan
 and even the [`OggDemuxer::build_seek_index`] full-file scan: the
