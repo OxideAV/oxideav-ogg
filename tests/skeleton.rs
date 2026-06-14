@@ -372,7 +372,7 @@ fn skeleton_3_0_head_parses_without_segment_length() {
     // segment-length / content-byte-offset fields the 4.0 layout adds.
     let mut head = FisHead::new(Version::V3_0);
     head.presentation_time = Rational::new(7, 1000);
-    head.utc[..15].copy_from_slice(b"20260529T064100");
+    head.utc[..16].copy_from_slice(b"20260529T064100Z");
     let head_packet = head.to_bytes();
     assert_eq!(head_packet.len(), 64);
 
@@ -422,6 +422,16 @@ fn skeleton_3_0_head_parses_without_segment_length() {
     assert_eq!(parsed_head.version, Version::V3_0);
     assert_eq!(parsed_head.segment_length, None);
     assert_eq!(parsed_head.content_byte_offset, None);
+    // The 20-byte UTC slot survives the page round-trip and the typed
+    // accessor parses the documented YYYYMMDDTHHMMSSZ basic convention.
+    assert_eq!(parsed_head.utc_str().as_deref(), Some("20260529T064100Z"));
+    let utc = parsed_head
+        .utc_time()
+        .expect("slot non-empty")
+        .expect("parses");
+    assert_eq!((utc.year, utc.month, utc.day), (2026, 5, 29));
+    assert_eq!((utc.hour, utc.minute, utc.second), (6, 41, 0));
+    assert_eq!(utc.to_string_basic(), "20260529T064100Z");
     // No fisbones supplied in this minimal blob → bones vec empty, but
     // the indexes vec is also empty (3.0 has no index packets).
     assert!(sk.indexes.is_empty());

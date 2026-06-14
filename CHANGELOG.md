@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed `fishead` UTC accessor: `FisHead::utc_str` / `FisHead::utc_time`
+  + the `Utc` value type.** The Skeleton `fishead` ident packet carries a
+  20-byte UTC slot (bytes 44..63) that
+  `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+  information is needed?" defines as the granule-0 → real-world-clock-time
+  mapping ("allowing to remember e.g. the recording or broadcast time of
+  some content"). The slot was already parsed and round-tripped as a raw
+  `[u8; 20]`; these accessors give it a typed view. `utc_str()` returns the
+  NUL/whitespace-stripped slot text (`None` when empty) for callers that
+  want a verbatim reading without committing to a date format. `utc_time()`
+  parses the documented `YYYYMMDDTHHMMSS.sssZ` ISO-8601 *basic* convention
+  into a structured `Utc { year, month, day, hour, minute, second,
+  fraction }`, following the same three-way `Option<Result<…>>` contract as
+  `content_type()` / `altitude()` / `display_hint()`: `None` for an empty
+  slot, `Some(Ok)` for the convention, `Some(Err)` for a non-empty slot
+  that doesn't match (the spec mandates the field's *meaning* but no byte
+  layout, so a non-convention slot is surfaced via `utc_str` rather than
+  rejected). Fractional seconds are preserved verbatim (trailing zeros
+  intact) and a positive leap second (`:60`) is accepted per ISO 8601.
+  `Utc::to_string_basic` re-emits the convention. Spec reference:
+  `docs/container/ogg/ogg-skeleton-3.0.md` /
+  `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+  information is needed?".
+
 - **Skeleton-level track addressing: `Skeleton::bone_for_name` /
   `Skeleton::bones_for_name` / `Skeleton::bones_with_role` /
   `Skeleton::bones_with_language`.** Implements the file-level track

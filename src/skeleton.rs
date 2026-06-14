@@ -224,6 +224,217 @@ impl FisHead {
         debug_assert_eq!(out.len(), len);
         out
     }
+
+    /// Raw, NUL-stripped text of the 20-byte `fishead` UTC slot (bytes
+    /// 44..63).
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+    /// information is needed?" defines the UTC field as a per-file "mapping
+    /// for granule position 0 (for all logical bitstreams) to a real-world
+    /// clock time allowing to remember e.g. the recording or broadcast time
+    /// of some content". The on-wire slot is a fixed 20-byte ASCII area; the
+    /// `to_bytes` / `parse` round-trip already preserves it verbatim. This
+    /// accessor returns the slot decoded as a string with trailing NUL
+    /// padding (and surrounding whitespace) stripped, for callers that want
+    /// the raw timestamp text without committing to a particular date format.
+    ///
+    /// Returns `None` when the slot is entirely empty (all NUL / blank),
+    /// which is the prevailing pattern for files that do not record a
+    /// wall-clock anchor. A slot containing non-UTF-8 bytes is surfaced
+    /// lossily (invalid sequences replaced) so a corrupt slot never makes
+    /// the whole header unreadable — callers that need byte-exact access
+    /// can read the public `utc` field directly.
+    pub fn utc_str(&self) -> Option<String> {
+        let end = self
+            .utc
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.utc.len());
+        let text = String::from_utf8_lossy(&self.utc[..end]);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    /// Typed view of the `fishead` UTC slot parsed against the documented
+    /// `YYYYMMDDTHHMMSS.sssZ` ISO-8601 *basic* convention.
+    ///
+    /// The Skeleton spec defines the UTC field's *meaning* (a granule-0 →
+    /// real-world-clock-time mapping per
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+    /// information is needed?") but does **not** mandate a byte layout for
+    /// the 20-byte slot; the convention used by existing Skeleton files is
+    /// the ISO-8601 basic combined date-time form `YYYYMMDDTHHMMSS.sssZ`
+    /// (no field separators, `T` between date and time, an optional
+    /// fractional-seconds part, and a trailing `Z` UTC designator). This
+    /// accessor parses exactly that convention into a structured [`Utc`].
+    ///
+    /// The return type follows the same three-way contract as
+    /// [`FisBone::content_type`] / [`FisBone::altitude`] /
+    /// [`FisBone::display_hint`]:
+    ///
+    /// * `None` — the slot is empty (no wall-clock anchor recorded);
+    /// * `Some(Ok(utc))` — the slot parses as the documented convention;
+    /// * `Some(Err(_))` — the slot is non-empty but does not match the
+    ///   convention, so the caller can fall back to [`Self::utc_str`] for a
+    ///   verbatim reading or reject the field.
+    pub fn utc_time(&self) -> Option<Result<Utc>> {
+        let raw = self.utc_str()?;
+        Some(Utc::parse(&raw))
+    }
+}
+
+/// Structured value of the `fishead` UTC field, parsed from the documented
+/// `YYYYMMDDTHHMMSS.sssZ` ISO-8601 *basic* convention.
+///
+/// See [`FisHead::utc_time`] for the contract and provenance. Fractional
+/// seconds are stored as a separate string of digits (without the leading
+/// `.`) so an arbitrary-precision fraction round-trips without losing
+/// trailing zeros; the `Z` UTC designator is required by the convention and
+/// is not retained as a field (its presence is enforced at parse time).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Utc {
+    /// Four-digit calendar year.
+    pub year: u16,
+    /// Month of year, `1..=12`.
+    pub month: u8,
+    /// Day of month, `1..=31` (the parser validates the range but not the
+    /// month/year-specific upper bound — a Feb-30 slot still parses, since
+    /// the spec gives no calendar-validity rule and a verbatim reading is
+    /// the conservative choice).
+    pub day: u8,
+    /// Hour of day, `0..=23`.
+    pub hour: u8,
+    /// Minute of hour, `0..=59`.
+    pub minute: u8,
+    /// Second of minute, `0..=60` (60 admits a positive leap second).
+    pub second: u8,
+    /// Fractional-seconds digits exactly as written, without the leading
+    /// `.`. Empty when the slot carried no fractional part.
+    pub fraction: String,
+}
+
+impl Utc {
+    /// Parse a UTC slot string in the documented `YYYYMMDDTHHMMSS.sssZ`
+    /// ISO-8601 basic convention. The fractional `.sss` part is optional;
+    /// the trailing `Z` designator is required (the convention is always
+    /// UTC). Surrounding whitespace is tolerated by [`FisHead::utc_str`]
+    /// before this is called.
+    pub fn parse(raw: &str) -> Result<Utc> {
+        let s = raw.trim();
+        // Minimum is `YYYYMMDDTHHMMSSZ` = 16 chars.
+        let bytes = s.as_bytes();
+        if bytes.len() < 16 {
+            return Err(Error::invalid(format!(
+                "Skeleton UTC '{s}' too short for YYYYMMDDTHHMMSS[.fff]Z"
+            )));
+        }
+        if !s.ends_with('Z') {
+            return Err(Error::invalid(format!(
+                "Skeleton UTC '{s}' missing trailing 'Z' designator"
+            )));
+        }
+        if bytes[8] != b'T' {
+            return Err(Error::invalid(format!(
+                "Skeleton UTC '{s}' missing 'T' date/time separator at index 8"
+            )));
+        }
+        let parse_field = |slice: &str, name: &str| -> Result<u32> {
+            if !slice.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Error::invalid(format!(
+                    "Skeleton UTC '{s}' has non-digit {name} field '{slice}'"
+                )));
+            }
+            slice.parse::<u32>().map_err(|_| {
+                Error::invalid(format!(
+                    "Skeleton UTC '{s}' {name} field '{slice}' out of range"
+                ))
+            })
+        };
+        let year = parse_field(&s[0..4], "year")? as u16;
+        let month = parse_field(&s[4..6], "month")? as u8;
+        let day = parse_field(&s[6..8], "day")? as u8;
+        let hour = parse_field(&s[9..11], "hour")? as u8;
+        let minute = parse_field(&s[11..13], "minute")? as u8;
+        let second = parse_field(&s[13..15], "second")? as u8;
+
+        // Optional fractional part: between index 15 and the trailing 'Z'.
+        let tail = &s[15..s.len() - 1];
+        let fraction = if tail.is_empty() {
+            String::new()
+        } else {
+            if !tail.starts_with('.') || tail.len() < 2 {
+                return Err(Error::invalid(format!(
+                    "Skeleton UTC '{s}' malformed fractional-seconds part '{tail}'"
+                )));
+            }
+            let digits = &tail[1..];
+            if !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Error::invalid(format!(
+                    "Skeleton UTC '{s}' non-digit fractional-seconds '{digits}'"
+                )));
+            }
+            digits.to_string()
+        };
+
+        if !(1..=12).contains(&month) {
+            return Err(Error::invalid(format!(
+                "Skeleton UTC '{s}' month {month} out of 1..=12"
+            )));
+        }
+        if !(1..=31).contains(&day) {
+            return Err(Error::invalid(format!(
+                "Skeleton UTC '{s}' day {day} out of 1..=31"
+            )));
+        }
+        if hour > 23 {
+            return Err(Error::invalid(format!(
+                "Skeleton UTC '{s}' hour {hour} out of 0..=23"
+            )));
+        }
+        if minute > 59 {
+            return Err(Error::invalid(format!(
+                "Skeleton UTC '{s}' minute {minute} out of 0..=59"
+            )));
+        }
+        // 60 permits a positive leap second per ISO 8601.
+        if second > 60 {
+            return Err(Error::invalid(format!(
+                "Skeleton UTC '{s}' second {second} out of 0..=60"
+            )));
+        }
+
+        Ok(Utc {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            fraction,
+        })
+    }
+
+    /// Re-emit this value in the documented `YYYYMMDDTHHMMSS.sssZ` basic
+    /// convention. The fractional part is omitted when [`Self::fraction`]
+    /// is empty; otherwise it is written verbatim (preserving any trailing
+    /// zeros) between a `.` and the `Z`.
+    pub fn to_string_basic(&self) -> String {
+        if self.fraction.is_empty() {
+            format!(
+                "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+                self.year, self.month, self.day, self.hour, self.minute, self.second
+            )
+        } else {
+            format!(
+                "{:04}{:02}{:02}T{:02}{:02}{:02}.{}Z",
+                self.year, self.month, self.day, self.hour, self.minute, self.second, self.fraction
+            )
+        }
+    }
 }
 
 /// One HTTP-style message header field carried inside a `fisbone` packet.
@@ -2446,6 +2657,102 @@ mod tests {
     #[test]
     fn fishead_rejects_short_packet() {
         assert!(FisHead::parse(b"fishead\0only_a_bit").is_err());
+    }
+
+    #[test]
+    fn fishead_utc_empty_slot_is_none() {
+        let head = FisHead::new(Version::V4_0);
+        assert_eq!(head.utc_str(), None);
+        assert!(head.utc_time().is_none());
+    }
+
+    #[test]
+    fn fishead_utc_str_strips_nul_padding() {
+        let mut head = FisHead::new(Version::V4_0);
+        head.utc[..16].copy_from_slice(b"20260529T064100Z");
+        assert_eq!(head.utc_str().as_deref(), Some("20260529T064100Z"));
+    }
+
+    #[test]
+    fn fishead_utc_parses_basic_no_fraction() {
+        let mut head = FisHead::new(Version::V4_0);
+        head.utc[..16].copy_from_slice(b"20260529T064100Z");
+        let utc = head.utc_time().unwrap().unwrap();
+        assert_eq!(
+            utc,
+            Utc {
+                year: 2026,
+                month: 5,
+                day: 29,
+                hour: 6,
+                minute: 41,
+                second: 0,
+                fraction: String::new(),
+            }
+        );
+        assert_eq!(utc.to_string_basic(), "20260529T064100Z");
+    }
+
+    #[test]
+    fn fishead_utc_parses_basic_with_fraction() {
+        let utc = Utc::parse("20260529T064100.250Z").unwrap();
+        assert_eq!(utc.fraction, "250");
+        assert_eq!(utc.second, 0);
+        // Trailing zeros are preserved through the round-trip.
+        assert_eq!(utc.to_string_basic(), "20260529T064100.250Z");
+    }
+
+    #[test]
+    fn fishead_utc_leap_second_accepted() {
+        let utc = Utc::parse("20161231T235960Z").unwrap();
+        assert_eq!(utc.second, 60);
+    }
+
+    #[test]
+    fn fishead_utc_round_trips_through_packet() {
+        let mut head = FisHead::new(Version::V4_0);
+        let text = b"20260529T064100.5Z";
+        head.utc[..text.len()].copy_from_slice(text);
+        let bytes = head.to_bytes();
+        let back = FisHead::parse(&bytes).unwrap();
+        let utc = back.utc_time().unwrap().unwrap();
+        assert_eq!(utc.to_string_basic(), "20260529T064100.5Z");
+    }
+
+    #[test]
+    fn fishead_utc_rejects_malformed() {
+        // Missing trailing 'Z'.
+        assert!(Utc::parse("20260529T064100").is_err());
+        // Missing 'T' separator.
+        assert!(Utc::parse("202605290641 00Z").is_err());
+        // Too short.
+        assert!(Utc::parse("2026Z").is_err());
+        // Non-digit field.
+        assert!(Utc::parse("2026XX29T064100Z").is_err());
+        // Month out of range.
+        assert!(Utc::parse("20261329T064100Z").is_err());
+        // Day out of range.
+        assert!(Utc::parse("20260532T064100Z").is_err());
+        // Hour out of range.
+        assert!(Utc::parse("20260529T254100Z").is_err());
+        // Minute out of range.
+        assert!(Utc::parse("20260529T066100Z").is_err());
+        // Second out of range (61).
+        assert!(Utc::parse("20260529T064161Z").is_err());
+        // Malformed fractional part (bare dot).
+        assert!(Utc::parse("20260529T064100.Z").is_err());
+        // Non-digit fractional part.
+        assert!(Utc::parse("20260529T064100.5xZ").is_err());
+    }
+
+    #[test]
+    fn fishead_utc_non_convention_slot_surfaces_err_not_panic() {
+        let mut head = FisHead::new(Version::V4_0);
+        // A free-text slot that doesn't follow the basic convention:
+        // utc_str() still returns it verbatim, utc_time() reports Err.
+        head.utc[..11].copy_from_slice(b"recorded-22");
+        assert_eq!(head.utc_str().as_deref(), Some("recorded-22"));
+        assert!(head.utc_time().unwrap().is_err());
     }
 
     #[test]

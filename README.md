@@ -331,6 +331,23 @@ For encode-side use, every type round-trips through `to_bytes` /
   *Segment length in bytes* and *Content byte offset* fields at
   bytes 64..80, used by players to validate the index and to bound
   chained-segment seeking).
+- **Typed UTC accessor** for the `fishead` 20-byte UTC slot (bytes
+  44..63), which `docs/container/ogg/ogg-skeleton-4.0.md` §"What
+  decoding-related information is needed?" defines as the granule-0 →
+  real-world-clock-time mapping ("allowing to remember e.g. the recording
+  or broadcast time of some content"). `FisHead::utc_str()` returns the
+  NUL/whitespace-stripped slot text (`Option<String>`, `None` for an empty
+  slot) for callers that want a verbatim reading. `FisHead::utc_time()`
+  parses the documented `YYYYMMDDTHHMMSS.sssZ` ISO-8601 *basic* convention
+  into a structured [`Utc`] — `{ year, month, day, hour, minute, second,
+  fraction }` — following the same three-way `Option<Result<…>>` contract
+  as `content_type()` / `altitude()` / `display_hint()`: `None` (slot
+  empty), `Some(Ok(utc))` (slot follows the convention), `Some(Err(_))`
+  (non-empty but off-convention — the spec mandates the field's *meaning*,
+  not a byte layout, so such a slot is surfaced through `utc_str()` rather
+  than rejected). Fractional seconds round-trip verbatim (trailing zeros
+  preserved) and a positive leap second (`:60`) is accepted per ISO 8601;
+  `Utc::to_string_basic` re-emits the convention.
 - `FisBone::to_bytes` emits the 52-byte fixed prefix followed by
   CRLF-delimited HTTP-style message header fields. `set_header` /
   `header` provide case-insensitive lookup for the spec's compulsory
