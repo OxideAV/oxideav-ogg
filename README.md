@@ -631,6 +631,49 @@ spec-defined order — the basis for a `track[name=…]` / `track[n]`
 resolver. Spec reference:
 `docs/container/ogg/ogg-skeleton-message-headers.wiki` §"Track order".
 
+#### Track addressing by name / role / language (`SkeletonHeaders`)
+
+The per-fisbone typed accessors above answer "what does *this* track
+declare"; four `Skeleton`-level resolvers answer the inverse "which
+track(s) match", consuming those accessors at the file level — the
+content-negotiation use the message-headers wiki was written for
+(differentiating and addressing tracks "e.g. from a JavaScript API"):
+
+- `Skeleton::bone_for_name(name)` resolves the wiki §Name
+  `track[name="…"]` addressing form to the unique fisbone carrying that
+  `Name` header. The §Name grammar mirrors XML 1.0 `NCName`, so matching
+  is **case-sensitive** (`Madonna_singing` ≠ `madonna_singing`), unlike
+  the case-insensitive HTTP-style *header field-name* lookup. Crucially,
+  it enforces the wiki's uniqueness rule — "The name needs to be unique
+  between all the track names, otherwise it is undefined which of the
+  tracks is retrieved when addressing by name" — by returning `None` when
+  **two or more** fisbones declare the same name, rather than arbitrarily
+  picking the first, so a caller can never silently address the wrong
+  track. (This is the file-level invariant the `FisBone::name()` per-value
+  parser explicitly left to callers.)
+- `Skeleton::bones_for_name(name)` is the ambiguity-observing companion:
+  it returns *all* fisbones with that name (at most one in a well-formed
+  file, more than one in a file that violates the uniqueness rule), so a
+  caller can surface a "duplicate track name" diagnostic instead of having
+  the match collapse to `None`.
+- `Skeleton::bones_with_role(role)` is a multi-track query — the wiki
+  §Role notes "The same role can be used across multiple tracks" (e.g.
+  every `audio/dub` track to populate a language picker). The role tag is
+  matched up to the first `;` (ignoring any `;key=value` parameters) and
+  case-insensitively, so a `"video/alternate"` query matches both
+  `video/alternate` and `video/alternate;angle=nw`.
+- `Skeleton::bones_with_language(tag)` answers "which tracks carry content
+  in this language". The wiki §Language documents a comma-separated list
+  with the dominating language first (`Language: en-US, fr`); a track
+  matches if `tag` appears **anywhere** in its list, not only as the
+  dominant first entry, matched case-insensitively per BCP 47.
+
+All four return fisbones in BOS declaration order, skip tracks lacking
+the queried header, and trim surrounding whitespace on the lookup key.
+Spec reference:
+`docs/container/ogg/ogg-skeleton-message-headers.wiki` §"Name", §"Role",
+§"Language".
+
 ### Page-loss detection (RFC 3533 §6)
 
 Every Ogg page header carries a `page_sequence_number` that "is

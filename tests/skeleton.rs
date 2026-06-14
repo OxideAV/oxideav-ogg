@@ -1429,3 +1429,188 @@ fn track_order_full_walk_round_trips() {
         );
     }
 }
+
+// --- Skeleton-level track addressing (SkeletonHeaders §Name / §Role /
+// --- §Language) ---------------------------------------------------------
+
+/// Build a Skeleton describing four content tracks that exercise the
+/// addressing helpers: a main video, a main audio (en-US), a French dub,
+/// and an English caption track. Built directly via `push_bone` so the
+/// resolvers can be tested without a full demux.
+fn multitrack_skeleton() -> skeleton::Skeleton {
+    let mut sk = skeleton::Skeleton::new();
+
+    let mut video = FisBone::new(0x1000, Rational::new(30, 1));
+    video.set_header("Content-Type", "video/theora");
+    video.set_header("Role", "video/main");
+    video.set_header("Name", "main_video");
+    sk.push_bone(video);
+
+    let mut audio = FisBone::new(0x2000, Rational::new(48_000, 1));
+    audio.set_header("Content-Type", "audio/vorbis");
+    audio.set_header("Role", "audio/main");
+    audio.set_header("Name", "main_audio");
+    audio.set_header("Language", "en-US");
+    sk.push_bone(audio);
+
+    let mut dub = FisBone::new(0x3000, Rational::new(48_000, 1));
+    dub.set_header("Content-Type", "audio/vorbis");
+    // Parameterised role: the tag (audio/dub) must still match a bare
+    // "audio/dub" role query.
+    dub.set_header("Role", "audio/dub;lang=fr");
+    dub.set_header("Name", "french_dub");
+    dub.set_header("Language", "fr, en");
+    sk.push_bone(dub);
+
+    let mut caption = FisBone::new(0x4000, Rational::new(1000, 1));
+    caption.set_header("Content-Type", "text/cmml");
+    caption.set_header("Role", "text/caption");
+    caption.set_header("Name", "english_captions");
+    caption.set_header("Language", "en");
+    sk.push_bone(caption);
+
+    sk
+}
+
+#[test]
+fn bone_for_name_resolves_track_addressing() {
+    // SkeletonHeaders §Name: track[name="…"] addressing resolves the
+    // unique fisbone carrying that Name header.
+    let sk = multitrack_skeleton();
+
+    assert_eq!(
+        sk.bone_for_name("main_audio").map(|b| b.serial),
+        Some(0x2000)
+    );
+    assert_eq!(
+        sk.bone_for_name("french_dub").map(|b| b.serial),
+        Some(0x3000)
+    );
+    // Surrounding whitespace on the lookup key is trimmed (same framing
+    // tolerance as Name::parse).
+    assert_eq!(
+        sk.bone_for_name("  main_video  ").map(|b| b.serial),
+        Some(0x1000)
+    );
+    // Absent name → None.
+    assert!(sk.bone_for_name("nonexistent").is_none());
+    // §Name is XML-NCName-shaped (case-sensitive): a case-mismatched
+    // lookup must NOT resolve, unlike header *field-name* matching.
+    assert!(sk.bone_for_name("MAIN_AUDIO").is_none());
+}
+
+#[test]
+fn bone_for_name_refuses_ambiguous_names() {
+    // SkeletonHeaders §Name: "otherwise it is undefined which of the
+    // tracks is retrieved" — a duplicate name must resolve to None, not
+    // an arbitrary pick. bones_for_name surfaces the ambiguity instead.
+    let mut sk = skeleton::Skeleton::new();
+    let mut a = FisBone::new(0x10, Rational::new(48_000, 1));
+    a.set_header("Name", "dup");
+    sk.push_bone(a);
+    let mut b = FisBone::new(0x20, Rational::new(48_000, 1));
+    b.set_header("Name", "dup");
+    sk.push_bone(b);
+
+    assert!(
+        sk.bone_for_name("dup").is_none(),
+        "ambiguous name must be unresolvable"
+    );
+    let matches: Vec<u32> = sk.bones_for_name("dup").iter().map(|x| x.serial).collect();
+    assert_eq!(matches, vec![0x10, 0x20]);
+    assert!(sk.bones_for_name("absent").is_empty());
+}
+
+#[test]
+fn bones_with_role_is_multitrack_and_param_tolerant() {
+    // SkeletonHeaders §Role: "The same role can be used across multiple
+    // tracks" — role addressing is a multi-track query. The tag is
+    // matched up to the first ';' so "audio/dub" matches
+    // "audio/dub;lang=fr", and case-insensitively per Role::parse.
+    let sk = multitrack_skeleton();
+
+    let mains: Vec<u32> = sk
+        .bones_with_role("audio/main")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(mains, vec![0x2000]);
+
+    // Bare-tag query matches the parameterised role.
+    let dubs: Vec<u32> = sk
+        .bones_with_role("audio/dub")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(dubs, vec![0x3000]);
+
+    // Case-insensitive tag match.
+    let captions: Vec<u32> = sk
+        .bones_with_role("TEXT/CAPTION")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(captions, vec![0x4000]);
+
+    assert!(sk.bones_with_role("audio/sfx").is_empty());
+}
+
+#[test]
+fn bones_with_language_matches_any_listed_tag() {
+    // SkeletonHeaders §Language: comma-separated list, dominant first.
+    // A track matches if the tag appears ANYWHERE in its list, matched
+    // case-insensitively per BCP 47.
+    let sk = multitrack_skeleton();
+
+    // "en" matches the caption (sole "en") and the dub (non-dominant
+    // "fr, en"), but NOT the main audio whose tag is the distinct
+    // "en-US".
+    let en: Vec<u32> = sk
+        .bones_with_language("en")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(en, vec![0x3000, 0x4000]);
+
+    // "fr" matches only the dub.
+    let fr: Vec<u32> = sk
+        .bones_with_language("fr")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(fr, vec![0x3000]);
+
+    // Case-insensitive: "EN-US" matches the main audio's "en-US".
+    let enus: Vec<u32> = sk
+        .bones_with_language("EN-US")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(enus, vec![0x2000]);
+
+    // A track with no Language header (main_video) never matches.
+    assert!(sk.bones_with_language("de").is_empty());
+}
+
+#[test]
+fn track_addressing_works_through_full_demux() {
+    // End-to-end: the addressing helpers resolve against a Skeleton
+    // parsed from on-wire bytes, not only one built via push_bone.
+    let (bytes, _, _, _) = build_skeleton_4_0_ogg();
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    let sk = dmx.skeleton().expect("Skeleton present");
+
+    // build_skeleton_4_0_ogg sets Name=main_audio, Role=audio/main.
+    assert_eq!(
+        sk.bone_for_name("main_audio").map(|b| b.serial),
+        Some(VORBIS_SERIAL)
+    );
+    let mains: Vec<u32> = sk
+        .bones_with_role("audio/main")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(mains, vec![VORBIS_SERIAL]);
+}

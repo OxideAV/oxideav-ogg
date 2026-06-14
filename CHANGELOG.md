@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton-level track addressing: `Skeleton::bone_for_name` /
+  `Skeleton::bones_for_name` / `Skeleton::bones_with_role` /
+  `Skeleton::bones_with_language`.** Implements the file-level track
+  resolution the message-headers wiki
+  (`docs/container/ogg/ogg-skeleton-message-headers.wiki`) describes but
+  the per-value typed accessors deferred to callers. `bone_for_name`
+  resolves the §Name `track[name="…"]` form and enforces its uniqueness
+  rule ("otherwise it is undefined which of the tracks is retrieved") by
+  returning `None` for an ambiguous (duplicated) name; `bones_for_name`
+  is the ambiguity-observing companion. `bones_with_role` is a multi-track
+  query (§Role: "The same role can be used across multiple tracks"),
+  matching the role tag up to the first `;` case-insensitively so a bare
+  `audio/dub` query matches `audio/dub;lang=fr`. `bones_with_language`
+  matches a §Language tag anywhere in a track's comma-separated list
+  (dominant or not), case-insensitively per BCP 47. All return fisbones
+  in BOS declaration order. Five new tests in `tests/skeleton.rs`.
+
 - **Skeleton substream / cut-in time mapping:
   `FisBone::start_seconds` / `FisBone::granule_to_seconds_since_start` /
   `Skeleton::presentation_seconds` / `Skeleton::stream_start_seconds` /

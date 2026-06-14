@@ -2104,6 +2104,131 @@ impl Skeleton {
         self.indexes.iter().find(|i| i.serial == serial)
     }
 
+    /// Resolve the `track[name="…"]` addressing form of
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Name: return
+    /// the fisbone whose `Name` message-header value equals `name`.
+    ///
+    /// The wiki documents `Name` as a stable per-track identifier "to allow
+    /// direct addressing of the track through its name", with the worked
+    /// example `track[name="Madonna_singing"]`. The per-value parser
+    /// ([`FisBone::name`]) deliberately leaves the wiki's uniqueness rule —
+    /// "The name needs to be unique between all the track names, otherwise it
+    /// is undefined which of the tracks is retrieved when addressing by
+    /// name" — to the file level, because enforcing it requires looking at
+    /// every `fisbone\0` in the same Skeleton stream. This `Skeleton`-level
+    /// resolver is where that rule lives.
+    ///
+    /// Matching is on [`Name::raw`] (the trimmed on-wire value), case-
+    /// sensitive: the §Name grammar mirrors XML 1.0 `NCName`, where
+    /// `Madonna_singing` and `madonna_singing` are distinct identifiers, so a
+    /// resolver must not fold case the way the HTTP-style *header field
+    /// names* are folded. A track that carries no `Name` header never
+    /// matches (its [`FisBone::name`] is `None`).
+    ///
+    /// Per the wiki's "otherwise it is undefined which of the tracks is
+    /// retrieved" wording, an **ambiguous** name — two or more fisbones
+    /// declaring the same `Name` — is treated as unresolvable: this returns
+    /// `None` rather than arbitrarily picking the first, so callers cannot
+    /// silently address the wrong track. Use [`Self::bones_for_name`] when a
+    /// caller wants to observe the ambiguity (e.g. to surface a "duplicate
+    /// track name" diagnostic) instead of having it collapse to `None`.
+    ///
+    /// Returns `None` when no fisbone declares `name`, or when more than one
+    /// does (ambiguous). Whitespace is matched after the same trim
+    /// [`Name::parse`] applies, so a lookup key with stray surrounding
+    /// spaces still resolves.
+    pub fn bone_for_name(&self, name: &str) -> Option<&FisBone> {
+        let key = name.trim();
+        let mut found: Option<&FisBone> = None;
+        for bone in &self.bones {
+            if let Some(n) = bone.name() {
+                if n.raw() == key {
+                    if found.is_some() {
+                        // Ambiguous: §Name says the result is undefined, so
+                        // refuse rather than pick one.
+                        return None;
+                    }
+                    found = Some(bone);
+                }
+            }
+        }
+        found
+    }
+
+    /// All fisbones whose `Name` message-header value equals `name`, in BOS
+    /// declaration order.
+    ///
+    /// This is the ambiguity-observing companion to [`Self::bone_for_name`].
+    /// A well-formed file per `docs/container/ogg/ogg-skeleton-message-headers.wiki`
+    /// §Name yields at most one match (names must be unique); a file that
+    /// violates the uniqueness rule yields more than one, letting a caller
+    /// surface a "duplicate track name" diagnostic rather than having the
+    /// match silently collapse to `None`. An empty `Vec` means the name is
+    /// absent. Matching follows the same case-sensitive, trimmed rule as
+    /// [`Self::bone_for_name`].
+    pub fn bones_for_name(&self, name: &str) -> Vec<&FisBone> {
+        let key = name.trim();
+        self.bones
+            .iter()
+            .filter(|b| b.name().is_some_and(|n| n.raw() == key))
+            .collect()
+    }
+
+    /// All fisbones whose `Role` message-header tag equals `role`, in BOS
+    /// declaration order.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Role notes
+    /// that, unlike `Name`, "The same role can be used across multiple
+    /// tracks" — so role addressing is inherently a multi-track query (e.g.
+    /// "every `audio/dub` track" to populate a language-picker), which is why
+    /// this returns a `Vec` rather than a single match.
+    ///
+    /// `role` is matched against [`Role::kind`]'s wire form
+    /// ([`RoleKind::as_wire`]) — i.e. the role tag up to the first `;`,
+    /// ignoring any `;key=value` parameters — case-insensitively, mirroring
+    /// the case-insensitive tag matching [`Role::parse`] performs against the
+    /// enumerated wiki values. A caller passing `"video/alternate"` therefore
+    /// matches both `video/alternate` and `video/alternate;angle=nw`. Tracks
+    /// with no `Role` header are skipped.
+    pub fn bones_with_role(&self, role: &str) -> Vec<&FisBone> {
+        let key = role.trim();
+        self.bones
+            .iter()
+            .filter(|b| {
+                b.role()
+                    .is_some_and(|r| r.kind.as_wire().eq_ignore_ascii_case(key))
+            })
+            .collect()
+    }
+
+    /// All fisbones whose `Language` message-header lists `tag` among its
+    /// BCP-47-shaped language tags, in BOS declaration order.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Language
+    /// documents a comma-separated list with "the dominating language
+    /// specified as the first language" followed by optional non-dominating
+    /// languages (the worked example is `Language: en-US, fr`). This query
+    /// answers "which tracks carry content in this language" — the basis for
+    /// a language picker — and so matches a track if `tag` appears anywhere
+    /// in its [`FisBone::languages`] list, not only as the dominant first
+    /// entry.
+    ///
+    /// Matching is case-insensitive per BCP 47 §2.1.1 ("language tags are to
+    /// be treated as case insensitive"); `tag` is trimmed first. Tracks with
+    /// no `Language` header are skipped. To restrict the query to tracks
+    /// whose *dominant* language is `tag`, a caller can filter
+    /// [`FisBone::languages`]`.first()` itself.
+    pub fn bones_with_language(&self, tag: &str) -> Vec<&FisBone> {
+        let key = tag.trim();
+        self.bones
+            .iter()
+            .filter(|b| {
+                b.languages()
+                    .is_some_and(|ls| ls.iter().any(|l| l.eq_ignore_ascii_case(key)))
+            })
+            .collect()
+    }
+
     /// Map a content page's raw `granulepos` for the track identified by
     /// `serial` to an **absolute** playback time in seconds.
     ///
