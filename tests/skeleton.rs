@@ -1603,6 +1603,101 @@ fn bones_with_language_matches_any_listed_tag() {
 }
 
 #[test]
+fn bones_by_stack_order_places_main_bottom_and_higher_altitude_front() {
+    // SkeletonHeaders §Altitude: "the stack order of the tracks ... an
+    // element with greater stack order is always in front of an element
+    // with a lower stack order. ... By default, a 'main' track is always
+    // displayed bottom-most unless otherwise defined."
+    let mut sk = skeleton::Skeleton::new();
+
+    // Undefaulted main video → bottom-most by default.
+    let mut main = FisBone::new(0x1000, Rational::new(30, 1));
+    main.set_header("Role", "video/main");
+    sk.push_bone(main);
+
+    // A PIP overlay placed in front with an explicit altitude.
+    let mut pip = FisBone::new(0x2000, Rational::new(30, 1));
+    pip.set_header("Role", "video/alternate");
+    pip.set_header("Altitude", "100");
+    sk.push_bone(pip);
+
+    // A non-main track with no altitude → CSS auto level 0.
+    let mut sign = FisBone::new(0x3000, Rational::new(30, 1));
+    sign.set_header("Role", "video/sign");
+    sk.push_bone(sign);
+
+    // An explicit negative altitude → below the auto-0 sign track but
+    // still above the undefaulted main (which sinks to the bottom).
+    let mut behind = FisBone::new(0x4000, Rational::new(30, 1));
+    behind.set_header("Role", "video/captioned");
+    behind.set_header("Altitude", "-150");
+    sk.push_bone(behind);
+
+    let order: Vec<u32> = sk.bones_by_stack_order().iter().map(|b| b.serial).collect();
+    // bottom-most .. front-most:
+    //   main (undefaulted main, group 0)
+    //   behind (explicit -150)
+    //   sign   (auto 0)
+    //   pip    (explicit 100)
+    assert_eq!(order, vec![0x1000, 0x4000, 0x3000, 0x2000]);
+}
+
+#[test]
+fn bones_by_stack_order_explicit_main_altitude_overrides_default() {
+    // §Altitude: "bottom-most unless otherwise defined" — an explicit
+    // Altitude on a main track is authoritative and lifts it off the
+    // bottom.
+    let mut sk = skeleton::Skeleton::new();
+
+    let mut main = FisBone::new(0x10, Rational::new(30, 1));
+    main.set_header("Role", "video/main");
+    main.set_header("Altitude", "50"); // otherwise defined → not bottom
+    sk.push_bone(main);
+
+    let mut other = FisBone::new(0x20, Rational::new(30, 1));
+    other.set_header("Role", "video/alternate"); // auto 0
+    sk.push_bone(other);
+
+    let order: Vec<u32> = sk.bones_by_stack_order().iter().map(|b| b.serial).collect();
+    // other (0) is now behind the explicitly-altituded main (50).
+    assert_eq!(order, vec![0x20, 0x10]);
+}
+
+#[test]
+fn bones_by_stack_order_is_stable_on_equal_altitude() {
+    // Ties retain BOS declaration order (a stable sort), matching the
+    // §"Track order" addressing semantics.
+    let mut sk = skeleton::Skeleton::new();
+    for serial in [0xA, 0xB, 0xC] {
+        let mut b = FisBone::new(serial, Rational::new(30, 1));
+        b.set_header("Role", "video/alternate"); // all auto-0
+        sk.push_bone(b);
+    }
+    let order: Vec<u32> = sk.bones_by_stack_order().iter().map(|b| b.serial).collect();
+    assert_eq!(order, vec![0xA, 0xB, 0xC]);
+}
+
+#[test]
+fn bones_by_stack_order_treats_malformed_altitude_as_default() {
+    // A present-but-malformed Altitude (FisBone::altitude → Some(Err))
+    // falls back to the default rule rather than failing the query: a
+    // main track with a garbage altitude still sinks to the bottom.
+    let mut sk = skeleton::Skeleton::new();
+
+    let mut main = FisBone::new(0x1, Rational::new(30, 1));
+    main.set_header("Role", "video/main");
+    main.set_header("Altitude", "not-a-number");
+    sk.push_bone(main);
+
+    let mut over = FisBone::new(0x2, Rational::new(30, 1));
+    over.set_header("Role", "video/alternate"); // auto 0
+    sk.push_bone(over);
+
+    let order: Vec<u32> = sk.bones_by_stack_order().iter().map(|b| b.serial).collect();
+    assert_eq!(order, vec![0x1, 0x2]);
+}
+
+#[test]
 fn track_addressing_works_through_full_demux() {
     // End-to-end: the addressing helpers resolve against a Skeleton
     // parsed from on-wire bytes, not only one built via push_bone.

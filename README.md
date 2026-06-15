@@ -718,6 +718,34 @@ Spec reference:
 `docs/container/ogg/ogg-skeleton-message-headers.wiki` §"Name", §"Role",
 §"Language".
 
+#### Track stack order (`SkeletonHeaders` §"Altitude")
+
+`Skeleton::bones_by_stack_order()` returns every fisbone ordered by its
+**stack order**, bottom-most (drawn first / furthest behind) to front-most
+(drawn last / on top) — the file-level companion to the per-track
+`FisBone::altitude()` accessor and the input a compositor painting a
+multitrack file (PIP overlay, sign-language video on top of the main
+video, a mask) consumes: walk the returned slice front-to-back and paint
+each track in turn. `docs/container/ogg/ogg-skeleton-message-headers.wiki`
+§Altitude defines the field as "the stack order of the tracks ... an
+element with greater stack order is always in front of an element with a
+lower stack order", taking "the same numerical values as the z-index in
+CSS, unlimited negative and positive numbers". The §Altitude default rule
+is honoured: a track with **no** `Altitude` header whose `Role` is a
+`*/main` role (`audio/main` / `video/main`) sorts strictly below every
+other track ("By default, a 'main' track is always displayed bottom-most
+unless otherwise defined"), while any track carrying an explicit `Altitude`
+("otherwise defined") is placed purely by that signed value — even a
+negative one, since the explicit z-index is authoritative — and a non-main
+track with no `Altitude` defaults to the CSS `auto` level of `0`. The sort
+is **stable** so equal-altitude tracks retain BOS declaration order (the
+same ordering the §"Track order" addressing uses), and an `Altitude` header
+that is present but malformed (a non-integer or out-of-`i64`-range value)
+is treated as "no explicit altitude" — dropped to the default rule rather
+than failing the whole query, matching the skip-malformed tolerance of the
+other `Skeleton`-level resolvers. Spec reference:
+`docs/container/ogg/ogg-skeleton-message-headers.wiki` §"Altitude".
+
 ### Page-loss detection (RFC 3533 §6)
 
 Every Ogg page header carries a `page_sequence_number` that "is

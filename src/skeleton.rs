@@ -2570,6 +2570,75 @@ impl Skeleton {
         let presentation = self.presentation_seconds()?;
         Some(presentation + elapsed)
     }
+
+    /// All fisbones ordered by their **stack order**, from bottom-most
+    /// (drawn first / furthest behind) to front-most (drawn last / on top).
+    ///
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Altitude
+    /// defines the `Altitude` message header as "the stack order of the
+    /// tracks, i.e. which track is displayed further towards the top of the
+    /// stack and which further down", taking "the same numerical values as
+    /// the z-index in CSS, unlimited negative and positive numbers", with
+    /// "an element with greater stack order is always in front of an element
+    /// with a lower stack order". This resolver answers the inverse,
+    /// file-level question the per-track [`FisBone::altitude`] accessor sets
+    /// up — "in what order do these tracks stack" — which is what a compositor
+    /// painting a multitrack file (a PIP overlay, a sign-language video on top
+    /// of the main video, a mask) actually consumes: walk the returned slice
+    /// front-to-back and paint each track in turn.
+    ///
+    /// The §Altitude default rule is honoured: "By default, a 'main' track is
+    /// always displayed bottom-most unless otherwise defined." So a track with
+    /// **no** `Altitude` header whose [`FisBone::role`] is a `*/main` role
+    /// (`audio/main` / `video/main`) sorts strictly below every other track;
+    /// any track that *does* carry an explicit `Altitude` ("otherwise
+    /// defined") is placed purely by that signed value, even a negative one,
+    /// because the explicit value is authoritative per the wiki's wording. A
+    /// non-`main` track with no `Altitude` defaults to the CSS z-index `auto`
+    /// level of `0`, sitting at the same level as an explicit `Altitude: 0`.
+    ///
+    /// The sort is **stable**: tracks with the same effective stack order
+    /// retain their BOS declaration order (the same ordering
+    /// [`Self::bones_with_role`] / the §"Track order" addressing use), so a
+    /// caller painting back-to-front gets a deterministic result. Fisbones
+    /// whose `Altitude` header is present but malformed (a non-integer or
+    /// out-of-`i64`-range value — see [`FisBone::altitude`]) are treated as
+    /// "no explicit altitude" for ordering purposes: the field is dropped to
+    /// its default rather than failing the whole query, matching the
+    /// skip-malformed tolerance of the other `Skeleton`-level resolvers.
+    pub fn bones_by_stack_order(&self) -> Vec<&FisBone> {
+        // Effective stack-order key, smaller = further back / bottom-most.
+        //
+        // group 0: an undefaulted `*/main` track — "bottom-most unless
+        //          otherwise defined". Sorts below every group-1 entry
+        //          regardless of value.
+        // group 1: everything with a stack level — an explicit (well-formed)
+        //          `Altitude`, or the CSS `auto` default of 0 for a non-main
+        //          track with no usable `Altitude` header.
+        fn key(bone: &FisBone) -> (u8, i64) {
+            match bone.altitude() {
+                // Explicit, well-formed Altitude: authoritative z-index.
+                Some(Ok(alt)) => (1, alt),
+                // Absent, or present-but-malformed: fall back to the default
+                // rule. A `*/main` role sinks to the bottom; anything else
+                // defaults to the z-index `auto` level of 0.
+                _ => {
+                    let is_main = bone.role().is_some_and(|r| {
+                        r.kind.as_wire().eq_ignore_ascii_case("audio/main")
+                            || r.kind.as_wire().eq_ignore_ascii_case("video/main")
+                    });
+                    if is_main {
+                        (0, 0)
+                    } else {
+                        (1, 0)
+                    }
+                }
+            }
+        }
+        let mut ordered: Vec<&FisBone> = self.bones.iter().collect();
+        ordered.sort_by_key(|b| key(b));
+        ordered
+    }
 }
 
 /// True if `packet` is a Skeleton BOS ident packet (starts with

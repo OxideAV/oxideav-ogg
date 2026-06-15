@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Skeleton::bones_by_stack_order`** — file-level resolver that returns
+  every fisbone ordered by its stack order, bottom-most (drawn first /
+  furthest behind) to front-most (drawn last / on top), per
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Altitude ("the
+  stack order of the tracks ... an element with greater stack order is
+  always in front of an element with a lower stack order"). This is the
+  file-level companion to the per-track `FisBone::altitude()` accessor and
+  the natural input to a compositor painting a multitrack file (PIP overlay,
+  sign-language video, mask). The §Altitude default rule is honoured: a
+  track with no `Altitude` header whose `Role` is `*/main` sorts strictly
+  below every other track ("By default, a 'main' track is always displayed
+  bottom-most unless otherwise defined"), while any track carrying an
+  explicit `Altitude` is placed purely by that signed z-index value
+  ("otherwise defined"), even a negative one; a non-main track with no
+  `Altitude` defaults to the CSS `auto` level of `0`. The sort is **stable**
+  so equal-altitude tracks retain BOS declaration order, and a
+  present-but-malformed `Altitude` value falls back to the default rule
+  rather than failing the query (the skip-malformed tolerance the other
+  `Skeleton`-level resolvers use).
+
 ## [0.1.6](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.5...v0.1.6) - 2026-06-15
 
 ### Other
