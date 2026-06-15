@@ -898,32 +898,14 @@ no `docs/` fixtures or external `.ogg` files are read. Scenarios:
   size 255×255 page (~65 KiB).
 - `page/parse/{short,multi_segment,max}` and
   `page/to_bytes/{short,multi_segment,max}` — the parse ↔ serialize
-  pair at the three legal-extreme sizes. `parse` validates the CRC
-  by streaming through `crc::compute_page_checksum` over the
-  borrowed page bytes (with the field at offset 22..26 treated as
-  zero per RFC 3533 §6 field 7) rather than cloning the page into a
-  scratch `Vec<u8>` so the four CRC bytes can be filled with zeros
-  before re-checksumming; the allocation+memcpy was on the hot path
-  of every `next_packet`, and for a max-size 65 KiB page it was a
-  full second copy of the page body. r172 took `page/parse/max`
-  from ~411 MiB/s to ~493 MiB/s, `page/parse/multi_segment` from
-  ~426 MiB/s to ~488 MiB/s, and `page/parse/short` from ~416 MiB/s
-  to ~489 MiB/s. r192 then replaced the byte-at-a-time CRC loop
-  with a **slice-by-4** advancement that consumes four input bytes
-  per iteration through four pre-shifted tables (the underlying
-  generator polynomial 0x04C11DB7 is unchanged; tables `T1..T3` are
-  each derived from `T0` by one extra zero-byte rank in the same
-  recurrence the scalar loop already used), and replaced the
-  per-byte `(22..26).contains(&i)` range check inside
-  `compute_page_checksum` with a straight-line three-segment split
-  (`[..22]`, four-zero CRC-field substitute, `[26..]`). Combined,
-  r192 takes `page/parse/max` from ~493 MiB/s to ~1.2-1.4 GiB/s
-  (~2.5-3× on top of r172), `page/parse/multi_segment` to
-  ~1.2 GiB/s, and `page/parse/short` to ~1.3 GiB/s. The recurrence
-  and the
-  rank-table derivations are pinned in unit tests against a
-  verbatim scalar oracle on lengths 0..65 535 so a future tweak that
-  miscomputes a table is caught at the lib-test stage.
+  pair at the three legal-extreme sizes. `parse` validates the CRC by
+  streaming through `crc::compute_page_checksum` over the borrowed page
+  bytes (field at offset 22..26 treated as zero per RFC 3533 §6 field 7)
+  rather than cloning the page into a scratch buffer. The checksum loop
+  is a slice-by-4 advancement (four input bytes per iteration through
+  four pre-shifted tables derived from the 0x04C11DB7 generator
+  polynomial); the table derivations are pinned in unit tests against a
+  verbatim scalar oracle on lengths 0..65 535.
 - `page/lace/{short,exact_255,large}` — the segment-table builder,
   with the exact-multiple-of-255 zero-terminator branch covered.
 - `demux/walk/vorbis_12pkt` — open + drain a 12-packet synthetic
