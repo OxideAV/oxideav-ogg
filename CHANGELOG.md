@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.5...v0.1.6) - 2026-06-15
+
+### Other
+
+- preroll-aware seek (Skeleton 4.0 fisbone preroll field)
+- typed UTC accessor on FisHead (Skeleton fishead granule-0 wall-clock anchor)
+- Skeleton-level track addressing by name / role / language
+- substream / cut-in time mapping (basegranule + presentation time)
+- granulepos->playback-time mapping (extract_granules / granule_to_seconds)
+- build Skeleton 4.0 keyframe index packets while muxing (open_with_skeleton_indexed)
+- backfill Skeleton 4.0 fishead segment-length + content-byte-offset at trailer; drain header pages before Skeleton EOS
+- Skeleton Track-order addressing (track_order_len/serial/index)
+- typed Name accessor on FisBone (Skeleton-4 XML-NCName-shaped track identifier)
+- typed Title accessor on FisBone (Skeleton-4 free-text track description)
+- typed Content-Type accessor on FisBone (Skeleton-4 mandatory message header)
+- typed Display-hint accessor on FisBone (Skeleton-4 rendering-hint header)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- typed Altitude accessor on FisBone (Skeleton-4 stack-order header)
+- typed Role + Language accessors on FisBone (Skeleton-4 message headers)
+- typed time-domain accessors on SkelIndex (keypoint_for_time + seconds wrappers)
+- Skeleton-aware open_with_skeleton emits fishead BOS + fisbones + EOS
+- Theora seek_to via Skeleton fisbone granuleshift + granule_rate
+- Skeleton 4.0 multi-stream keyframe-index minimisation in seek_to
+- gate Skeleton 4.0 index fast-path on per-spec validity checks
+- fuzz parsers + bound SkelIndex allocation by remaining payload
+- Skeleton 4.0 index-accelerated seek_to (no bisection, no full-file scan)
+
 ### Added
 
 - **Preroll-aware seek: `OggDemuxer::seek_to_with_preroll` +
