@@ -645,6 +645,36 @@ performed against the *winning* stream's serial — the page at the
 chosen offset must belong to that stream, not necessarily the
 originally-requested one.
 
+The two cross-stream algorithms the §"Keyframe indexes for faster
+seeking" section defines are also exposed as reusable methods on the
+parsed `Skeleton` (alongside the public `read_vbi_u64` / `write_vbi_u64`
+codec) so external seek tooling can run them without re-implementing the
+demuxer's internal seek path:
+
+- `Skeleton::indexed_duration_seconds()` returns the indexed segment's
+  total duration without decoding any content — the spec's "you can
+  calculate the duration as the end time of the last active stream minus
+  the start time of first active stream". It takes the minimum
+  first-sample time and the maximum last-sample time across every index
+  whose `timestamp_denominator` is known (non-zero), combined on a common
+  seconds axis so indexes with differing denominators (a 1/48000 audio
+  track alongside a 1/1000 video track) mix correctly. An index with an
+  unknown (zero) denominator contributes neither endpoint; with no usable
+  index (Skeleton 3.0, an index-free 4.0 stream) it returns `None`. This
+  is the file-level companion to the per-index
+  `SkelIndex::duration_seconds`.
+- `Skeleton::seek_offset_for_time(target_seconds)` returns the byte
+  offset a multi-stream seek should jump to: for each index with a known
+  denominator it takes that stream's last keypoint at or before the
+  target (`SkelIndex::keypoint_for_time`), then returns the smallest
+  `KeyPoint::offset` across that set — so decoding from there up to the
+  target passes a keyframe at or before the target on every concurrently
+  active stream. Returns `None` when the target precedes every stream's
+  first keypoint or no usable index exists, so the caller falls back to
+  bisection per the spec's graceful-fallback rule. This is the same
+  minimisation `Demuxer::seek_to` performs internally, surfaced for
+  callers driving a seek against a parsed `Skeleton` directly.
+
 Spec reference: `docs/container/ogg/ogg-skeleton-3.0.md`,
 `docs/container/ogg/ogg-skeleton-4.0.md`,
 `docs/container/ogg/ogg-skeleton-message-headers.wiki`. The 4.0 page

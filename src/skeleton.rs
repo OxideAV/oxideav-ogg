@@ -2639,6 +2639,92 @@ impl Skeleton {
         ordered.sort_by_key(|b| key(b));
         ordered
     }
+
+    /// Total playback duration of an indexed Ogg segment, computed
+    /// entirely from the Skeleton 4.0 `index\0` packets without decoding
+    /// any content.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
+    /// faster seeking" spells this out: each index "stores the timestamps
+    /// of the first and last samples in its track. This also allows you to
+    /// determine the duration of the indexed Ogg media without having to
+    /// decode the start and end of the Ogg segment to calculate the
+    /// difference (which is the duration). With the index packets storing
+    /// the start and end times of every track, you can calculate the
+    /// duration as the end time of the last active stream minus the start
+    /// time of first active stream."
+    ///
+    /// This is the file-level cross-stream companion to the per-index
+    /// [`SkelIndex::duration_seconds`]: it takes the **minimum** first-sample
+    /// time and the **maximum** last-sample time across every index whose
+    /// `timestamp_denominator` is known (non-zero — the spec's "value was
+    /// unable to be determined at indexing time, and is unknown" case is
+    /// skipped), and returns `max_last - min_first`. An index with an
+    /// unknown denominator contributes neither endpoint; if no index has a
+    /// known denominator (Skeleton 3.0, an index-free 4.0 stream, or every
+    /// denominator zero) the duration is unknown and the method returns
+    /// `None`.
+    ///
+    /// The comparison is performed in seconds via
+    /// [`SkelIndex::first_sample_seconds`] / [`SkelIndex::last_sample_seconds`]
+    /// so indexes with different `timestamp_denominator`s in the same file
+    /// (e.g. a 1/48000 audio track alongside a 1/1000 video track) are
+    /// combined on a common time axis.
+    pub fn indexed_duration_seconds(&self) -> Option<f64> {
+        let mut min_first: Option<f64> = None;
+        let mut max_last: Option<f64> = None;
+        for idx in &self.indexes {
+            if let Some(first) = idx.first_sample_seconds() {
+                min_first = Some(min_first.map_or(first, |m: f64| m.min(first)));
+            }
+            if let Some(last) = idx.last_sample_seconds() {
+                max_last = Some(max_last.map_or(last, |m: f64| m.max(last)));
+            }
+        }
+        Some(max_last? - min_first?)
+    }
+
+    /// Resolve a seek target time to the byte offset a multi-stream
+    /// Skeleton-4.0-indexed Ogg seek should jump to, per the algorithm in
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
+    /// faster seeking": "first construct the set which contains every
+    /// active streams' last keypoint which has time less than or equal to
+    /// the seek target time. This tells you a known point on every stream
+    /// which lies before the seek target. Then from that set of key points,
+    /// select the key point with the smallest byte offset."
+    ///
+    /// Landing on that smallest offset guarantees that decoding from there
+    /// up to the target passes a keyframe at or before the target on *every*
+    /// concurrently-active stream — a naive single-stream lookup would land
+    /// past another stream's required keyframe and leave that decoder unable
+    /// to recover.
+    ///
+    /// For each index whose `timestamp_denominator` is known (non-zero), the
+    /// per-stream "last keypoint at or before `target_seconds`" answer comes
+    /// from [`SkelIndex::keypoint_for_time`]; this method then returns the
+    /// minimum [`KeyPoint::offset`] across those per-stream answers. The
+    /// returned offset is relative to the start of the Ogg segment, exactly
+    /// the convention the keypoint offsets use. Returns `None` when no index
+    /// has a keypoint at or before the target (the target precedes every
+    /// stream's first keypoint), or when there are no usable indexes at all
+    /// — the caller must then fall back to a bisection search per the spec's
+    /// "you must gracefully fall-back" requirement.
+    ///
+    /// This is the file-level resolver the demuxer's index-accelerated
+    /// `seek_to` uses internally; it is exposed so external seek tooling
+    /// working against a parsed [`Skeleton`] can run the same minimisation
+    /// without re-implementing it.
+    pub fn seek_offset_for_time(&self, target_seconds: f64) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        for idx in &self.indexes {
+            if let Some(kp_index) = idx.keypoint_for_time(target_seconds) {
+                if let Some(kp) = idx.keypoints.get(kp_index) {
+                    best = Some(best.map_or(kp.offset, |b: u64| b.min(kp.offset)));
+                }
+            }
+        }
+        best
+    }
 }
 
 /// True if `packet` is a Skeleton BOS ident packet (starts with
@@ -4706,5 +4792,127 @@ mod tests {
             .substream_granule_to_seconds(0x1234, 96_000)
             .expect("usable");
         assert!((s - 2.0).abs() < 1e-9, "got {s}");
+    }
+
+    // ---- file-level Skeleton 4.0 indexed-seek helpers ----
+
+    #[test]
+    fn skeleton_indexed_duration_single_index() {
+        // §"Keyframe indexes for faster seeking": duration = last - first.
+        let mut sk = Skeleton::new();
+        let mut idx = SkelIndex::new(0x2A, 1_000_000);
+        idx.first_sample_time = 0;
+        idx.last_sample_time = 60_000_000; // 60 s
+        sk.push_index(idx);
+        let d = sk.indexed_duration_seconds().expect("known");
+        assert!((d - 60.0).abs() < 1e-9, "got {d}");
+    }
+
+    #[test]
+    fn skeleton_indexed_duration_cross_stream_min_first_max_last() {
+        // Two streams with different denominators and offset start/end
+        // times. Spec: "the end time of the last active stream minus the
+        // start time of first active stream." So min(first) over all, and
+        // max(last) over all, combined on a common (seconds) axis.
+        let mut sk = Skeleton::new();
+        // Audio: 1/48000 axis, samples 0 .. 48000*70 (0 s .. 70 s).
+        let mut audio = SkelIndex::new(1, 48_000);
+        audio.first_sample_time = 0;
+        audio.last_sample_time = 48_000 * 70;
+        sk.push_index(audio);
+        // Video: 1/1000 axis, samples 2000 .. 65000 (2 s .. 65 s).
+        let mut video = SkelIndex::new(2, 1_000);
+        video.first_sample_time = 2_000;
+        video.last_sample_time = 65_000;
+        sk.push_index(video);
+        // min first = 0 s (audio), max last = 70 s (audio) -> 70 s.
+        let d = sk.indexed_duration_seconds().expect("known");
+        assert!((d - 70.0).abs() < 1e-9, "got {d}");
+    }
+
+    #[test]
+    fn skeleton_indexed_duration_skips_unknown_denominator() {
+        // An index whose denominator is 0 ("unable to be determined at
+        // indexing time, and is unknown") contributes neither endpoint.
+        let mut sk = Skeleton::new();
+        let mut unknown = SkelIndex::new(1, 0);
+        unknown.first_sample_time = 999;
+        unknown.last_sample_time = 999_999;
+        sk.push_index(unknown);
+        // No usable index at all -> None.
+        assert_eq!(sk.indexed_duration_seconds(), None);
+        // Add one known index alongside it: the known one drives the result,
+        // the unknown is ignored.
+        let mut known = SkelIndex::new(2, 1_000);
+        known.first_sample_time = 1_000; // 1 s
+        known.last_sample_time = 11_000; // 11 s
+        sk.push_index(known);
+        let d = sk.indexed_duration_seconds().expect("known");
+        assert!((d - 10.0).abs() < 1e-9, "got {d}");
+    }
+
+    #[test]
+    fn skeleton_indexed_duration_none_without_indexes() {
+        // Skeleton 3.0 / index-free 4.0: no indexes -> duration unknown.
+        let sk = Skeleton::new();
+        assert_eq!(sk.indexed_duration_seconds(), None);
+    }
+
+    #[test]
+    fn skeleton_seek_offset_multi_stream_min_offset_wins() {
+        // §"Keyframe indexes for faster seeking": construct each stream's
+        // last keypoint at-or-before the target, then take the SMALLEST
+        // byte offset across that set.
+        let mut sk = Skeleton::new();
+        // Stream A (1 MHz): keypoints at t=0 (off 4000), t=2 s (off 9000),
+        // t=4 s (off 20000).
+        let mut a = SkelIndex::new(1, 1_000_000);
+        a.push(4_000, 0);
+        a.push(9_000, 2_000_000);
+        a.push(20_000, 4_000_000);
+        sk.push_index(a);
+        // Stream B (1 MHz): keypoints at t=0 (off 5000), t=3 s (off 7000).
+        let mut b = SkelIndex::new(2, 1_000_000);
+        b.push(5_000, 0);
+        b.push(7_000, 3_000_000);
+        sk.push_index(b);
+        // Target 3.5 s: A's last keypoint <= 3.5 s is t=2 s (off 9000);
+        // B's is t=3 s (off 7000). Min offset = 7000 (B), so seeking there
+        // is guaranteed to precede a keyframe on BOTH streams.
+        assert_eq!(sk.seek_offset_for_time(3.5), Some(7_000));
+        // Target 0.5 s: both stream floors are their t=0 keypoint
+        // (off 4000 / 5000). Min = 4000.
+        assert_eq!(sk.seek_offset_for_time(0.5), Some(4_000));
+    }
+
+    #[test]
+    fn skeleton_seek_offset_before_all_keypoints_is_none() {
+        // A target before every stream's first keypoint -> no floor on any
+        // stream -> None (caller must fall back to bisection).
+        let mut sk = Skeleton::new();
+        let mut a = SkelIndex::new(1, 1_000);
+        a.push(4_000, 1_000); // first keypoint at t=1 s
+        a.push(9_000, 2_000);
+        sk.push_index(a);
+        assert_eq!(sk.seek_offset_for_time(0.5), None);
+        // No indexes at all -> None.
+        let empty = Skeleton::new();
+        assert_eq!(empty.seek_offset_for_time(1.0), None);
+    }
+
+    #[test]
+    fn skeleton_seek_offset_skips_unknown_denominator_index() {
+        // An index with denominator 0 cannot contribute a time-keyed floor;
+        // the usable index drives the answer.
+        let mut sk = Skeleton::new();
+        let mut unknown = SkelIndex::new(1, 0);
+        unknown.push(100, 0);
+        sk.push_index(unknown);
+        let mut known = SkelIndex::new(2, 1_000);
+        known.push(8_000, 0);
+        known.push(12_000, 5_000); // t=5 s
+        sk.push_index(known);
+        // Target 6 s -> known's last floor is t=5 s (off 12000).
+        assert_eq!(sk.seek_offset_for_time(6.0), Some(12_000));
     }
 }

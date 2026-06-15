@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Skeleton::indexed_duration_seconds` + `Skeleton::seek_offset_for_time`** —
+  two file-level Skeleton 4.0 index helpers that lift the cross-stream
+  algorithms of `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes
+  for faster seeking" out of the demuxer's internal `seek_to` and into
+  reusable methods on the parsed `Skeleton` (the same audience the public
+  `read_vbi_u64` / `write_vbi_u64` helpers serve — external seek tooling
+  working against a parsed Skeleton).
+  - `indexed_duration_seconds()` computes the indexed segment's total
+    duration without decoding content: the spec says each `index\0` "stores
+    the timestamps of the first and last samples in its track ... you can
+    calculate the duration as the end time of the last active stream minus
+    the start time of first active stream." The method takes the **minimum**
+    first-sample time and the **maximum** last-sample time across every index
+    whose `timestamp_denominator` is known (non-zero), combined on a common
+    seconds axis so indexes with differing denominators (e.g. a 1/48000 audio
+    track alongside a 1/1000 video track) mix correctly. An index with an
+    unknown (zero) denominator — the spec's "value was unable to be determined
+    at indexing time, and is unknown" case — contributes neither endpoint;
+    when no index has a known denominator (Skeleton 3.0, an index-free 4.0
+    stream) it returns `None`. File-level companion to the per-index
+    `SkelIndex::duration_seconds`.
+  - `seek_offset_for_time(target_seconds)` runs the per-spec multi-stream
+    minimisation: "first construct the set which contains every active
+    streams' last keypoint which has time less than or equal to the seek
+    target time ... Then from that set of key points, select the key point
+    with the smallest byte offset." For each index with a known denominator
+    it takes the per-stream "last keypoint at or before the target" via
+    `SkelIndex::keypoint_for_time`, then returns the minimum `KeyPoint::offset`
+    across that set — the offset a multi-stream seek should jump to so that
+    decoding up to the target passes a keyframe at or before the target on
+    *every* concurrently-active stream (a naive single-stream lookup would
+    land past another stream's required keyframe). Returns `None` when the
+    target precedes every stream's first keypoint or there are no usable
+    indexes, so the caller falls back to bisection per the spec's "you must
+    gracefully fall-back" rule.
+  7 new lib unit tests cover the single-index duration, the cross-stream
+  min-first / max-last duration with differing denominators, the
+  unknown-denominator skip, the no-index `None`, the multi-stream
+  smallest-offset selection, the before-all-keypoints / no-index `None`, and
+  the unknown-denominator-index skip in the offset resolver.
+
 - **`Skeleton::bones_by_stack_order`** — file-level resolver that returns
   every fisbone ordered by its stack order, bottom-most (drawn first /
   furthest behind) to front-most (drawn last / on top), per
