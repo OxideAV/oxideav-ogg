@@ -9,8 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Preroll-aware seek: `OggDemuxer::seek_to_with_preroll` +
+  `preroll_seek_count` / `input_position`.** Consumes the per-track
+  **preroll** field that `docs/container/ogg/ogg-skeleton-4.0.md` §"How
+  to describe the logical bitstreams within an Ogg container?" defines as
+  "the number of past content packets to take into account when decoding
+  the current Ogg page, which is necessary for seeking (vorbis has
+  generally 2, speex 3)". The field was already parsed and round-tripped
+  on `FisBone` but never used by the demuxer. A bare `seek_to` lands on
+  the floor page for the target granule; a codec with inter-packet state
+  (window overlap, prediction) resuming there is missing its preroll
+  warm-up packets and produces wrong output for the first packets.
+  `seek_to_with_preroll(stream_index, pts)` runs the same landing as
+  `seek_to`, then rewinds the resume byte offset to an earlier page
+  boundary so at least `preroll` content packets of the requested stream
+  precede the landed page. The preroll comes from the stream's Skeleton
+  `fisbone\0` (looked up by on-wire serial); the codec's `num_headers`
+  identification/comment/setup packets (`fisbone` bytes 16..20) are
+  excluded so only *content* packets are counted, and the count is taken
+  in packets — a page carrying several terminated packets contributes all
+  of them. The returned granule is identical to `seek_to`'s (the decode
+  target is unchanged; the earlier pages are warm-up the caller decodes
+  and discards). With no Skeleton, no fisbone for the stream, a `preroll`
+  of 0, or a landing already at the stream's first content page, the call
+  is identical to `seek_to`. `preroll_seek_count()` tallies the calls
+  that actually moved the offset earlier; `input_position()` returns the
+  current resume byte offset for callers comparing the two seek variants.
+  7 integration tests in `tests/seek_preroll.rs` cover the
+  back-up-two-pages case, the multi-packet-page packet-level count, the
+  clamp-to-first-content-page case, the no-op cases (preroll 0, no
+  Skeleton, first content page), and the bare-`seek_to` baseline.
+
 - **Typed `fishead` UTC accessor: `FisHead::utc_str` / `FisHead::utc_time`
   + the `Utc` value type.** The Skeleton `fishead` ident packet carries a
+  20-byte UTC slot (bytes 44..63) that
   20-byte UTC slot (bytes 44..63) that
   `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
   information is needed?" defines as the granule-0 → real-world-clock-time

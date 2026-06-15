@@ -329,6 +329,17 @@ pub struct OggDemuxer {
     /// * `Some(false)` — segment-length mismatches the file, the spec
     ///   says the index is invalid; fast path is skipped.
     skeleton_segment_length_ok: Option<bool>,
+    /// Number of [`OggDemuxer::seek_to_with_preroll`] calls that actually
+    /// backed the resume offset up to honour a non-zero per-track preroll
+    /// (`docs/container/ogg/ogg-skeleton-4.0.md` §"How to describe the
+    /// logical bitstreams within an Ogg container?": "the preroll: the
+    /// number of past content packets to take into account when decoding
+    /// the current Ogg page, which is necessary for seeking"). Stays at 0
+    /// when no Skeleton fisbone records a preroll for the requested
+    /// stream, when the recorded preroll is 0, or when the landed page is
+    /// already the stream's first content page (no earlier page to back
+    /// up to). Surfaced via [`OggDemuxer::preroll_seek_count`].
+    preroll_seeks: u64,
 }
 
 impl OggDemuxer {
@@ -357,6 +368,7 @@ impl OggDemuxer {
             skeleton_index_seeks: 0,
             skeleton_index_rejects: 0,
             skeleton_segment_length_ok: None,
+            preroll_seeks: 0,
         }
     }
 
@@ -905,6 +917,257 @@ impl OggDemuxer {
     /// has been internally consistent with its file.
     pub fn skeleton_index_invalid_count(&self) -> u64 {
         self.skeleton_index_rejects
+    }
+
+    /// Number of [`OggDemuxer::seek_to_with_preroll`] calls that actually
+    /// backed the resume offset up by at least one page to satisfy a
+    /// non-zero per-track preroll.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"How to describe the
+    /// logical bitstreams within an Ogg container?" defines the fisbone
+    /// **preroll** field as "the number of past content packets to take
+    /// into account when decoding the current Ogg page, which is necessary
+    /// for seeking (vorbis has generally 2, speex 3)". The counter stays
+    /// at 0 when no fisbone records a preroll for the requested stream,
+    /// when the recorded preroll is 0, or when the landed page is already
+    /// at or near the stream's first content page so there is no earlier
+    /// page to back up to. Each call that does move the resume offset
+    /// earlier counts once, regardless of how many pages it walked back.
+    pub fn preroll_seek_count(&self) -> u64 {
+        self.preroll_seeks
+    }
+
+    /// Current byte position of the underlying input.
+    ///
+    /// After a [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to) or
+    /// [`OggDemuxer::seek_to_with_preroll`] call this is the page boundary
+    /// the next [`Demuxer::next_packet`](oxideav_core::Demuxer::next_packet)
+    /// read resumes from, so callers (and a preroll-aware caller comparing
+    /// the two seek variants) can observe where the resume offset landed.
+    pub fn input_position(&mut self) -> Result<u64> {
+        Ok(self.input.stream_position()?)
+    }
+
+    /// Seek as [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to) does,
+    /// then move the resume byte offset earlier so that a decoder reading
+    /// forward from it sees at least `preroll` content packets of the
+    /// requested stream **before** the page `seek_to` would have landed on.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"How to describe the
+    /// logical bitstreams within an Ogg container?" specifies a per-track
+    /// **preroll**: "the number of past content packets to take into
+    /// account when decoding the current Ogg page, which is necessary for
+    /// seeking (vorbis has generally 2, speex 3)". A decoder that resumes
+    /// exactly on the landed page is missing that warm-up context; codecs
+    /// with inter-packet state (window overlap, prediction) therefore
+    /// produce incorrect output for the first packets after a bare
+    /// `seek_to`. This method consumes the preroll the stream's Skeleton
+    /// fisbone declares (looked up by the stream's on-wire serial via
+    /// [`Skeleton::bone_for_serial`](crate::skeleton::Skeleton::bone_for_serial))
+    /// and rewinds to an earlier page boundary so those packets are
+    /// available.
+    ///
+    /// The returned granule is identical to what [`Demuxer::seek_to`]
+    /// would return — the *decode target* is unchanged; the earlier
+    /// pages are warm-up the caller is expected to decode and discard
+    /// (the spec's "take into account when decoding" packets) until it
+    /// reaches the target granule.
+    ///
+    /// Behaves exactly like `seek_to` (same input position, same return
+    /// value) when:
+    ///   * the file has no Skeleton, or no fisbone for this stream's
+    ///     serial;
+    ///   * the fisbone's `preroll` is 0 (the audio mappings without
+    ///     inter-packet warm-up, and the common encoder default); or
+    ///   * the landed page is already the stream's first content page (or
+    ///     within fewer than `preroll` content packets of it), so there
+    ///     is no earlier page to back up to.
+    pub fn seek_to_with_preroll(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        // Resolve the serial first so we can read the preroll before the
+        // seek perturbs any state.
+        let wanted_serial = self.serial_for_stream(stream_index).ok_or_else(|| {
+            Error::unsupported(format!("Ogg: no logical stream for index {stream_index}"))
+        })?;
+        let preroll = self.preroll_for_serial(wanted_serial);
+        let num_headers = self.num_headers_for_serial(wanted_serial);
+
+        // Run the standard seek. This sets the input position to the
+        // landed page boundary, flushes per-stream state, and returns the
+        // landed granule.
+        let landed_granule = self.seek_to(stream_index, pts)?;
+        if preroll == 0 {
+            return Ok(landed_granule);
+        }
+        // After `seek_to`, the input cursor sits at the landed page
+        // boundary; that offset is the target the decoder must reach.
+        let landed_off = self.input.stream_position()?;
+        if landed_off == 0 {
+            // Already at the very start of the file — no earlier page.
+            return Ok(landed_granule);
+        }
+
+        // Collect every page of the requested stream that starts strictly
+        // before the landed offset, in file order, alongside the number
+        // of content packets each page terminates. The resume page is the
+        // earliest page such that the content-packet count from it (up to,
+        // but excluding, the landed page) is at least `preroll`.
+        // `collect_stream_pages_until` walks the input forward and leaves
+        // the cursor mid-file, so every no-back-up path below must restore
+        // the cursor to `landed_off` (the page `seek_to` chose) before
+        // returning — otherwise the next `next_packet` would resume from a
+        // stale position.
+        let pages = self.collect_stream_pages_until(wanted_serial, landed_off, num_headers)?;
+        if pages.is_empty() {
+            // No earlier content page of this stream — `seek_to`'s
+            // landing stands.
+            self.input.seek(SeekFrom::Start(landed_off))?;
+            return Ok(landed_granule);
+        }
+        let mut acc: u64 = 0;
+        let mut resume_off = pages.last().map(|&(off, _)| off).unwrap_or(landed_off);
+        for &(off, terminated) in pages.iter().rev() {
+            resume_off = off;
+            acc = acc.saturating_add(terminated as u64);
+            if acc >= preroll as u64 {
+                break;
+            }
+        }
+
+        if resume_off >= landed_off {
+            // Nothing earlier to move to (shouldn't happen given the
+            // strict-`<` collection, but keep the contract defensive).
+            self.input.seek(SeekFrom::Start(landed_off))?;
+            return Ok(landed_granule);
+        }
+
+        // Re-seek to the earlier resume page and re-flush demuxer state so
+        // forward reads start cleanly from the preroll pages.
+        self.input.seek(SeekFrom::Start(resume_off))?;
+        self.page_queue.clear();
+        self.out_queue.clear();
+        for state in self.state_by_serial.values_mut() {
+            state.pending.clear();
+            state.granule_seen = 0;
+        }
+        self.eof_reached = false;
+        self.preroll_seeks = self.preroll_seeks.saturating_add(1);
+        Ok(landed_granule)
+    }
+
+    /// Look up the requested stream's on-wire serial number.
+    fn serial_for_stream(&self, stream_index: u32) -> Option<u32> {
+        for (serial, state) in &self.state_by_serial {
+            if self.streams[state.public_index].index == stream_index {
+                return Some(*serial);
+            }
+        }
+        None
+    }
+
+    /// Per-track preroll for `serial`, read from its Skeleton fisbone.
+    /// Returns 0 when there is no Skeleton, no fisbone for the serial, or
+    /// the fisbone records preroll 0 — every "behave like `seek_to`" path.
+    fn preroll_for_serial(&self, serial: u32) -> u32 {
+        self.skeleton
+            .as_ref()
+            .and_then(|s| s.bone_for_serial(serial))
+            .map(|b| b.preroll)
+            .unwrap_or(0)
+    }
+
+    /// Per-track header-packet count for `serial`, read from its Skeleton
+    /// fisbone (`Number of header packets`, bytes 16..20 of `fisbone\0`).
+    /// Returns 0 when there is no Skeleton or no fisbone for the serial.
+    /// Used to exclude the codec's identification / comment / setup
+    /// header packets from the preroll content-packet count — the spec's
+    /// preroll counts "past *content* packets", not headers.
+    fn num_headers_for_serial(&self, serial: u32) -> u32 {
+        self.skeleton
+            .as_ref()
+            .and_then(|s| s.bone_for_serial(serial))
+            .map(|b| b.num_headers)
+            .unwrap_or(0)
+    }
+
+    /// Walk pages of `serial` from the start of the file up to (but not
+    /// including) `until_off`, returning each *content* page's `(offset,
+    /// terminated_packet_count)` in file order.
+    ///
+    /// `terminated_packet_count` is the number of packets that *end* on
+    /// the page (a trailing 255-lacing partial that continues into the
+    /// next page is not counted as terminated here) — the unit the spec's
+    /// preroll field is measured in ("past content packets"). The first
+    /// `skip_headers` terminated packets of the stream are the codec's
+    /// header packets (id / comment / setup); pages are not collected
+    /// until that many packets have terminated, and a page straddling the
+    /// header→content boundary contributes only its content packets.
+    /// Pages whose serial differs, or whose offset is `>= until_off`, are
+    /// skipped. The scan reads only page headers + segment tables, never
+    /// page bodies.
+    fn collect_stream_pages_until(
+        &mut self,
+        serial: u32,
+        until_off: u64,
+        skip_headers: u32,
+    ) -> Result<Vec<(u64, u32)>> {
+        let mut out: Vec<(u64, u32)> = Vec::new();
+        // Number of this stream's terminated packets consumed so far, used
+        // to step past the `skip_headers` header packets.
+        let mut packets_seen: u32 = 0;
+        let mut cursor: u64 = 0;
+        while cursor < until_off {
+            self.input.seek(SeekFrom::Start(cursor))?;
+            let mut hdr = [0u8; 27];
+            let mut filled = 0usize;
+            while filled < 27 {
+                match self.input.read(&mut hdr[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if filled < 27 || hdr[0..4] != page::CAPTURE_PATTERN {
+                break;
+            }
+            let page_serial = u32::from_le_bytes([hdr[14], hdr[15], hdr[16], hdr[17]]);
+            let n_segs = hdr[26] as usize;
+            let mut lacing = vec![0u8; n_segs];
+            let mut lfilled = 0usize;
+            while lfilled < n_segs {
+                match self.input.read(&mut lacing[lfilled..]) {
+                    Ok(0) => break,
+                    Ok(n) => lfilled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if lfilled < n_segs {
+                break;
+            }
+            let data_len: u64 = lacing.iter().map(|&v| v as u64).sum();
+            // A packet terminates on this page for every lacing segment
+            // < 255 (the same rule `Page::packet_segments` uses).
+            let terminated = lacing.iter().filter(|&&v| v < 255).count() as u32;
+            if page_serial == serial {
+                // Skip the codec's header packets so only *content*
+                // packets feed the preroll count.
+                let before = packets_seen;
+                packets_seen = packets_seen.saturating_add(terminated);
+                if packets_seen > skip_headers {
+                    // Number of content packets that ended on this page:
+                    // everything past the header threshold.
+                    let content_here = packets_seen - before.max(skip_headers);
+                    out.push((cursor, content_here));
+                }
+            }
+            let next_off = cursor + 27 + n_segs as u64 + data_len;
+            if next_off <= cursor {
+                break;
+            }
+            cursor = next_off;
+        }
+        Ok(out)
     }
 
     /// Lazily validate the Skeleton 4.0 BOS `Segment length in bytes`

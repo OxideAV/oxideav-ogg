@@ -123,6 +123,33 @@ explicitly. Pages with granule `-1` (RFC 3533 §6 "no packets finish
 on this page") are excluded from the index because they carry no
 seek-target information.
 
+#### Preroll-aware seek
+
+`docs/container/ogg/ogg-skeleton-4.0.md` §"How to describe the logical
+bitstreams within an Ogg container?" defines a per-track **preroll**:
+"the number of past content packets to take into account when decoding
+the current Ogg page, which is necessary for seeking (vorbis has
+generally 2, speex 3)". A bare `seek_to` lands the input on the page
+whose granule floors the target, but a codec with inter-packet state
+(window overlap, prediction) produces wrong output for the first
+packets if it resumes exactly there — it is missing the preroll
+warm-up packets. `OggDemuxer::seek_to_with_preroll(stream_index, pts)`
+runs the same landing as `seek_to`, then rewinds the resume byte
+offset to an earlier page boundary so that at least `preroll` content
+packets of the requested stream precede the landed page. The preroll
+count comes from the stream's Skeleton `fisbone\0` (looked up by its
+on-wire serial); the codec's `num_headers` identification / comment /
+setup packets are excluded from the count so only *content* packets
+warm the decoder. The returned granule is identical to `seek_to`'s —
+the decode target is unchanged; the earlier pages are warm-up the
+caller decodes and discards until it reaches the target. With no
+Skeleton, no fisbone for the stream, a `preroll` of 0, or a landing
+already at the stream's first content page, the call is byte-for-byte
+identical to `seek_to`. `OggDemuxer::preroll_seek_count()` tallies the
+calls that actually backed the offset up; `OggDemuxer::input_position()`
+exposes the resume byte offset for callers that want to compare the two
+seek variants.
+
 ### Muxing
 
 The muxer packs incoming packets into pages with a proper CRC32,
