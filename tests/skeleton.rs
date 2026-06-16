@@ -1603,6 +1603,54 @@ fn bones_with_language_matches_any_listed_tag() {
 }
 
 #[test]
+fn bones_with_dominant_language_matches_only_first_tag() {
+    // SkeletonHeaders §Language: "the dominating language specified as the
+    // first language". The dominant-only query matches a track only when
+    // `tag` is its FIRST tag — unlike bones_with_language which matches
+    // anywhere in the list.
+    let sk = multitrack_skeleton();
+
+    // "fr" is the dub's dominant tag ("fr, en") → it matches; the broad
+    // query also matched it, but on the same dominant position here.
+    let fr: Vec<u32> = sk
+        .bones_with_dominant_language("fr")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(fr, vec![0x3000]);
+
+    // "en" is the caption's dominant tag ("en") but only a SECONDARY tag
+    // on the dub ("fr, en"), so the dominant-only query matches the
+    // caption alone — the key distinction from bones_with_language("en"),
+    // which matched both the dub and the caption.
+    let en: Vec<u32> = sk
+        .bones_with_dominant_language("en")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(en, vec![0x4000]);
+    // Contrast: the broad query matches the dub too.
+    let en_any: Vec<u32> = sk
+        .bones_with_language("en")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(en_any, vec![0x3000, 0x4000]);
+
+    // Case-insensitive per BCP 47: "EN-US" matches the main audio's
+    // dominant "en-US".
+    let enus: Vec<u32> = sk
+        .bones_with_dominant_language("EN-US")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(enus, vec![0x2000]);
+
+    // A track with no Language header (main_video) never matches.
+    assert!(sk.bones_with_dominant_language("de").is_empty());
+}
+
+#[test]
 fn bones_by_stack_order_places_main_bottom_and_higher_altitude_front() {
     // SkeletonHeaders §Altitude: "the stack order of the tracks ... an
     // element with greater stack order is always in front of an element

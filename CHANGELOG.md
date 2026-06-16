@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`FisBone::dominant_language` + `Skeleton::bones_with_dominant_language`** —
+  the dominant-only counterpart to the existing `FisBone::languages` /
+  `Skeleton::bones_with_language` pair, implementing the distinguished
+  meaning the wiki gives the first list entry in
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Language ("The
+  Language field will have the dominating language specified as the first
+  language. It is possible to specify less non-dominating languages as a
+  list after the main language."). `FisBone::dominant_language()` returns
+  the first non-empty trimmed tag (`Option<&str>`, `None` when the header
+  is absent or expands to zero tags). `Skeleton::bones_with_dominant_language(tag)`
+  matches a track only when `tag` is its *first* tag — so a `Language: fr, en`
+  dub matches a `"fr"` query but not an `"en"` one — distinguishing "which
+  tracks are *primarily* in this language" (default-track selection) from
+  the broad "which tracks carry any content in this language" (language
+  picker) that `bones_with_language` answers. Case-insensitive per BCP 47
+  §2.1.1.
+
 - **`Skeleton::indexed_duration_seconds` + `Skeleton::seek_offset_for_time`** —
   two file-level Skeleton 4.0 index helpers that lift the cross-stream
   algorithms of `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes

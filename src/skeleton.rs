@@ -1456,6 +1456,33 @@ impl FisBone {
         })
     }
 
+    /// The track's **dominating** language tag per
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Language.
+    ///
+    /// The wiki gives the first list entry a distinguished, normative
+    /// meaning: "The Language field will have the dominating language
+    /// specified as the first language. It is possible to specify less
+    /// non-dominating languages as a list after the main language." For
+    /// the worked example `Language: en-US, fr` the dominating language is
+    /// `en-US`; `fr` is a secondary, non-dominating tag.
+    ///
+    /// This accessor is the dominant-only counterpart to [`languages`]
+    /// (which surfaces the *whole* list): it returns the first non-empty,
+    /// trimmed tag — the language a UI would label the track with, or the
+    /// one a "primary spoken language" picker keys on.
+    ///
+    /// Returns `None` when no `Language` header is present **or** when the
+    /// header is present but expands to zero tags (a blank or
+    /// comma-only value); the latter has no dominating language to name,
+    /// so it collapses to `None` rather than an empty string — consistent
+    /// with [`languages`] returning `Some(vec![])` for the same input
+    /// while there is still no *single* dominant tag to hand back.
+    ///
+    /// [`languages`]: FisBone::languages
+    pub fn dominant_language(&self) -> Option<&str> {
+        self.languages().and_then(|ls| ls.into_iter().next())
+    }
+
     /// Typed `Altitude` accessor.
     ///
     /// Parses the `Altitude` message header per
@@ -2436,6 +2463,39 @@ impl Skeleton {
             .filter(|b| {
                 b.languages()
                     .is_some_and(|ls| ls.iter().any(|l| l.eq_ignore_ascii_case(key)))
+            })
+            .collect()
+    }
+
+    /// All fisbones whose **dominating** `Language` tag is `tag`, in BOS
+    /// declaration order.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Language
+    /// gives the first list entry distinguished meaning — "the dominating
+    /// language specified as the first language" — followed by optional
+    /// non-dominating tags. This query is the dominant-only counterpart to
+    /// [`bones_with_language`]: it matches a track only when `tag` is its
+    /// *first* ([`FisBone::dominant_language`]) tag, so a `Language: fr, en`
+    /// dub matches a `"fr"` query but **not** an `"en"` one — `en` is a
+    /// secondary tag there. The broad [`bones_with_language`] query, by
+    /// contrast, matches `tag` anywhere in the list.
+    ///
+    /// Use this to answer "which tracks are *primarily* in this language"
+    /// (e.g. choosing the default audio track for a user's locale), and
+    /// [`bones_with_language`] to answer "which tracks carry any content in
+    /// this language" (e.g. populating a language picker). Matching is
+    /// case-insensitive per BCP 47 §2.1.1; `tag` is trimmed first. Tracks
+    /// with no `Language` header — or one with no dominating tag — are
+    /// skipped.
+    ///
+    /// [`bones_with_language`]: Skeleton::bones_with_language
+    pub fn bones_with_dominant_language(&self, tag: &str) -> Vec<&FisBone> {
+        let key = tag.trim();
+        self.bones
+            .iter()
+            .filter(|b| {
+                b.dominant_language()
+                    .is_some_and(|l| l.eq_ignore_ascii_case(key))
             })
             .collect()
     }
@@ -3446,6 +3506,43 @@ mod tests {
         // the outer `Option` wrapper.
         let b = bone_with("Language", "");
         assert_eq!(b.languages(), Some(vec![]));
+    }
+
+    #[test]
+    fn dominant_language_returns_first_listed_tag() {
+        // Wiki §Language: "the dominating language specified as the first
+        // language" — for "en-US, fr" the dominant tag is en-US.
+        let b = bone_with("Language", "en-US, fr");
+        assert_eq!(b.dominant_language(), Some("en-US"));
+    }
+
+    #[test]
+    fn dominant_language_single_tag() {
+        let b = bone_with("Language", "de-DE");
+        assert_eq!(b.dominant_language(), Some("de-DE"));
+    }
+
+    #[test]
+    fn dominant_language_skips_leading_empties() {
+        // A leading empty fragment is dropped (same liberal accept as
+        // languages()), so the dominant tag is the first non-empty one.
+        let b = bone_with("Language", ", en-US, fr");
+        assert_eq!(b.dominant_language(), Some("en-US"));
+    }
+
+    #[test]
+    fn dominant_language_none_when_header_absent() {
+        let b = FisBone::new(1, Rational::new(48_000, 1));
+        assert_eq!(b.dominant_language(), None);
+    }
+
+    #[test]
+    fn dominant_language_none_when_value_is_blank() {
+        // Header present but expands to zero tags → no single dominant
+        // tag to name, so None (distinct from languages()'s Some(vec![])).
+        let b = bone_with("Language", "  ,  ,");
+        assert_eq!(b.languages(), Some(vec![]));
+        assert_eq!(b.dominant_language(), None);
     }
 
     // -------------------------------------------------------------

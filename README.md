@@ -741,6 +741,19 @@ content-negotiation use the message-headers wiki was written for
   with the dominating language first (`Language: en-US, fr`); a track
   matches if `tag` appears **anywhere** in its list, not only as the
   dominant first entry, matched case-insensitively per BCP 47.
+- `Skeleton::bones_with_dominant_language(tag)` is the dominant-only
+  counterpart: it matches a track only when `tag` is its **first**
+  (`FisBone::dominant_language`) tag — so a `Language: fr, en` dub matches
+  a `"fr"` query but **not** an `"en"` one (`en` is a secondary tag there).
+  This answers "which tracks are *primarily* in this language" (e.g.
+  choosing the default audio track for a user's locale), the complement to
+  `bones_with_language`'s "any content in this language" (e.g. a language
+  picker). The wiki §Language gives the first list entry distinguished
+  meaning — "the dominating language specified as the first language. It is
+  possible to specify less non-dominating languages as a list after the
+  main language" — which `FisBone::dominant_language()` surfaces as an
+  `Option<&str>` (`None` when the header is absent or expands to zero
+  tags). Matching is case-insensitive per BCP 47 §2.1.1.
 
 All four return fisbones in BOS declaration order, skip tracks lacking
 the queried header, and trim surrounding whitespace on the lookup key.
