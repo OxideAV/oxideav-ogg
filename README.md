@@ -755,11 +755,31 @@ content-negotiation use the message-headers wiki was written for
   `Option<&str>` (`None` when the header is absent or expands to zero
   tags). Matching is case-insensitive per BCP 47 §2.1.1.
 
-All four return fisbones in BOS declaration order, skip tracks lacking
+- `Skeleton::bones_with_content_kind(kind)` and
+  `Skeleton::bones_with_content_type(mime)` are the MIME-based companions,
+  consuming the per-track `FisBone::content_type()` accessor at the file
+  level. `docs/container/ogg/ogg-skeleton-message-headers.wiki`
+  §Content-type designates `Content-Type` as Skeleton 4's only **mandatory**
+  per-track header ("the mime type of the track"), so MIME lookup is the
+  broadest content-negotiation query the field exists for.
+  `bones_with_content_kind(&ContentTypeKind)` buckets tracks by their
+  top-level MIME kind — "which tracks are audio / video / text" — comparing
+  the well-known buckets (`Audio` / `Video` / `Text` / `Image` /
+  `Application`) by variant and an `Other(token)` kind case-insensitively
+  on its preserved token. `bones_with_content_type(mime)` is the narrow
+  codec-specific query — "which tracks are `audio/vorbis`" — matching the
+  full `type/subtype` pair case-insensitively per RFC 2045 §5.1; any
+  `;key=value` parameters on the query *and* on the track are ignored (so a
+  bare `audio/ogg` query matches an `audio/ogg;codecs=opus` track), and a
+  `mime` argument with no `/` matches nothing (use `bones_with_content_kind`
+  for top-level matching). Both skip tracks whose `Content-Type` header is
+  absent or fails to parse as a MIME type.
+
+All six return fisbones in BOS declaration order, skip tracks lacking
 the queried header, and trim surrounding whitespace on the lookup key.
 Spec reference:
 `docs/container/ogg/ogg-skeleton-message-headers.wiki` §"Name", §"Role",
-§"Language".
+§"Language", §"Content-type".
 
 #### Track stack order (`SkeletonHeaders` §"Altitude")
 

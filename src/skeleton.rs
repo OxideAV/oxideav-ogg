@@ -2500,6 +2500,99 @@ impl Skeleton {
             .collect()
     }
 
+    /// All fisbones whose `Content-Type` top-level MIME kind equals `kind`,
+    /// in BOS declaration order.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Content-type
+    /// designates `Content-Type` as the only **mandatory** Skeleton 4
+    /// per-track message header, the "mime type of the track". Where
+    /// [`bones_with_role`] / [`bones_with_language`] answer "which tracks have
+    /// this semantic role / language", this is the broadest content-negotiation
+    /// query the §Content-type field was written for: "which tracks are
+    /// audio / video / text". It is the file-level companion to the per-track
+    /// [`FisBone::content_type`] accessor — a caller picking a default audio
+    /// track, or enumerating every renderable video track, filters on the
+    /// top-level [`ContentTypeKind`] bucket rather than re-parsing each MIME
+    /// string.
+    ///
+    /// A track matches when its parsed [`ContentType::kind`] equals `kind`.
+    /// The well-known buckets (`audio` / `video` / `text` / `image` /
+    /// `application`) compare by variant; an [`ContentTypeKind::Other`] kind
+    /// compares its preserved token **case-insensitively** (so a query for
+    /// `Other("model")` matches a `model/gltf+json` track regardless of the
+    /// header's casing), mirroring the case-insensitive top-level-type rule
+    /// [`ContentType::parse`] applies. Tracks with no `Content-Type` header —
+    /// or one that fails to parse as a MIME type — are skipped (the inner
+    /// parse `Err` is treated as "no usable kind", the same skip-malformed
+    /// tolerance the other `Skeleton`-level resolvers apply).
+    ///
+    /// [`bones_with_role`]: Skeleton::bones_with_role
+    /// [`bones_with_language`]: Skeleton::bones_with_language
+    pub fn bones_with_content_kind(&self, kind: &ContentTypeKind) -> Vec<&FisBone> {
+        self.bones
+            .iter()
+            .filter(|b| {
+                b.content_type()
+                    .and_then(|r| r.ok())
+                    .is_some_and(|ct| match (&ct.kind, kind) {
+                        (ContentTypeKind::Other(a), ContentTypeKind::Other(b)) => {
+                            a.eq_ignore_ascii_case(b)
+                        }
+                        (a, b) => a == b,
+                    })
+            })
+            .collect()
+    }
+
+    /// All fisbones whose `Content-Type` full `type/subtype` MIME value
+    /// equals `mime`, in BOS declaration order.
+    ///
+    /// This is the narrow companion to [`bones_with_content_kind`]: where that
+    /// answers "which tracks are audio", this answers "which tracks are
+    /// `audio/vorbis`" — the codec-specific query a player uses to find, say,
+    /// every Opus track for which it has a decoder. `mime` is a bare
+    /// `type/subtype` pair (e.g. `audio/vorbis`); any `;key=value` parameters
+    /// on `mime` are ignored, and the track's own parameters
+    /// (`audio/ogg;codecs=opus`) are not consulted — matching is purely on the
+    /// `type` kind and the `subtype` string. Both halves compare
+    /// case-insensitively per RFC 2045 §5.1 ("the type, subtype, and parameter
+    /// names are not case sensitive"), reusing [`ContentTypeKind::from_token`]
+    /// for the kind half and [`ContentType::subtype_eq`] for the subtype half,
+    /// so a `mime` of `AUDIO/Vorbis` matches an on-wire `audio/vorbis`.
+    ///
+    /// A `mime` argument with no `/` matches nothing (every MIME type requires
+    /// a subtype; a bare `audio` would be ambiguous between `audio/vorbis` and
+    /// `audio/opus` — use [`bones_with_content_kind`] for top-level matching).
+    /// Tracks with no `Content-Type` header, or one that fails to parse, are
+    /// skipped.
+    ///
+    /// [`bones_with_content_kind`]: Skeleton::bones_with_content_kind
+    pub fn bones_with_content_type(&self, mime: &str) -> Vec<&FisBone> {
+        let head = mime.split(';').next().unwrap_or("").trim();
+        let Some(slash) = head.find('/') else {
+            return Vec::new();
+        };
+        let want_kind = ContentTypeKind::from_token(head[..slash].trim());
+        let want_subtype = head[slash + 1..].trim();
+        if want_subtype.is_empty() {
+            return Vec::new();
+        }
+        self.bones
+            .iter()
+            .filter(|b| {
+                b.content_type().and_then(|r| r.ok()).is_some_and(|ct| {
+                    let kind_eq = match (&ct.kind, &want_kind) {
+                        (ContentTypeKind::Other(a), ContentTypeKind::Other(b)) => {
+                            a.eq_ignore_ascii_case(b)
+                        }
+                        (a, b) => a == b,
+                    };
+                    kind_eq && ct.subtype_eq(want_subtype)
+                })
+            })
+            .collect()
+    }
+
     /// Map a content page's raw `granulepos` for the track identified by
     /// `serial` to an **absolute** playback time in seconds.
     ///

@@ -16,7 +16,9 @@ use std::io::Cursor;
 use oxideav_core::{NullCodecResolver, ReadSeek};
 
 use oxideav_ogg::page::{flags, lace, Page};
-use oxideav_ogg::skeleton::{self, FisBone, FisHead, Rational, SkelIndex, Version};
+use oxideav_ogg::skeleton::{
+    self, ContentTypeKind, FisBone, FisHead, Rational, SkelIndex, Version,
+};
 
 /// Build a single page carrying `packet` whole (no continuation),
 /// with the given flags and serial. `seq_no` and `granule` are passed
@@ -1743,6 +1745,132 @@ fn bones_by_stack_order_treats_malformed_altitude_as_default() {
 
     let order: Vec<u32> = sk.bones_by_stack_order().iter().map(|b| b.serial).collect();
     assert_eq!(order, vec![0x1, 0x2]);
+}
+
+#[test]
+fn bones_with_content_kind_buckets_tracks_by_top_level_mime() {
+    // SkeletonHeaders §Content-type: the only mandatory per-track header,
+    // "the mime type of the track". The file-level query buckets tracks by
+    // their top-level MIME kind — "which tracks are audio / video / text".
+    let sk = multitrack_skeleton();
+    // multitrack_skeleton: video/theora(0x1000), audio/vorbis(0x2000),
+    // audio/vorbis(0x3000), text/cmml(0x4000).
+
+    let audio: Vec<u32> = sk
+        .bones_with_content_kind(&ContentTypeKind::Audio)
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(audio, vec![0x2000, 0x3000]);
+
+    let video: Vec<u32> = sk
+        .bones_with_content_kind(&ContentTypeKind::Video)
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(video, vec![0x1000]);
+
+    let text: Vec<u32> = sk
+        .bones_with_content_kind(&ContentTypeKind::Text)
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(text, vec![0x4000]);
+
+    // No image/* track present → empty.
+    assert!(sk
+        .bones_with_content_kind(&ContentTypeKind::Image)
+        .is_empty());
+}
+
+#[test]
+fn bones_with_content_kind_other_compares_case_insensitively() {
+    // An Other(token) kind compares its preserved top-level type token
+    // case-insensitively, mirroring ContentType::parse's rule. A track with
+    // a missing or malformed Content-Type header is skipped, not matched.
+    let mut sk = skeleton::Skeleton::new();
+
+    let mut model = FisBone::new(0x10, Rational::new(1, 1));
+    model.set_header("Content-Type", "Model/gltf+json");
+    sk.push_bone(model);
+
+    // No Content-Type header at all → never matches.
+    let bare = FisBone::new(0x20, Rational::new(1, 1));
+    sk.push_bone(bare);
+
+    // Present but malformed (no subtype) → parse Err → skipped.
+    let mut broken = FisBone::new(0x30, Rational::new(1, 1));
+    broken.set_header("Content-Type", "garbage-no-slash");
+    sk.push_bone(broken);
+
+    let hits: Vec<u32> = sk
+        .bones_with_content_kind(&ContentTypeKind::Other("model".to_string()))
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(hits, vec![0x10]);
+
+    // A well-known bucket query never matches the Other track.
+    assert!(sk
+        .bones_with_content_kind(&ContentTypeKind::Audio)
+        .is_empty());
+}
+
+#[test]
+fn bones_with_content_type_matches_full_mime_case_insensitively() {
+    // The narrow codec-specific query: "which tracks are audio/vorbis".
+    // Both halves compare case-insensitively per RFC 2045 §5.1, and a
+    // track's own ;parameters are ignored.
+    let mut sk = multitrack_skeleton();
+    // Add a parameterised Opus track to confirm parameters are ignored.
+    let mut opus = FisBone::new(0x5000, Rational::new(48_000, 1));
+    opus.set_header("Content-Type", "audio/ogg;codecs=opus");
+    sk.push_bone(opus);
+
+    let vorbis: Vec<u32> = sk
+        .bones_with_content_type("audio/vorbis")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(vorbis, vec![0x2000, 0x3000]);
+
+    // Case-insensitive on kind and subtype.
+    let vorbis_ci: Vec<u32> = sk
+        .bones_with_content_type("AUDIO/Vorbis")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(vorbis_ci, vec![0x2000, 0x3000]);
+
+    // The parameterised audio/ogg track matches a bare audio/ogg query
+    // (its own ;codecs=opus parameter is not part of the type/subtype).
+    let ogg: Vec<u32> = sk
+        .bones_with_content_type("audio/ogg")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(ogg, vec![0x5000]);
+
+    // A ;parameter on the QUERY is ignored — only type/subtype is compared.
+    let ogg_param: Vec<u32> = sk
+        .bones_with_content_type("audio/ogg;codecs=vorbis")
+        .iter()
+        .map(|b| b.serial)
+        .collect();
+    assert_eq!(ogg_param, vec![0x5000]);
+
+    // Subtype mismatch → empty.
+    assert!(sk.bones_with_content_type("audio/opus").is_empty());
+}
+
+#[test]
+fn bones_with_content_type_requires_a_subtype() {
+    // A bare top-level type (no '/') matches nothing — use
+    // bones_with_content_kind for top-level matching.
+    let sk = multitrack_skeleton();
+    assert!(sk.bones_with_content_type("audio").is_empty());
+    assert!(sk.bones_with_content_type("audio/").is_empty());
+    assert!(sk.bones_with_content_type("").is_empty());
 }
 
 #[test]

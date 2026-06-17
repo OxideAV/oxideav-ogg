@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Skeleton::bones_with_content_kind` + `Skeleton::bones_with_content_type`** —
+  the file-level companions to the per-track `FisBone::content_type()`
+  accessor, implementing the broadest content-negotiation query the
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` §Content-type field
+  (Skeleton 4's only *mandatory* per-track header) was written for. They
+  complete the `bones_with_role` / `bones_with_language` resolver family with
+  MIME-based lookup. `bones_with_content_kind(&ContentTypeKind)` buckets
+  tracks by top-level MIME kind ("which tracks are audio / video / text"),
+  comparing well-known buckets by variant and an `Other(token)` kind
+  case-insensitively. `bones_with_content_type(mime)` matches the full
+  `type/subtype` pair (e.g. `audio/vorbis`) case-insensitively per RFC 2045
+  §5.1, ignoring `;parameters` on both the query and the track (so a bare
+  `audio/ogg` query matches an `audio/ogg;codecs=opus` track); a `mime`
+  argument with no subtype matches nothing. Both return fisbones in BOS
+  declaration order and skip tracks whose `Content-Type` is absent or
+  fails to parse as a MIME type.
+
 - **`FisBone::dominant_language` + `Skeleton::bones_with_dominant_language`** —
   the dominant-only counterpart to the existing `FisBone::languages` /
   `Skeleton::bones_with_language` pair, implementing the distinguished
