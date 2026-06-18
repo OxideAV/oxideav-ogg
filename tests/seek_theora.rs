@@ -272,6 +272,63 @@ fn theora_bisection_seek_after_build_seek_index_uses_index_floor() {
 }
 
 #[test]
+fn theora_duration_unpacks_granuleshift_via_fisbone() {
+    // The last Theora data page carries granule 8192, which under the
+    // shift=6 keyframe packing is frame 128 ((128 << 6) | 0). The stream
+    // duration must be the *frame* time, 128 / 30 fps = 4.2666… s, NOT the
+    // raw granule fed straight into a time-base. Two prior bugs both
+    // produced wrong durations on Theora:
+    //   * the demuxer stamps Theora with the 1/1_000_000 placeholder
+    //     time-base (Ogg framing never reveals fps), so the raw granule
+    //     8192 read as microseconds is 0.008192 s — far too short;
+    //   * even with the granule rate, the raw 8192 is not a frame count —
+    //     it is the packed (keyframe<<shift)|offset value, so it must be
+    //     unpacked to 128 first.
+    // The fix routes the last page's granule through the Skeleton
+    // fisbone's `granule_to_seconds` (extract_granules + /granule_rate),
+    // giving 4.2666… s. `populate_duration` (the open-time end-of-file
+    // scan) is the path exercised here.
+    let (bytes, table) = build_skeleton_theora_ogg();
+    let last_frame = table.last().unwrap().1; // 128
+    let expected_us = last_frame * 1_000_000 / 30; // 4_266_666
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    let dur = oxideav_core::Demuxer::duration_micros(&dmx).expect("duration estimated");
+    // Allow a 1-tick rounding slack (one frame's worth would be far larger,
+    // so this only tolerates the f64->i64 truncation of 4_266_666.66…).
+    assert!(
+        (dur - expected_us).abs() <= 1,
+        "Theora duration must be {expected_us}us (frame {last_frame} / 30fps), got {dur}us"
+    );
+    // Sanity: the bug would have reported either ~8192us (raw-as-micros)
+    // or ~273s (raw 8192 / 30fps) — both are far from the right answer.
+    assert!(
+        dur > 4_000_000 && dur < 5_000_000,
+        "duration {dur}us must be ~4.27s, not a raw-granule misread"
+    );
+}
+
+#[test]
+fn theora_duration_via_seek_index_also_unpacks_granuleshift() {
+    // `build_seek_index` recomputes duration through
+    // `populate_duration_from_index`, which must apply the same fisbone
+    // unpacking as the open-time scan. Both paths must agree.
+    let (bytes, table) = build_skeleton_theora_ogg();
+    let last_frame = table.last().unwrap().1;
+    let expected_us = last_frame * 1_000_000 / 30;
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    dmx.build_seek_index().expect("build index ok");
+    let dur = oxideav_core::Demuxer::duration_micros(&dmx).expect("duration estimated");
+    assert!(
+        (dur - expected_us).abs() <= 1,
+        "indexed Theora duration must be {expected_us}us, got {dur}us"
+    );
+}
+
+#[test]
 fn theora_seek_without_skeleton_fisbone_still_rejects() {
     // Without a Skeleton fisbone the demuxer has no `granuleshift` /
     // `granule_rate` to translate `pts` into a Theora frame number, so

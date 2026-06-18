@@ -197,6 +197,26 @@ packet) are parsed during `open` and surfaced via
 `vendor` entry. Duration is estimated from the last page's granule
 position translated to microseconds.
 
+For an audio mapping (Vorbis / Opus / FLAC / Speex) the granule *is* a
+sample count and the stream's time-base is the granule rate, so the
+last-page granule converts to seconds directly. **Theora is the
+exception**: its `granulepos` is the packed `(keyframe_idx << shift) |
+frame_offset` value (`docs/container/ogg/ogg-skeleton-4.0.md` §"What
+decoding-related information is needed?"), not a frame count, and the
+demuxer stamps Theora streams with the `1/1_000_000` placeholder
+time-base because Ogg framing alone never reveals the frame rate.
+Reading that raw granule as either microseconds or a frame count both
+mis-report the duration. When the file carries a Skeleton `fisbone\0`
+for the stream, the duration estimate (both the `open`-time
+end-of-file scan and the `build_seek_index` recompute) routes the
+last-page granule through the fisbone's `granule_to_seconds`
+(`extract_granules` to undo the keyframe shift, then `granules /
+granulerate`), so a Theora track reports its real playback length. A
+`granuleshift == 0` fisbone collapses the extraction to a pass-through,
+so the same path stays correct for audio mappings that happen to carry
+a fisbone; streams with no Skeleton (or an unusable granule rate) fall
+back to the stream time-base unchanged.
+
 ### Chained streams (RFC 3533 §4)
 
 A *chained* Ogg file is the back-to-back concatenation of independent

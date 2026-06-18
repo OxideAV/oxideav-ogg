@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Theora duration estimate now unpacks the granuleshift via the Skeleton
+  fisbone.** A Theora `granulepos` is the packed
+  `(keyframe_idx << shift) | frame_offset` value
+  (`docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+  information is needed?"), and the demuxer stamps Theora streams with the
+  `1/1_000_000` placeholder time-base because Ogg framing never reveals the
+  frame rate. The duration estimate previously fed the raw last-page granule
+  straight into the stream time-base, mis-reporting a Theora track's length
+  (a granule of 8192 — frame 128 under shift=6 — was read as 0.008 s instead
+  of 4.27 s at 30 fps). When a Skeleton `fisbone\0` describes the stream,
+  both the `open`-time end-of-file scan (`populate_duration`) and the
+  `build_seek_index` recompute (`populate_duration_from_index`) now route the
+  last-page granule through the fisbone's `granule_to_seconds`
+  (`extract_granules` to undo the keyframe shift, then `granules /
+  granulerate`). A `granuleshift == 0` fisbone collapses the extraction to a
+  pass-through, so audio mappings that carry a fisbone stay correct; streams
+  with no Skeleton or an unusable granule rate fall back to the stream
+  time-base unchanged. The seek path already unpacked Theora granules — this
+  brings the duration path into agreement with it.
+
 ### Added
 
 - **`Skeleton::bones_with_content_kind` + `Skeleton::bones_with_content_type`** —

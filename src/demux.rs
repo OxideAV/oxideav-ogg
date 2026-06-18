@@ -618,11 +618,10 @@ impl OggDemuxer {
                     continue;
                 };
                 let last_granule = entries.last().map(|(g, _)| *g).unwrap_or(0);
-                let Some(state) = self.state_by_serial.get(serial) else {
+                if !self.state_by_serial.contains_key(serial) {
                     continue;
                 };
-                let stream = &self.streams[state.public_index];
-                let us = (stream.time_base.seconds_of(last_granule) * 1_000_000.0) as i64;
+                let us = self.granule_to_micros_for_serial(*serial, last_granule);
                 if us > link_micros {
                     link_micros = us;
                 }
@@ -1087,6 +1086,58 @@ impl OggDemuxer {
             .and_then(|s| s.bone_for_serial(serial))
             .map(|b| b.num_headers)
             .unwrap_or(0)
+    }
+
+    /// Convert a logical stream's raw on-wire `granulepos` into a duration
+    /// in microseconds.
+    ///
+    /// For an audio mapping (Vorbis / Opus / FLAC / Speex) the granulepos
+    /// *is* the granule value — a monotone sample count — and the stream's
+    /// time-base is the granule rate (`1/sample_rate`), so the raw value
+    /// converts directly through `time_base.seconds_of`.
+    ///
+    /// Theora is the exception. Its granulepos is **not** a plain frame
+    /// count: it is `(keyframe_idx << shift) | frame_offset` per
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+    /// information is needed?" (granuleshift = "the number of lower bits
+    /// from the granulepos field that are used to provide position
+    /// information for sub-seekable units (like the keyframe shift in
+    /// theora)"), and the demuxer stamps Theora streams with the
+    /// `1/1_000_000` placeholder time-base because Ogg framing alone never
+    /// reveals the frame rate. Both facts make the raw `time_base.seconds_of`
+    /// path wrong for Theora — it neither unpacks the keyframe shift nor
+    /// divides by the real frame rate.
+    ///
+    /// The Skeleton `fisbone\0` carries both missing pieces: its
+    /// `granuleshift` and `granule_rate`. When a fisbone is present for the
+    /// serial, [`FisBone::granule_to_seconds`] performs the full two-step
+    /// mapping the §"What decoding-related information is needed?" section
+    /// defines — `extract_granules` (undo the shift) then `granules /
+    /// granulerate` — so the duration is the page's real playback time
+    /// regardless of codec. A `granuleshift == 0` fisbone (every audio
+    /// mapping, plus a Theora encoder that left the shift unset) collapses
+    /// the extraction to a pass-through, so the fisbone path also returns
+    /// the right answer for audio when one happens to be present.
+    ///
+    /// Streams with no Skeleton, no fisbone for the serial, or a fisbone
+    /// whose `granule_rate` is unusable (`None` from `granule_to_seconds`)
+    /// fall back to the stream's own time-base — the prior behaviour,
+    /// correct for the audio mappings whose time-base is already the
+    /// granule rate.
+    fn granule_to_micros_for_serial(&self, serial: u32, granule: i64) -> i64 {
+        let Some(state) = self.state_by_serial.get(&serial) else {
+            return 0;
+        };
+        if let Some(secs) = self
+            .skeleton
+            .as_ref()
+            .and_then(|s| s.bone_for_serial(serial))
+            .and_then(|b| b.granule_to_seconds(granule))
+        {
+            return (secs * 1_000_000.0) as i64;
+        }
+        let stream = &self.streams[state.public_index];
+        (stream.time_base.seconds_of(granule) * 1_000_000.0) as i64
     }
 
     /// Walk pages of `serial` from the start of the file up to (but not
@@ -1805,11 +1856,10 @@ impl OggDemuxer {
         // Pick the longest duration across streams in their own time base.
         let mut best_micros = 0i64;
         for (serial, granule) in last_granule_by_serial {
-            let Some(st) = self.state_by_serial.get(&serial) else {
+            if !self.state_by_serial.contains_key(&serial) {
                 continue;
-            };
-            let stream = &self.streams[st.public_index];
-            let us = (stream.time_base.seconds_of(granule) * 1_000_000.0) as i64;
+            }
+            let us = self.granule_to_micros_for_serial(serial, granule);
             if us > best_micros {
                 best_micros = us;
             }
