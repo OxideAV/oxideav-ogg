@@ -1,10 +1,10 @@
 # oxideav-ogg
 
 Pure-Rust **Ogg** container (RFC 3533) — page framing, CRC32
-checksumming, packet reassembly across page boundaries, multi-stream
-(multiplexed logical bitstream) demux, codec sniffing, metadata, and
-a muxer that emits compliant Ogg for Vorbis, Opus, Theora, FLAC and
-Speex. Zero C dependencies.
+checksumming, packet reassembly across page boundaries (including
+multi-page packets and 'nil' pages), the full §4 grouping + chaining
+topology, codec sniffing, metadata, and a muxer that emits compliant
+Ogg for Vorbis, Opus, Theora, FLAC and Speex. Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -247,6 +247,50 @@ returns which link a given public stream belongs to; and
 `bitstream_serial_number` (RFC 3533 §6 field 5) for callers that need
 to correlate the dense `StreamInfo::index` enumeration with the
 page-header serials a byte-level scanner observes.
+
+#### Mixed grouping + chaining (the full §4 topology)
+
+RFC 3533 §4 defines the most general legal physical bitstream as a
+*chain of groups* of concurrently-multiplexed bitstreams ("It is
+possible to consecutively chain groups of concurrently multiplexed
+bitstreams. The groups, when unchained, MUST stand on their own as a
+valid concurrently multiplexed bitstream"), with the worked example
+`|*A*|*B*|*C*|A|A|C|B|…|#B#|#C#|*D*|D|…|#D#|` — link 0 grouping three
+bitstreams A/B/C whose BOS pages all precede any data page and whose
+EOS pages need not be contiguous, then link 1 chaining a fourth
+bitstream D. The demuxer handles this end to end: every grouped stream
+in a link shares that link's `link_index`; a new link's grouped BOS
+pages (those before any of *its* data pages) likewise share one
+`link_index` rather than splitting into extra links; interleaved data
+pages reassemble per-serial without cross-contamination; a grouped
+stream that ends (`#A#`) long before the rest of its group does not
+trip link-boundary detection; and a seek into one stream of a grouped
+link walks only that serial's pages, landing on its granule floor
+unperturbed by the interleaved pages of the other grouped streams.
+Chained duration sums per link with each grouped link contributing the
+**max** over its concurrently-multiplexed streams (so
+`max(A,B,C) + D`). `tests/chained_grouped.rs` pins all of this.
+
+#### 'Nil' pages and multi-page packets (§4 / §5)
+
+A *nil page* (§4: "containing no content but simply a page header with
+position information and the eos flag set") has
+`number_page_segments = 0` — no segment table, no body. A nil EOS page
+carries the stream's closing granulepos after the last data packet has
+already terminated on an earlier page; the demuxer reads its granule
+for the duration estimate yet delivers no spurious packet for it, and a
+mid-stream nil page (granule `-1`, "no packets finish on this page") is
+transparent to packet reassembly (`tests/nil_page.rs`).
+
+A packet larger than a page is "distributed over several pages" (§5)
+via 255-byte lacing chunks terminated by a value `< 255` (or `0` for an
+exact multiple of 255, which may land alone on a fresh continued page).
+`tests/multipage_packet.rs` asserts byte-exact reassembly of packets
+spanning 2, 3, and 4 pages (including two-segment 510-byte continuing
+pages and the exact-multiple-of-255 fresh-page zero-terminator) — the
+path real >64 KB Vorbis setup and Theora keyframe packets exercise.
+The lossy counterpart (a spanning packet whose middle page is dropped,
+discarded rather than spliced) lives in `tests/page_loss.rs`.
 
 ### Skeleton metadata bitstream (Xiph Skeleton 3.0 / 4.0)
 
