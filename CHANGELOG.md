@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **End-to-end coverage for the RFC 3533 §4 mixed grouping + chaining
+  topology.** §4 defines the most general legal Ogg physical bitstream as a
+  chain of *groups* of concurrently-multiplexed bitstreams ("It is possible
+  to consecutively chain groups of concurrently multiplexed bitstreams"),
+  with the worked example `|*A*|*B*|*C*|A|A|C|B|...|#B#|#C#|*D*|D|...|#D#|`
+  (link 0 groups A/B/C, link 1 chains D). The existing chained tests only
+  exercised one stream per link. New `tests/chained_grouped.rs` validates the
+  demuxer across the full topology matrix: a grouped-then-single-chained file
+  (all three grouped BOS pages register under `link_index` 0 at `open`, the
+  chained stream registers under `link_index` 1 once its mid-file BOS is read,
+  interleaved data pages reassemble per-serial with no cross-contamination,
+  non-contiguous EOS pages do not trip link-boundary detection); a
+  grouped-then-grouped file (both chained links are groups — the second link's
+  grouping does not split into extra links); chained duration as
+  `max(group) + next-link` (link-0 max over A/B/C plus link-1 D); and a seek
+  into one stream of a grouped link landing on that serial's granule floor
+  unperturbed by the other grouped streams' interleaved pages. The
+  implementation already handled this shape via `process_page`'s mid-file
+  BOS registration and `seen_nonbos_in_current_link` link-boundary tracking;
+  these tests pin the behaviour.
+
 ### Fixed
 
 - **Theora duration estimate now unpacks the granuleshift via the Skeleton
