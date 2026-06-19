@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Byte-exact coverage for clean multi-page packet reassembly (RFC 3533
+  §5).** §5 specifies that a packet larger than a page "has to be distributed
+  over several pages" by 255-byte lacing chunks, terminated by a value `< 255`
+  (or `0` for an exact multiple of 255). The existing `page_loss.rs` tests
+  covered the *lossy* spanning case (a middle page dropped → discard, not
+  splice); new `tests/multipage_packet.rs` covers the *clean* case end to end:
+  a packet split across 2, 3, and 4 pages (the 4-page case using 510-byte,
+  two-segment continuing pages) reassembles **byte-for-byte**; the
+  exact-multiple-of-255 boundary where the zero-terminator lands alone on a
+  fresh continued page completes the packet correctly; and a spanning packet
+  following two whole-packet pages on the same stream does not lose the
+  demuxer's place. Validates the `continued`-flag (§6 field 3) + lacing (§5)
+  reassembly path that real >64 KB Vorbis setup / Theora keyframe packets
+  exercise.
+
 - **Coverage for RFC 3533 §4 'nil' (zero-segment) pages.** §4 defines a nil
   page as "containing no content but simply a page header with position
   information and the eos flag set", and §5 reiterates that a zero-length
