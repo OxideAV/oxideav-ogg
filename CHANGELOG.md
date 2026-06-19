@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Coverage for RFC 3533 §4 'nil' (zero-segment) pages.** §4 defines a nil
+  page as "containing no content but simply a page header with position
+  information and the eos flag set", and §5 reiterates that a zero-length
+  packet "is not an error". New `tests/nil_page.rs` exercises the full demuxer
+  path: a nil EOS page (granule + eos flag, `number_page_segments = 0`, no
+  body) produces no spurious packet yet its granule still drives the open-time
+  duration estimate (the common encoder pattern of flushing the closing
+  granulepos after the last data packet already terminated); a mid-stream nil
+  page with granule `-1` is transparent to packet reassembly; and a nil page
+  round-trips through `Page::parse`/`to_bytes` to zero packet segments with its
+  granule/flags preserved. The page layer and demuxer already handled this —
+  these pin the §4 nil-page contract.
+
 - **End-to-end coverage for the RFC 3533 §4 mixed grouping + chaining
   topology.** §4 defines the most general legal Ogg physical bitstream as a
   chain of *groups* of concurrently-multiplexed bitstreams ("It is possible
