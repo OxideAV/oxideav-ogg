@@ -2241,18 +2241,13 @@ impl OggDemuxer {
     fn process_page(&mut self, page: Page) -> Result<()> {
         // RFC 3533 §4 + Vorbis I §A.2: chained Ogg streams concatenate
         // independent logical bitstreams back-to-back, each with its own
-        // BOS page. A BOS-flagged page for an unknown serial therefore
-        // signals a NEW logical stream beginning mid-file — register it
-        // before processing the page's packets so its identification
-        // header is captured as a header packet, not delivered as data.
+        // BOS page. A BOS page that arrives AFTER any non-BOS page in the
+        // current link starts a new chained link; BOS pages arriving while
+        // `seen_nonbos_in_current_link` is still false join the current
+        // link's BOS section (multiplex within one link). Either way the
+        // (re)registered stream inherits the link index current at its BOS.
         //
-        // For chained-link tracking: a BOS page that arrives AFTER any
-        // non-BOS page in the current link starts a new link. BOS pages
-        // arriving while `seen_nonbos_in_current_link` is still false
-        // are part of the same link's BOS section (multiplex within one
-        // link). Either way, the registered stream inherits the link
-        // index that was current at the moment of its BOS.
-        // BOS-page handling. Three cases for a `is_first()` page (the
+        // BOS-page handling — three cases for a `is_first()` page (the
         // Skeleton bitstream's BOS is handled by its own path and excluded
         // here):
         //
