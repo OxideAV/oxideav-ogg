@@ -665,10 +665,24 @@ accessors now consume them:
   time. `None` when no fishead has been recorded (the cut-in is then
   unknown); a zero-denominator presentation time is the un-cut default of
   `0.0`.
+- `Skeleton::presentation_seconds_checked() -> Option<f64>` /
+  `Skeleton::basetime_seconds() -> Option<f64>` — the same two fishead
+  anchors with the module's three-way "unknown vs. zero" contract:
+  `Rational::to_seconds_checked()` returns `None` for the spec's
+  zero-denominator "unknown" marker and `Some(0.0)` for an explicit `0/N`
+  time-zero, so a caller can tell "no anchor recorded / unknown" apart from
+  "the anchor is exactly zero" (the lossy `presentation_seconds()` and the
+  granule-mapping accessors deliberately fold both to `0.0`).
 - `Skeleton::stream_start_seconds(serial) -> Option<f64>` — the
   **file-absolute** data start: `FisBone::start_seconds` plus the fishead
   **basetime**. `None` for an unknown serial or unusable rate; an
-  absent/zero-denominator basetime contributes a `0.0` offset.
+  absent/zero-denominator basetime contributes a `0.0` offset. The demuxer
+  folds this value into each stream's `StreamInfo::start_time` at open time
+  (converted into the stream's own `time_base` ticks), so a non-zero
+  basetime/basegranule — e.g. analog video digitised with its original
+  `01:00:00` anchor — places the content on the intended timeline rather
+  than reporting `start_time = 0`. The duration accumulator stays
+  basetime-free, so `duration == end - start` still holds.
 - `Skeleton::substream_granule_to_seconds(serial, granulepos) ->
   Option<f64>` — a page's position on the cut segment's own playback
   timeline, `presentation_time + (extract_granules(granulepos) -
@@ -698,10 +712,17 @@ three validity checks the Skeleton 4.0 spec requires (per
 `docs/container/ogg/ogg-skeleton-4.0.md` §"Keyframe indexes for
 faster seeking"):
 
-1. the `fishead` BOS packet's *Segment length in bytes* field equals
-   the actual file size (a one-shot lazy check on the first seek;
+1. the `fishead` BOS packet's *Segment length in bytes* field is
+   consistent with the file (a one-shot lazy check on the first seek;
    encoders that left this field at `0` opt out, which is the
-   prevailing pattern);
+   prevailing pattern). For a single-link file the declared length must
+   equal the file size; for a **chained** file the declared length is
+   shorter — per `docs/container/ogg/ogg-skeleton-4.0.md` "a new
+   \"link\" in a \"chain\" can start at the end of the segment" — so a
+   shorter declared length is accepted exactly when a fresh `OggS` page
+   (the next link's BOS) begins at that offset. A declared length past
+   EOF, or one that lands mid-page, disqualifies the index (the segment
+   was modified since indexing);
 2. the keypoint's stored byte offset starts an `OggS` capture
    pattern (i.e. it lands on a page boundary, not mid-payload);
 3. the page at that offset has `bitstream_serial_number` equal to

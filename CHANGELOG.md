@@ -116,6 +116,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Skeleton 4.0 index `Segment length in bytes` validity check is now
+  chained-file-aware.** Per `docs/container/ogg/ogg-skeleton-4.0.md` §"When
+  using the index to seek …" the index is invalid if "The segment doesn't end
+  at the segment length offset stored in the Skeleton BOS packet (note that a
+  new \"link\" in a \"chain\" can start at the end of the segment)". The check
+  previously required `segment_length == file_size`, which is correct only for
+  a single-link file — every *chained* file has a declared segment length
+  shorter than the whole file (it names where the first link ends), so the
+  strict equality wrongly disqualified the entire keyframe index and forced a
+  bisection fall-back on every seek of any chained-plus-indexed file. The check
+  now accepts a shorter declared length when a fresh `OggS` page (the next
+  link's BOS) begins exactly at that offset — the chain boundary the spec
+  describes — while still rejecting a declared length that overshoots EOF or
+  lands mid-page (the segment was modified since indexing). Single-link
+  exact-match and the over-EOF / mid-page rejections are unchanged. New
+  `tests/skeleton.rs` cases cover the chained-boundary accept and the
+  no-page-boundary reject.
+
 - **Theora duration estimate now unpacks the granuleshift via the Skeleton
   fisbone.** A Theora `granulepos` is the packed
   `(keyframe_idx << shift) | frame_offset` value

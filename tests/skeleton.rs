@@ -845,6 +845,121 @@ fn skeleton_index_segment_length_match_keeps_fast_path() {
     assert_eq!(dmx.skeleton_index_invalid_count(), 0);
 }
 
+// `docs/container/ogg/ogg-skeleton-4.0.md` §"When using the index to seek
+// …": the index is invalid only if "The segment doesn't end at the segment
+// length offset stored in the Skeleton BOS packet (note that a new \"link\"
+// in a \"chain\" can start at the end of the segment)". A chained file's
+// declared segment_length is SHORTER than the whole file — it names where
+// the first link ends and the next link's BOS begins. The previous
+// `declared == file_size` check wrongly disqualified the index for every
+// chained file; this verifies the relaxed chained-aware check.
+#[test]
+fn skeleton_index_segment_length_shorter_with_chain_boundary_keeps_fast_path() {
+    let (mut bytes, expected_keypoints) = build_skeleton_indexed_seek_ogg();
+    // Length of the first (indexed) link — this is where a new link's BOS
+    // page will begin once we append it.
+    let first_link_len = bytes.len() as u64;
+
+    // Append a second link: a fresh Vorbis BOS page with a DIFFERENT
+    // serial, starting exactly at `first_link_len`. This makes the file
+    // a legal chain whose first segment ends at `first_link_len`.
+    let second_link_serial = 0x0BADF00Du32;
+    let v_id2 = vorbis_id_packet(2, 48_000);
+    bytes.extend_from_slice(&single_packet_page(
+        &v_id2,
+        flags::FIRST_PAGE | flags::LAST_PAGE,
+        second_link_serial,
+        0,
+        0,
+    ));
+    assert!(
+        bytes.len() as u64 > first_link_len,
+        "second link must extend the file past the first-link length"
+    );
+
+    // Patch the fishead's segment_length to the FIRST-LINK length (where
+    // the chain boundary is), not the whole-file length.
+    let new_bos = {
+        let (mut page, consumed) =
+            oxideav_ogg::page::Page::parse(&bytes).expect("BOS reparse on clean bytes");
+        page.data[64..72].copy_from_slice(&first_link_len.to_le_bytes());
+        let refreshed = page.to_bytes();
+        assert_eq!(refreshed.len(), consumed);
+        refreshed
+    };
+    bytes[..new_bos.len()].copy_from_slice(&new_bos);
+
+    // Confirm the chain boundary really is a page start at `first_link_len`.
+    assert_eq!(
+        &bytes[first_link_len as usize..first_link_len as usize + 4],
+        b"OggS",
+        "a new link's BOS must begin exactly at the declared segment length"
+    );
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    assert_eq!(
+        dmx.skeleton()
+            .unwrap()
+            .head
+            .as_ref()
+            .unwrap()
+            .segment_length,
+        Some(first_link_len)
+    );
+
+    // The relaxed chained-aware segment-length check must keep the fast
+    // path armed: declared < file_size BUT a page boundary sits at
+    // `declared`, which the spec explicitly allows.
+    let landed = oxideav_core::Demuxer::seek_to(&mut dmx, 0, 1200).expect("seek ok");
+    assert_eq!(landed, expected_keypoints[1].1);
+    assert_eq!(
+        dmx.skeleton_index_seek_count(),
+        1,
+        "chained file with a valid link boundary at segment_length keeps the fast path"
+    );
+    assert_eq!(dmx.skeleton_index_invalid_count(), 0);
+}
+
+// The inverse of the chained case: a declared segment_length shorter than
+// the file that does NOT fall on a page boundary means the segment has been
+// modified since indexing — the index must be rejected. (§"… you don't land
+// exactly on a page boundary".)
+#[test]
+fn skeleton_index_segment_length_shorter_without_page_boundary_rejects() {
+    let (mut bytes, _expected) = build_skeleton_indexed_seek_ogg();
+    // Pick a declared length that is < file_size but lands in the middle
+    // of a page (offset 30 is inside the first BOS page, not a boundary).
+    let mid_page: u64 = 30;
+    assert!(mid_page < bytes.len() as u64);
+    assert_ne!(
+        &bytes[mid_page as usize..mid_page as usize + 4],
+        b"OggS",
+        "chosen declared offset must NOT be a page boundary"
+    );
+    let new_bos = {
+        let (mut page, consumed) =
+            oxideav_ogg::page::Page::parse(&bytes).expect("BOS reparse on clean bytes");
+        page.data[64..72].copy_from_slice(&mid_page.to_le_bytes());
+        let refreshed = page.to_bytes();
+        assert_eq!(refreshed.len(), consumed);
+        refreshed
+    };
+    bytes[..new_bos.len()].copy_from_slice(&new_bos);
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let codecs = NullCodecResolver;
+    let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
+    let _ = oxideav_core::Demuxer::seek_to(&mut dmx, 0, 1200).expect("seek ok");
+    assert_eq!(
+        dmx.skeleton_index_seek_count(),
+        0,
+        "no page boundary at declared length disables the fast path"
+    );
+    assert_eq!(dmx.skeleton_index_invalid_count(), 1);
+}
+
 #[test]
 fn skeleton_index_rejected_on_keypoint_offset_not_on_page_boundary() {
     // Build a fresh fixture but patch the first keypoint's stored byte

@@ -1402,17 +1402,75 @@ impl OggDemuxer {
         if let Some(cached) = self.skeleton_segment_length_ok {
             return cached;
         }
-        let ok = match self.skeleton.as_ref().and_then(|s| s.head.as_ref()) {
+        let declared = match self.skeleton.as_ref().and_then(|s| s.head.as_ref()) {
             // No Skeleton, no head, or 3.0 head (no segment_length field):
             // there's nothing to disprove at the file level.
-            None => true,
+            None => {
+                self.skeleton_segment_length_ok = Some(true);
+                return true;
+            }
             Some(h) => match h.segment_length {
-                None | Some(0) => true,
-                Some(declared) => declared == file_size,
+                // 3.0 header (no field), or a 4.0 encoder that opted out
+                // by writing 0 — nothing to check.
+                None | Some(0) => {
+                    self.skeleton_segment_length_ok = Some(true);
+                    return true;
+                }
+                Some(d) => d,
             },
         };
+        // A declared length longer than the whole file is impossible: the
+        // indexed segment cannot extend past EOF. Hard-disqualify.
+        if declared > file_size {
+            self.skeleton_segment_length_ok = Some(false);
+            return false;
+        }
+        // Exact match: the indexed segment is the whole (single-link) file.
+        // This is the unchained common case.
+        if declared == file_size {
+            self.skeleton_segment_length_ok = Some(true);
+            return true;
+        }
+        // `declared < file_size`. Per `docs/container/ogg/ogg-skeleton-4.0.md`
+        // §"When using the index to seek …": the index is invalid if "The
+        // segment doesn't end at the segment length offset stored in the
+        // Skeleton BOS packet (note that a new \"link\" in a \"chain\" can
+        // start at the end of the segment)". So a shorter-than-file declared
+        // length is NOT automatically a mismatch — it is valid precisely
+        // when the indexed segment ends at `declared` and a *new link* (a
+        // fresh `OggS` BOS page) begins exactly there. We verify that an
+        // Ogg page starts at byte `declared`; if so the chain boundary is
+        // where the spec says it should be and the index stays trusted.
+        // Anything else (no page boundary at `declared`) means the segment
+        // has been modified since indexing — fall through to bisection.
+        let ok = self.page_begins_at(declared);
         self.skeleton_segment_length_ok = Some(ok);
         ok
+    }
+
+    /// Return `true` if an Ogg page (the `OggS` capture pattern) begins at
+    /// exactly `offset`. Only the 4-byte capture pattern is read; the page
+    /// header, segment table and body are not consulted. Returns `false` on
+    /// any I/O error or short read so a transient failure degrades to a
+    /// bisection fall-back rather than surfacing as a seek error. Used by
+    /// the Skeleton 4.0 segment-length chained-file check
+    /// (`docs/container/ogg/ogg-skeleton-4.0.md`: "a new \"link\" in a
+    /// \"chain\" can start at the end of the segment").
+    fn page_begins_at(&mut self, offset: u64) -> bool {
+        if self.input.seek(SeekFrom::Start(offset)).is_err() {
+            return false;
+        }
+        let mut magic = [0u8; 4];
+        let mut filled = 0usize;
+        while filled < magic.len() {
+            match self.input.read(&mut magic[filled..]) {
+                Ok(0) => return false,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
+        magic == page::CAPTURE_PATTERN
     }
 
     /// Verify that the bytes at `offset` start an Ogg page whose
@@ -2702,8 +2760,12 @@ impl Demuxer for OggDemuxer {
         // index is available for this stream's serial, OR when the
         // index fails the three per-spec validity checks:
         //
-        //   1. `fishead` `Segment length in bytes` matches the file size
-        //      (a one-shot lazy check on the first seek call);
+        //   1. the `fishead` `Segment length in bytes` is consistent with
+        //      the file — it equals the file size (single-link file), or,
+        //      for a chained file, names a shorter length at which a new
+        //      link's `OggS` BOS page begins ("a new \"link\" in a
+        //      \"chain\" can start at the end of the segment") — a one-shot
+        //      lazy check on the first seek call;
         //   2. the keypoint's stored offset lands on an `OggS` page
         //      boundary;
         //   3. that page's `bitstream_serial_number` equals the
