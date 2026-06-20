@@ -292,6 +292,36 @@ path real >64 KB Vorbis setup and Theora keyframe packets exercise.
 The lossy counterpart (a spanning packet whose middle page is dropped,
 discarded rather than spliced) lives in `tests/page_loss.rs`.
 
+#### Unique serial-number enforcement (§4)
+
+RFC 3533 §4 makes serial uniqueness a normative **MUST** for both
+topologies: "Each grouped logical bitstream MUST have a unique serial
+number within the scope of the physical bitstream" and, identically,
+"Each chained logical bitstream MUST have a unique serial number within
+the scope of the physical bitstream." A conforming encoder never reuses a
+`bitstream_serial_number`, so this never fires on a well-formed file.
+
+A malformed file that does reuse a serial — two grouped streams sharing
+one, or a chained link reusing a prior link's — used to silently merge:
+the duplicate BOS fell through to the reassembly path, splicing the new
+bitstream's packets onto the colliding stream's stale pending bytes and
+reading its identification packet as content. The demuxer now detects the
+collision and **restarts the serial in place**: it drops the prior
+occupant's buffered partial packet, resets the page-sequence tracker (so
+the restart's pages are not mis-read as page loss), re-arms header capture
+from the duplicate BOS's own codec, and re-files the serial under the new
+BOS's link index. Every packet then delivered for that serial still
+belongs to a single bitstream — the most recent one to claim the serial —
+so a downstream decoder never receives a frankenpacket assembled from two
+streams. `OggDemuxer::duplicate_serial_count()` exposes the running tally
+(0 for a conforming file). Detection fires on all three walkers (the
+`open` BOS walk, the `next_packet` data path, and the `build_seek_index`
+header scan); the header scan, which visits every page exactly once, is
+the authoritative file-wide source, so the two walkers never double-count
+the same collision. `tests/duplicate_serial.rs` pins the grouping
+violation, the chaining violation, three-way reuse, the index-scan /
+drain non-double-count, and the conforming-file zero case.
+
 ### Skeleton metadata bitstream (Xiph Skeleton 3.0 / 4.0)
 
 Ogg files often carry an **Ogg Skeleton** logical bitstream as their
