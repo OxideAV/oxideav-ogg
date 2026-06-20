@@ -31,9 +31,13 @@
 //!   `continued`-bit, page-sequence-number, lacing-terminator state,
 //!   and 255-segment boundaries are chosen by the fuzzer.
 //! * Counter accessors `hole_count` / `framing_error_count` /
-//!   `resync_count` after the drain. They are interrogated, not
-//!   compared to ground truth — the only oracle is "must not panic"
-//!   per the clean-room wall.
+//!   `resync_count` / `duplicate_serial_count` after the drain. They
+//!   are interrogated, not compared to ground truth — the only oracle
+//!   is "must not panic" per the clean-room wall.
+//! * Optional duplicate-BOS injection (RFC 3533 §4 unique-serial
+//!   violation) appended after the body pages when a fuzz control bit
+//!   is set, so the `restart_serial_on_duplicate_bos` recovery path is
+//!   reached deterministically instead of essentially never.
 //!
 //! Soft invariant that IS checked: every delivered packet's
 //! `stream_index` must be inside the bound the demuxer just reported
@@ -228,6 +232,31 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // ----------------------------------------------------------------
+    // Optional duplicate-BOS injection (RFC 3533 §4 unique-serial
+    // violation). When the fuzzer sets the low bit of the next control
+    // byte, append a second BOS page reusing SERIAL after the body
+    // pages — a chained-link serial collision. This drives the
+    // demuxer's `restart_serial_on_duplicate_bos` recovery path
+    // (drop stale partial, reset sequence tracker, re-arm headers,
+    // re-file link) which random fuzz bytes essentially never reach on
+    // their own, and the `duplicate_serial_count` accessor below is
+    // interrogated for panic-freedom on the resulting state.
+    if cursor < data.len() && data[cursor] & 0x01 != 0 {
+        cursor += 1;
+        let id = vorbis_id_packet();
+        let dup_bos = Page {
+            flags: flags::FIRST_PAGE,
+            granule_position: 0,
+            serial: SERIAL,
+            seq_no: 0,
+            lacing: lace(id.len()),
+            data: id,
+        }
+        .to_bytes();
+        buf.extend_from_slice(&dup_bos);
+    }
+
+    // ----------------------------------------------------------------
     // Optional global mutation pass: flip one byte in the assembled
     // buffer at a fuzz-derived offset. This adds CRC-failure resync
     // exercise on top of the structurally-malformed-by-design pages
@@ -283,6 +312,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = dmx.hole_count();
     let _ = dmx.framing_error_count();
     let _ = dmx.resync_count();
+    let _ = dmx.duplicate_serial_count();
 });
 
 /// Build the three Vorbis header pages: identification (BOS), comment,

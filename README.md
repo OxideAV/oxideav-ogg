@@ -1040,9 +1040,11 @@ and our own source) hammers five surfaces with attacker bytes:
   continuation-without-terminator, segment-table truncation),
   attacker-driven `continued` / `first` / `last` flag bits,
   attacker-driven page-sequence-number deltas (zero = duplicate,
-  large = fabricated hole), and an optional single-byte global
-  mutation that triggers CRC-failure resync. The reassembly path
-  is therefore reached on essentially every iteration.
+  large = fabricated hole), an optional duplicate-BOS page reusing
+  the stream serial (RFC 3533 §4 unique-serial violation, driving the
+  `restart_serial_on_duplicate_bos` recovery path), and an optional
+  single-byte global mutation that triggers CRC-failure resync. The
+  reassembly path is therefore reached on essentially every iteration.
 - `skeleton_parse` — the four other targets virtually never reach
   the Skeleton packet parsers because random fuzz buffers almost
   never begin with `fishead\0` / `fisbone\0` / `index\0`. This
