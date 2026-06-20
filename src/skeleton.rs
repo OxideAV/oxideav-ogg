@@ -96,6 +96,27 @@ impl Rational {
             self.numerator as f64 / self.denominator as f64
         }
     }
+
+    /// Convert to seconds, distinguishing the spec's zero-denominator
+    /// **"unknown"** marker from a genuine `0.0` value.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` defines rationals as a
+    /// numerator over a denominator "providing the temporal resolution
+    /// at which the time is given", and §"Keyframe index packets" gives
+    /// the zero denominator the dedicated meaning "that value was unable
+    /// to be determined at indexing time, and is unknown". The lossy
+    /// [`Self::to_seconds`] collapses that marker to `0.0`, which is
+    /// indistinguishable from a rational that genuinely encodes time
+    /// zero (`0/1`). This accessor preserves the distinction: `None`
+    /// for the zero-denominator "unknown" marker, `Some(seconds)`
+    /// otherwise — including `Some(0.0)` for an explicit `0/N` rational.
+    pub fn to_seconds_checked(self) -> Option<f64> {
+        if self.denominator == 0 {
+            None
+        } else {
+            Some(self.numerator as f64 / self.denominator as f64)
+        }
+    }
 }
 
 /// `fishead` ident header packet (Skeleton 3.0 + 4.0 layout).
@@ -2656,6 +2677,57 @@ impl Skeleton {
         self.head.as_ref().map(|h| h.presentation_time.to_seconds())
     }
 
+    /// The file's **presentation (cut-in) time** in seconds, distinguishing
+    /// the spec's zero-denominator "unknown" marker from a genuine `0.0`.
+    ///
+    /// Same provenance as [`Self::presentation_seconds`] — the once-per-file
+    /// fishead presentation time of `docs/container/ogg/ogg-skeleton-4.0.md`
+    /// §"How to allow the creation of substreams …" — but with the three-way
+    /// contract used elsewhere in this module:
+    ///
+    /// * `None` — no fishead recorded yet, **or** the presentation-time
+    ///   rational has a zero denominator (the spec's "unknown" marker);
+    /// * `Some(seconds)` — a usable rational, including `Some(0.0)` for an
+    ///   explicit `0/N` (un-cut content that presents from time zero).
+    ///
+    /// The lossy [`Self::presentation_seconds`] cannot tell an absent /
+    /// unknown anchor apart from a deliberate time-zero one; choose this
+    /// accessor when a caller must branch on "no cut-in time was recorded"
+    /// versus "the cut-in time is exactly zero".
+    pub fn presentation_seconds_checked(&self) -> Option<f64> {
+        self.head
+            .as_ref()
+            .and_then(|h| h.presentation_time.to_seconds_checked())
+    }
+
+    /// The file's **basetime** in seconds: the playback time that the
+    /// fishead maps onto granule position 0 for every logical bitstream.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+    /// information is needed?" defines the basetime as "a mapping for
+    /// granule position 0 (for all logical bitstreams) to a playback
+    /// time", with the motivating example that "most content in
+    /// professional analog video creation actually starts at a time of 1
+    /// hour and thus adding this additional field allows them to retain
+    /// this mapping on digitizing their content". It is the additive
+    /// offset that [`Self::granule_to_seconds`] and
+    /// [`Self::stream_start_seconds`] fold on top of their track-relative
+    /// granule mappings.
+    ///
+    /// Returns `None` when no fishead has been recorded yet, **or** when
+    /// the basetime rational has a zero denominator (the spec's "unknown"
+    /// marker). A genuine `0/N` basetime — the un-cut default where
+    /// granule 0 maps to playback time zero — yields `Some(0.0)`. The
+    /// granule-mapping accessors deliberately treat a missing / unknown
+    /// basetime as a `0.0` offset rather than blocking the mapping; this
+    /// accessor instead surfaces the distinction so a caller can tell a
+    /// recorded zero anchor apart from an absent one.
+    pub fn basetime_seconds(&self) -> Option<f64> {
+        self.head
+            .as_ref()
+            .and_then(|h| h.basetime.to_seconds_checked())
+    }
+
     /// The **file-absolute** playback time, in seconds, at which the track
     /// identified by `serial` begins its data in a (possibly remuxed) Ogg
     /// segment: the per-track [`FisBone::start_seconds`] (basegranule /
@@ -3216,6 +3288,58 @@ mod tests {
         // Skeleton 4.0 §"Keyframe index packets": denominator 0 means
         // "unknown"; expose that as 0.0 rather than NaN.
         assert_eq!(Rational::new(123, 0).to_seconds(), 0.0);
+    }
+
+    #[test]
+    fn rational_seconds_checked_distinguishes_unknown_from_zero() {
+        // A usable rational maps to Some(seconds), including an explicit
+        // 0/N which is a genuine "time zero", not "unknown".
+        assert_eq!(Rational::new(7, 1000).to_seconds_checked(), Some(0.007));
+        assert_eq!(Rational::new(0, 1).to_seconds_checked(), Some(0.0));
+        // Skeleton 4.0 zero-denominator "unknown" marker is None, distinct
+        // from the lossy `to_seconds` which collapses it to 0.0.
+        assert_eq!(Rational::new(123, 0).to_seconds_checked(), None);
+        assert_eq!(Rational::new(0, 0).to_seconds_checked(), None);
+    }
+
+    #[test]
+    fn skeleton_presentation_and_basetime_checked_accessors() {
+        // No fishead recorded: both checked accessors are None.
+        let empty = Skeleton::new();
+        assert_eq!(empty.presentation_seconds_checked(), None);
+        assert_eq!(empty.basetime_seconds(), None);
+
+        // A fishead with a usable presentation time (7 s, the spec's
+        // `?t=7-59` cut-in example) and a 1-hour basetime (the analog-
+        // video "starts at 01:00:00" example from §"What decoding-related
+        // information is needed?").
+        let mut head = FisHead::new(Version::V4_0);
+        head.presentation_time = Rational::new(7, 1);
+        head.basetime = Rational::new(3600, 1);
+        let mut sk = Skeleton::new();
+        sk.set_head(head);
+        assert_eq!(sk.presentation_seconds_checked(), Some(7.0));
+        assert_eq!(sk.basetime_seconds(), Some(3600.0));
+
+        // An explicit 0/N anchor is a genuine zero, surfaced as Some(0.0).
+        let mut head0 = FisHead::new(Version::V4_0);
+        head0.presentation_time = Rational::new(0, 1000);
+        head0.basetime = Rational::new(0, 1000);
+        let mut sk0 = Skeleton::new();
+        sk0.set_head(head0);
+        assert_eq!(sk0.presentation_seconds_checked(), Some(0.0));
+        assert_eq!(sk0.basetime_seconds(), Some(0.0));
+
+        // A zero-denominator anchor is the spec's "unknown" marker: None
+        // from the checked accessors even though the lossy ones return 0.0.
+        let mut head_unk = FisHead::new(Version::V4_0);
+        head_unk.presentation_time = Rational::new(5, 0);
+        head_unk.basetime = Rational::new(9, 0);
+        let mut sk_unk = Skeleton::new();
+        sk_unk.set_head(head_unk);
+        assert_eq!(sk_unk.presentation_seconds_checked(), None);
+        assert_eq!(sk_unk.basetime_seconds(), None);
+        assert_eq!(sk_unk.presentation_seconds(), Some(0.0));
     }
 
     // -------------------------------------------------------------

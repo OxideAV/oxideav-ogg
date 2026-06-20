@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Skeleton 4.0 fishead time-anchor accessors that distinguish the spec's
+  zero-denominator "unknown" marker from a genuine time zero.** The fishead's
+  presentation time ("the actual cut-in time … all logical bitstreams are
+  meant to start presenting from") and basetime ("a mapping for granule
+  position 0 (for all logical bitstreams) to a playback time", per
+  `docs/container/ogg/ogg-skeleton-4.0.md`) were parsed and serialized but had
+  no typed read API — and the existing lossy `presentation_seconds` collapses
+  a zero-denominator rational (the spec's "unknown" marker) to `0.0`,
+  indistinguishable from a deliberate `0/N` time-zero anchor. New
+  `Rational::to_seconds_checked() -> Option<f64>` makes the distinction at the
+  rational level (`None` for a zero denominator, `Some(0.0)` for `0/N`), and
+  `Skeleton::presentation_seconds_checked()` / `Skeleton::basetime_seconds()`
+  surface the two fishead anchors with the same three-way contract used by the
+  other typed Skeleton accessors. A caller can now tell "no cut-in time
+  recorded / unknown" apart from "the cut-in time is exactly zero".
+
 - **RFC 3533 §4 unique-serial-number enforcement (`duplicate_serial_count`).**
   §4 makes serial uniqueness a normative MUST for both topologies: "Each
   grouped logical bitstream MUST have a unique serial number within the scope
