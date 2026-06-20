@@ -195,6 +195,14 @@ struct LogicalStream {
     /// page was not itself a continuation orphaned by a hole. Cleared once
     /// the packet completes or a hole invalidates the partial bytes.
     pending_valid: bool,
+    /// True once `process_page` has handled this serial's BOS page (the
+    /// initial header-capture drain). `read_bos_section` registers a stream
+    /// and queues its BOS page, which `process_page` then re-processes during
+    /// header collection — that first re-processing is normal and sets this
+    /// flag. A BOS page for a serial whose stream already has this flag set
+    /// is a genuine RFC 3533 §4 unique-serial violation (a second grouped or
+    /// chained BOS reusing the serial), not the expected initial drain.
+    bos_processed: bool,
 }
 
 /// Concrete Ogg demuxer state. Most callers should use the boxed
@@ -340,6 +348,22 @@ pub struct OggDemuxer {
     /// already the stream's first content page (no earlier page to back
     /// up to). Surfaced via [`OggDemuxer::preroll_seek_count`].
     preroll_seeks: u64,
+    /// Number of `bitstream_serial_number` collisions the demuxer has
+    /// observed — a violation of the RFC 3533 §4 normative rule that
+    /// "Each grouped logical bitstream MUST have a unique serial number
+    /// within the scope of the physical bitstream" (and the identical
+    /// rule for chained bitstreams). A collision is a BOS page whose
+    /// serial is already live in `state_by_serial`: either two grouped
+    /// streams in the same link sharing a serial, or a chained link
+    /// reusing a serial a prior link already used. The demuxer recovers
+    /// by treating the second BOS as a logical restart of that serial
+    /// (its stale reassembly buffer is dropped and `last_seq` reset so
+    /// the new bitstream's packets are not spliced onto the old one's
+    /// pending bytes), and the link index is updated to the new BOS's
+    /// link so subsequent diagnostics attribute the serial to the link
+    /// it now belongs to. Surfaced via
+    /// [`OggDemuxer::duplicate_serial_count`].
+    duplicate_serials: u64,
 }
 
 impl OggDemuxer {
@@ -369,6 +393,7 @@ impl OggDemuxer {
             skeleton_index_rejects: 0,
             skeleton_segment_length_ok: None,
             preroll_seeks: 0,
+            duplicate_serials: 0,
         }
     }
 
@@ -467,6 +492,23 @@ impl OggDemuxer {
 
         // Scan from byte 0 — every Ogg page starts with `OggS`.
         let mut cursor: u64 = 0;
+        // Serials whose BOS page we've already seen *within this scan*. The
+        // scan re-walks the whole file (including the initial BOS pages that
+        // `open` already registered), so `state_by_serial.contains_key` cannot
+        // distinguish a genuine RFC 3533 §4 serial collision from re-meeting a
+        // page we registered at open time. A serial appearing as a BOS twice
+        // *in this single scan* is the real violation; this set scopes the
+        // collision check to the scan so the re-walk does not over-count.
+        let mut bos_serials_this_scan: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+        // This scan visits every page in the file exactly once, so it is the
+        // authoritative source for the file-wide duplicate-serial tally. Reset
+        // the counter to the scan's own findings rather than adding to whatever
+        // `next_packet` (which may have partially drained the file) accumulated,
+        // so a caller that runs `build_seek_index` gets the true file-wide count
+        // and `open_indexed` (build immediately after open) does not double-count
+        // duplicates the subsequent `next_packet` walk re-observes.
+        self.duplicate_serials = 0;
         // Re-use a chunk buffer to find `OggS` captures cheaply.
         const CHUNK: u64 = 64 * 1024;
         while cursor < end {
@@ -538,34 +580,50 @@ impl OggDemuxer {
                 // attribute that link's last granule to a known time
                 // base, even before any packet flows through the demuxer.
                 let is_bos = flags_byte & page::flags::FIRST_PAGE != 0;
-                if is_bos && !self.state_by_serial.contains_key(&serial) {
-                    // Read the page payload so we can parse the first
-                    // packet for codec_id + sample_rate. Identification
-                    // packets must fit in a single page per the various
-                    // codec mapping RFCs, so we only need this page's
-                    // data, not any continuation.
-                    let mut data = vec![0u8; data_len as usize];
-                    if self.input.read(&mut data)? != data_len as usize {
-                        self.input.seek(SeekFrom::Start(saved_pos))?;
-                        self.seek_index_built = true;
-                        return Ok(());
+                if is_bos {
+                    // A BOS serial seen for the SECOND time in this scan is an
+                    // RFC 3533 §4 unique-serial violation. (`state_by_serial`
+                    // alone can't tell this apart from re-meeting an
+                    // open()-registered initial BOS, since the scan re-walks
+                    // the whole file — hence the scan-scoped set.) Count it,
+                    // open a new link if it followed a data page, and do NOT
+                    // re-register a duplicate stream slot.
+                    let is_skeleton = Some(serial) == self.skeleton_serial;
+                    if !is_skeleton && !bos_serials_this_scan.insert(serial) {
+                        if self.seen_nonbos_in_current_link {
+                            self.next_link_index = self.next_link_index.saturating_add(1);
+                            self.seen_nonbos_in_current_link = false;
+                        }
+                        self.duplicate_serials += 1;
+                    } else if !self.state_by_serial.contains_key(&serial) {
+                        // Read the page payload so we can parse the first
+                        // packet for codec_id + sample_rate. Identification
+                        // packets must fit in a single page per the various
+                        // codec mapping RFCs, so we only need this page's
+                        // data, not any continuation.
+                        let mut data = vec![0u8; data_len as usize];
+                        if self.input.read(&mut data)? != data_len as usize {
+                            self.input.seek(SeekFrom::Start(saved_pos))?;
+                            self.seek_index_built = true;
+                            return Ok(());
+                        }
+                        let synth = Page {
+                            flags: flags_byte,
+                            granule_position: granule,
+                            serial,
+                            seq_no: u32::from_le_bytes([hdr[18], hdr[19], hdr[20], hdr[21]]),
+                            lacing: lacing.clone(),
+                            data,
+                        };
+                        if self.seen_nonbos_in_current_link {
+                            self.next_link_index = self.next_link_index.saturating_add(1);
+                            self.seen_nonbos_in_current_link = false;
+                        }
+                        // Best-effort: ignore registration failure (a malformed
+                        // BOS shouldn't abort the seek-index build).
+                        let _ = self.register_stream(&synth);
                     }
-                    let synth = Page {
-                        flags: flags_byte,
-                        granule_position: granule,
-                        serial,
-                        seq_no: u32::from_le_bytes([hdr[18], hdr[19], hdr[20], hdr[21]]),
-                        lacing: lacing.clone(),
-                        data,
-                    };
-                    if self.seen_nonbos_in_current_link {
-                        self.next_link_index = self.next_link_index.saturating_add(1);
-                        self.seen_nonbos_in_current_link = false;
-                    }
-                    // Best-effort: ignore registration failure (a malformed
-                    // BOS shouldn't abort the seek-index build).
-                    let _ = self.register_stream(&synth);
-                } else if !is_bos {
+                } else {
                     self.seen_nonbos_in_current_link = true;
                 }
 
@@ -703,6 +761,40 @@ impl OggDemuxer {
     /// header-only `build_seek_index` scan does not contribute.
     pub fn resync_count(&self) -> u64 {
         self.resyncs
+    }
+
+    /// Number of `bitstream_serial_number` collisions detected — BOS pages
+    /// whose serial was already live in the file when they arrived. RFC 3533
+    /// §4 makes serial uniqueness a normative MUST: "Each grouped logical
+    /// bitstream MUST have a unique serial number within the scope of the
+    /// physical bitstream" and, identically, "Each chained logical bitstream
+    /// MUST have a unique serial number within the scope of the physical
+    /// bitstream." A conforming encoder never reuses a serial, so this is
+    /// zero for every well-formed file.
+    ///
+    /// Two malformed shapes tick the counter:
+    ///
+    /// * a second grouped BOS in the same link declaring a serial an earlier
+    ///   grouped BOS already claimed (a grouping violation), and
+    /// * a chained link whose BOS reuses a serial a prior link already used
+    ///   (a chaining violation).
+    ///
+    /// Rather than abort or silently splice the new bitstream's packets onto
+    /// the colliding stream's stale reassembly buffer, the demuxer treats the
+    /// duplicate BOS as a logical restart of that serial: it drops any partial
+    /// packet the previous occupant left buffered, resets the page-sequence
+    /// tracker so the restart's pages do not register as page-loss holes, and
+    /// re-files the serial under the new BOS's link index. Every packet the
+    /// demuxer then delivers for that serial still belongs to a single
+    /// bitstream — the most recent one to claim the serial — so downstream
+    /// decoders never receive a frankenpacket assembled from two streams.
+    ///
+    /// The tally reflects BOS pages seen via `next_packet`, the initial
+    /// `open` BOS walk, or the `build_seek_index` header scan. A non-zero
+    /// value lets a caller surface "this file reuses logical-stream serials,
+    /// which the Ogg spec forbids" without losing the demux.
+    pub fn duplicate_serial_count(&self) -> u64 {
+        self.duplicate_serials
     }
 
     /// Number of distinct chained links the demuxer has observed so far
@@ -1450,6 +1542,70 @@ impl OggDemuxer {
         })
     }
 
+    /// Handle a BOS page whose `bitstream_serial_number` is already live in
+    /// `state_by_serial` — a violation of the RFC 3533 §4 unique-serial MUST.
+    /// Returns `true` if this was a collision (so the caller skips the normal
+    /// fresh-registration path), `false` if `serial` is genuinely new.
+    ///
+    /// On a collision the existing logical stream is *restarted in place*: its
+    /// pending partial-packet buffer is dropped and its page-sequence tracker
+    /// reset (so the duplicate BOS's pages are not mis-read as the old
+    /// occupant's continuation or as a page-loss hole), and the stream is
+    /// re-filed under `new_link_index` so link diagnostics follow the serial
+    /// to the link that now owns it. The public `StreamInfo` entry and codec
+    /// parameters are left untouched: the colliding bitstream is, by the spec
+    /// violation, indistinguishable at the container layer from the original,
+    /// so we keep the single stream slot and just refuse to splice the two
+    /// bitstreams' bytes together. The Skeleton bitstream's serial never
+    /// collides through this path (it is recorded separately), so a `fishead`
+    /// re-declaration is not treated here.
+    fn restart_serial_on_duplicate_bos(&mut self, bos_page: &Page, new_link_index: u32) -> bool {
+        let serial = bos_page.serial;
+        if Some(serial) == self.skeleton_serial {
+            return false;
+        }
+        if !self.state_by_serial.contains_key(&serial) {
+            return false;
+        }
+        // Re-arm header capture so the restarted bitstream's identification /
+        // comment / setup packets are re-read as headers (not emitted as
+        // content frames), exactly as a fresh registration would. The codec
+        // is taken from the duplicate BOS's own first packet — a chained link
+        // may legally reuse a serial for a *different* codec, so we must not
+        // assume the original stream's header count still applies.
+        let header_count = bos_page
+            .packet_segments()
+            .first()
+            .map(|seg| {
+                codec_id::header_packet_count(&codec_id::detect(&bos_page.data[seg.data.clone()]))
+            })
+            .unwrap_or(0);
+        // The `build_seek_index` header scan, when it has run, is the
+        // authoritative file-wide source for the duplicate-serial tally
+        // (it visits every page exactly once). Only the incremental
+        // `next_packet` / `open`-walk path counts here, so the two walkers
+        // never double-count the same collision. The state reset below
+        // always runs — it is required for correct reassembly regardless of
+        // which walker observed the duplicate.
+        if !self.seek_index_built {
+            self.duplicate_serials += 1;
+        }
+        let state = self
+            .state_by_serial
+            .get_mut(&serial)
+            .expect("serial presence checked above");
+        state.pending.clear();
+        state.pending_valid = false;
+        state.last_seq = None;
+        state.link_index = new_link_index;
+        state.headers_remaining = header_count;
+        state.header_packets.clear();
+        // The caller re-arms `bos_processed` after this returns; reset it here
+        // so the restarted occupant's BOS is treated as freshly seen.
+        state.bos_processed = false;
+        true
+    }
+
     /// Read pages until we leave the Beginning-Of-Stream section, registering
     /// every logical bitstream we discover. The pages we read are queued so
     /// `next_packet` can drain them in order.
@@ -1463,7 +1619,14 @@ impl OggDemuxer {
                 }
             };
             let is_bos = page.is_first();
-            if is_bos {
+            if is_bos && !self.state_by_serial.contains_key(&page.serial) {
+                // Register each NEW serial's stream. A BOS reusing a serial
+                // already registered in this same initial bos section is an
+                // RFC 3533 §4 grouping violation; we do NOT register a second
+                // `StreamInfo` for it here. The page is still queued, and
+                // `process_page` (the single drain authority) recognises the
+                // duplicate when it sees this serial's BOS for the second
+                // time and counts / restarts it there.
                 self.register_stream(&page)?;
             }
             self.page_queue.push_back(page);
@@ -1556,6 +1719,7 @@ impl OggDemuxer {
                 link_index: self.next_link_index,
                 last_seq: None,
                 pending_valid: false,
+                bos_processed: false,
             },
         );
         Ok(())
@@ -2088,20 +2252,61 @@ impl OggDemuxer {
         // are part of the same link's BOS section (multiplex within one
         // link). Either way, the registered stream inherits the link
         // index that was current at the moment of its BOS.
-        if page.is_first() && !self.state_by_serial.contains_key(&page.serial) {
-            if self.seen_nonbos_in_current_link {
+        // BOS-page handling. Three cases for a `is_first()` page (the
+        // Skeleton bitstream's BOS is handled by its own path and excluded
+        // here):
+        //
+        //  * unknown serial — a NEW logical bitstream begins (a chained
+        //    link's first BOS, or a grouped BOS in the initial section);
+        //    register it so its identification packet is captured as a
+        //    header, not delivered as data.
+        //  * known serial whose BOS we have NOT yet processed — the expected
+        //    re-processing of an initial-section BOS that `read_bos_section`
+        //    already registered and queued. Mark it processed; otherwise do
+        //    nothing special (its headers are captured by the loop below).
+        //  * known serial whose BOS we HAVE processed — an RFC 3533 §4
+        //    unique-serial violation (a second grouped or chained BOS reusing
+        //    the serial). It must NOT fall through to the reassembly loop with
+        //    the prior occupant's state, which would splice the two
+        //    bitstreams' packets together. Restart the serial in place (drop
+        //    its stale buffer, reset its sequence tracker, re-arm header
+        //    capture, re-file it under the new link) and count the violation.
+        let is_skeleton_bos = Some(page.serial) == self.skeleton_serial;
+        if page.is_first() && !is_skeleton_bos {
+            let known = self.state_by_serial.contains_key(&page.serial);
+            let is_duplicate = known
+                && self
+                    .state_by_serial
+                    .get(&page.serial)
+                    .map(|s| s.bos_processed)
+                    .unwrap_or(false);
+            // A new bitstream's BOS, or a duplicate BOS, that follows at least
+            // one data page in the current link opens a new chained link. The
+            // expected re-processing of an already-known, not-yet-processed
+            // initial BOS does not (it is still the current link).
+            if (!known || is_duplicate) && self.seen_nonbos_in_current_link {
                 self.next_link_index = self.next_link_index.saturating_add(1);
                 self.seen_nonbos_in_current_link = false;
             }
-            // `register_stream` short-circuits for a `fishead\0` BOS,
-            // initialising `skeleton_serial` instead of pushing a
-            // public stream entry. The BOS page itself carries the
-            // fishead packet which `register_stream` already parsed
-            // and stashed, so there is nothing more to do for the
-            // Skeleton stream on its own BOS page.
-            self.register_stream(&page)?;
-            if Some(page.serial) == self.skeleton_serial {
-                return Ok(());
+            if !known {
+                self.register_stream(&page)?;
+            } else if is_duplicate {
+                self.restart_serial_on_duplicate_bos(&page, self.next_link_index);
+            }
+            // Mark this serial's BOS as processed so a later BOS for the same
+            // serial is recognised as the duplicate it is. (After a restart,
+            // `restart_serial_on_duplicate_bos` reset the flag, so this line
+            // re-arms it for the restarted occupant.)
+            if let Some(s) = self.state_by_serial.get_mut(&page.serial) {
+                s.bos_processed = true;
+            }
+        } else if page.is_first() && is_skeleton_bos {
+            // `register_stream` for a `fishead\0` BOS initialises
+            // `skeleton_serial` rather than pushing a public stream; the BOS
+            // page carries the fishead packet it already parsed, so route to
+            // the Skeleton path below.
+            if !self.state_by_serial.contains_key(&page.serial) {
+                self.register_stream(&page)?;
             }
         } else if !page.is_first() {
             self.seen_nonbos_in_current_link = true;

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **RFC 3533 §4 unique-serial-number enforcement (`duplicate_serial_count`).**
+  §4 makes serial uniqueness a normative MUST for both topologies: "Each
+  grouped logical bitstream MUST have a unique serial number within the scope
+  of the physical bitstream" and, identically, "Each chained logical bitstream
+  MUST have a unique serial number within the scope of the physical bitstream."
+  The demuxer previously silently merged a BOS page whose serial was already
+  live into the existing stream's reassembly state — splicing two distinct
+  bitstreams' packets together and reading the duplicate's identification
+  packet as content. It now detects the collision, recovers by restarting the
+  colliding serial in place (drops the stale partial-packet buffer, resets the
+  page-sequence tracker so the restart's pages are not mis-read as page loss,
+  re-arms header capture from the duplicate BOS's own codec, and re-files the
+  serial under the new BOS's link index), and exposes the running tally on
+  `OggDemuxer::duplicate_serial_count()`. Detection fires on all three walkers
+  (the `open` BOS section walk, the `next_packet` data-page path, and the
+  `build_seek_index` header scan); the header scan, which visits every page
+  exactly once, is the authoritative file-wide source and the two walkers
+  never double-count the same collision. Zero for every conforming file.
+
 - **Byte-exact coverage for clean multi-page packet reassembly (RFC 3533
   §5).** §5 specifies that a packet larger than a page "has to be distributed
   over several pages" by 255-byte lacing chunks, terminated by a value `< 255`
