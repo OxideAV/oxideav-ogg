@@ -19,6 +19,7 @@ pub fn open(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     state.read_until_headers_collected()?;
     state.populate_extradata();
     state.populate_metadata();
+    state.anchor_start_times_from_skeleton();
     state.populate_duration();
     Ok(Box::new(state))
 }
@@ -50,6 +51,7 @@ pub fn open_concrete(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> R
     state.read_until_headers_collected()?;
     state.populate_extradata();
     state.populate_metadata();
+    state.anchor_start_times_from_skeleton();
     state.populate_duration();
     Ok(state)
 }
@@ -1216,10 +1218,74 @@ impl OggDemuxer {
     /// fall back to the stream's own time-base — the prior behaviour,
     /// correct for the audio mappings whose time-base is already the
     /// granule rate.
+    /// Anchor each stream's `start_time` onto the playback timeline the
+    /// Skeleton fishead defines.
+    ///
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` §"What decoding-related
+    /// information is needed?" defines the fishead **basetime** as "a
+    /// mapping for granule position 0 (for all logical bitstreams) to a
+    /// playback time" — the motivating example being analog video that
+    /// "actually starts at a time of 1 hour" and wants to "retain this
+    /// mapping on digitizing their content". For a remuxed substream the
+    /// per-track **basegranule** further shifts where that track's own data
+    /// begins; [`Skeleton::stream_start_seconds`] combines both
+    /// (`basetime + basegranule / granulerate`).
+    ///
+    /// Without this, every stream reports `start_time = 0` regardless of
+    /// the fishead anchor, so a player has no way to place the content on
+    /// the intended timeline. We translate the seconds value into the
+    /// stream's own `time_base` ticks (the unit `start_time` is expressed
+    /// in) and store it. Streams with no Skeleton, no fisbone, an unusable
+    /// granule rate, or a zero/absent basetime+basegranule keep their
+    /// `start_time = 0` default — the un-cut, un-anchored common case.
+    ///
+    /// Only `start_time` is touched; the duration accumulator stays
+    /// basetime-free (see [`Self::granule_to_micros_for_serial`]) so
+    /// `duration == end - start` holds.
+    fn anchor_start_times_from_skeleton(&mut self) {
+        let Some(sk) = self.skeleton.as_ref() else {
+            return;
+        };
+        // Snapshot (public_index, serial) pairs first so we can borrow
+        // `self.streams` mutably below without aliasing `self.skeleton`.
+        let anchors: Vec<(usize, f64)> = self
+            .state_by_serial
+            .iter()
+            .filter_map(|(serial, state)| {
+                sk.stream_start_seconds(*serial)
+                    .filter(|s| *s != 0.0)
+                    .map(|secs| (state.public_index, secs))
+            })
+            .collect();
+        for (public_index, secs) in anchors {
+            let Some(stream) = self.streams.get_mut(public_index) else {
+                continue;
+            };
+            // Convert the seconds anchor into the stream's own time_base
+            // ticks (the unit `start_time` is expressed in). `seconds_of(1)`
+            // is the duration of one tick; dividing recovers the tick count.
+            let tick = stream.time_base.seconds_of(1);
+            if tick > 0.0 {
+                stream.start_time = Some((secs / tick).round() as i64);
+            }
+        }
+    }
+
     fn granule_to_micros_for_serial(&self, serial: u32, granule: i64) -> i64 {
         let Some(state) = self.state_by_serial.get(&serial) else {
             return 0;
         };
+        // This is the **track-relative** granule→time used by the duration
+        // accumulator: it measures elapsed playback from the track's granule
+        // 0, NOT the file-absolute playback time. The fishead basetime — the
+        // spec's "mapping for granule position 0 (for all logical
+        // bitstreams) to a playback time" (`docs/container/ogg/
+        // ogg-skeleton-4.0.md`) — is a *timeline anchor*, not part of a
+        // duration: a stream that runs granule 0..N is N/rate seconds long
+        // regardless of where granule 0 sits on the playback clock. The
+        // basetime is therefore applied to each stream's `start_time`
+        // (see `register_stream`), and the duration here stays basetime-free
+        // so duration == end - start.
         if let Some(secs) = self
             .skeleton
             .as_ref()

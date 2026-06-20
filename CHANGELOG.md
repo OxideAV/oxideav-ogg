@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The demuxer anchors each stream's `start_time` onto the Skeleton fishead
+  playback timeline.** `docs/container/ogg/ogg-skeleton-4.0.md` §"What
+  decoding-related information is needed?" defines the fishead **basetime** as
+  "a mapping for granule position 0 (for all logical bitstreams) to a playback
+  time" (the analog-video "starts at a time of 1 hour" example), and §"How to
+  allow the creation of substreams …" adds the per-track **basegranule**, "the
+  granule number with which this logical bitstream starts in the remuxed
+  stream". Both were exposed by `Skeleton::stream_start_seconds` but the
+  demuxer ignored them and reported `start_time = 0` for every stream. `open`
+  / `open_concrete` now fold `basetime + basegranule / granulerate` into each
+  stream's `start_time` (converted into the stream's own `time_base` ticks),
+  so a player can place the content on the intended timeline. The basetime is
+  a *timeline anchor*, not a duration component, so the duration accumulator
+  stays basetime-free and `duration == end - start` continues to hold (a
+  3600 s basetime on a 2 s stream still reports a 2 s duration). Streams with
+  no Skeleton, no fisbone, an unusable granule rate, or a zero/absent
+  basetime+basegranule keep the `start_time = 0` default — the un-cut common
+  case. New `tests/skeleton_basetime.rs` covers the basetime-only anchor, the
+  basetime+basegranule sum, the zero-anchor no-op, and the basetime-free
+  duration invariant.
+
 - **Skeleton 4.0 fishead time-anchor accessors that distinguish the spec's
   zero-denominator "unknown" marker from a genuine time zero.** The fishead's
   presentation time ("the actual cut-in time … all logical bitstreams are
