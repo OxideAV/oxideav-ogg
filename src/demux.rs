@@ -1774,7 +1774,8 @@ impl OggDemuxer {
             .packet_segments()
             .first()
             .map(|seg| {
-                codec_id::header_packet_count(&codec_id::detect(&bos_page.data[seg.data.clone()]))
+                let first = &bos_page.data[seg.data.clone()];
+                codec_id::header_packet_count_from_first(&codec_id::detect(first), first)
             })
             .unwrap_or(0);
         // The `build_seek_index` header scan, when it has run, is the
@@ -1920,7 +1921,7 @@ impl OggDemuxer {
             LogicalStream {
                 public_index,
                 pending: Vec::new(),
-                headers_remaining: codec_id::header_packet_count(&codec_id),
+                headers_remaining: codec_id::header_packet_count_from_first(&codec_id, first),
                 header_packets: Vec::new(),
                 granule_seen: 0,
                 link_index: self.next_link_index,
@@ -2162,6 +2163,26 @@ impl OggDemuxer {
                     let p = &packets[1];
                     if p.len() > 7 && &p[1..7] == b"theora" {
                         parse_vorbis_comment(&p[7..], &mut self.metadata);
+                    }
+                }
+                "flac" => {
+                    // FLAC-in-Ogg carries each metadata block in its own
+                    // header packet after the mapping packet (RFC 9639 §10.1,
+                    // `docs/audio/flac/rfc9639-flac.pdf`). The Vorbis-comment
+                    // block is one of them: a 4-byte metadata block header
+                    // (§8.1 — low 7 bits of byte 0 are the block type; 4 =
+                    // Vorbis comment) directly followed by the standard
+                    // vorbis_comment payload (§"In a Vorbis comment metadata
+                    // block, the metadata block header is directly followed by
+                    // 4 bytes" — vendor length + vendor + comment count + …,
+                    // with no `0x03 "vorbis"` prefix and no trailing framing
+                    // bit). Skip the mapping packet (index 0) and scan the
+                    // remaining header packets for the type-4 block.
+                    for p in packets.iter().skip(1) {
+                        if p.len() >= 4 && (p[0] & 0x7F) == 4 {
+                            parse_vorbis_comment(&p[4..], &mut self.metadata);
+                            break;
+                        }
                     }
                 }
                 _ => {}

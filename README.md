@@ -73,6 +73,19 @@ each logical bitstream and assigns a `CodecId`:
 All other streams are reported as `CodecId::new("unknown")` so the
 registry can still walk them; decode will fail for unregistered codecs.
 
+Each codec has a fixed number of header packets the demuxer absorbs
+before delivering content packets (Vorbis 3, Opus 2, Theora 3, Speex
+2). **FLAC** is the one mapping that declares its header-packet count
+in-band: per RFC 9639 §10.1 (`docs/audio/flac/rfc9639-flac.pdf`) the
+mapping packet's bytes 7..9 hold a big-endian "number of header packets
+(excluding the first)", so the total is `1 + that count`. The demuxer
+reads it and absorbs every metadata block (STREAMINFO, Vorbis comment,
+padding, …) as a header rather than mis-delivering it as audio; a
+declared `0` ("unknown") falls back to absorbing just the mapping
+packet. The FLAC Vorbis-comment block (FLAC §8.1 block type 4) is then
+parsed into `Demuxer::metadata()` like the other codecs' comment
+packets.
+
 ### Multi-stream
 
 Multiplexed Ogg (e.g., Theora video + Vorbis audio in the same `.ogv`)

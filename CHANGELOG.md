@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **FLAC-in-Ogg header-packet count read from the mapping header (RFC 9639
+  §10.1).** A FLAC-in-Ogg logical bitstream declares the number of header
+  packets *after* the first in a 2-byte big-endian field at bytes 7..9 of the
+  `0x7F "FLAC"` mapping packet (`docs/audio/flac/rfc9639-flac.pdf` §10.1:
+  "Number of header packets (excluding the first header packet) as an
+  unsigned number coded big-endian"). The demuxer previously hard-coded a
+  conservative `1` header packet, so every metadata block past STREAMINFO
+  (Vorbis comment, padding, seek table, picture, …) was mis-delivered as a
+  content packet. The new `codec_id::header_packet_count_from_first` reads the
+  field and absorbs `1 + declared` header packets; a declared `0` is the
+  spec's explicit "unknown" marker and falls back to the old conservative
+  `1`. As a result the first audio frame is the first packet the demuxer
+  delivers, and the full metadata header section now lands in the stream's
+  `extradata`.
+- **FLAC-in-Ogg Vorbis-comment metadata is parsed.** Now that the metadata
+  header packets are correctly absorbed, the demuxer scans them for the FLAC
+  Vorbis-comment block (§8.1 metadata block type 4: a 4-byte block header
+  whose low 7 type bits are 4, directly followed by the standard
+  vorbis_comment payload — no `0x03 "vorbis"` prefix, no framing bit) and
+  surfaces its tags via `Demuxer::metadata()`, matching the existing Vorbis /
+  Opus / Theora metadata paths. New `tests/flac_mapping.rs` (header-count
+  absorption, metadata extraction, unknown-count fallback) plus
+  `codec_id` unit tests.
 - **Opus pre-skip granule-position semantics (RFC 7845 §4.2 / §4.3 / §5.1).**
   An Ogg Opus stream's on-wire `granulepos` counts 48 kHz samples *including*
   the encoder-delay padding the decoder must warm up on but discard; the
