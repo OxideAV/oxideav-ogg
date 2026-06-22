@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Opus pre-skip granule-position semantics (RFC 7845 §4.2 / §4.3 / §5.1).**
+  An Ogg Opus stream's on-wire `granulepos` counts 48 kHz samples *including*
+  the encoder-delay padding the decoder must warm up on but discard; the
+  playback-relevant sample count is `granule − pre-skip`
+  (`docs/audio/opus/rfc7845-ogg-opus.txt` §4.3: "PCM sample position =
+  granule position − pre-skip"). The demuxer now reads the pre-skip from the
+  `OpusHead` ID header (bytes 10..12, LE u16, §5.1 field 4) at BOS time and
+  subtracts it in its granule→time mapping, so an Opus stream no longer
+  over-reports its duration by `pre-skip / 48000` seconds (an 11 971-sample
+  pre-skip on a 1 s stream previously reported ≈1.249 s). The new
+  `OggDemuxer::opus_pre_skip(stream_index) -> Option<u16>` accessor exposes
+  the raw value (`None` for a non-Opus or unknown stream) so a downstream
+  Opus decoder can discard the same leading samples without re-parsing the
+  header. The `-1` "no packets finish on this page" sentinel is left
+  untouched, and a granule below the pre-skip clamps to 0 (RFC 7845 §4.5's
+  legal "stream shorter than pre-skip" edge reports zero-length rather than
+  negative). Non-Opus streams are unaffected — they never carry a pre-skip
+  entry and pass through unchanged. New `tests/opus_pre_skip.rs` covers the
+  duration subtraction, the accessor, the zero-pre-skip pass-through, and the
+  non-Opus no-op.
 - **The demuxer anchors each stream's `start_time` onto the Skeleton fishead
   playback timeline.** `docs/container/ogg/ogg-skeleton-4.0.md` §"What
   decoding-related information is needed?" defines the fishead **basetime** as

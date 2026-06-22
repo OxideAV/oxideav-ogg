@@ -366,6 +366,17 @@ pub struct OggDemuxer {
     /// it now belongs to. Surfaced via
     /// [`OggDemuxer::duplicate_serial_count`].
     duplicate_serials: u64,
+    /// Per-serial Opus **pre-skip** (`docs/audio/opus/rfc7845-ogg-opus.txt`
+    /// §5.1 field 4: "the number of samples (at 48 kHz) to discard from the
+    /// decoder output when starting playback, and also the number to
+    /// subtract from a page's granule position to calculate its PCM sample
+    /// position"). Read from the `OpusHead` ID header at BOS time, in the
+    /// 48 kHz granule units Opus always uses. RFC 7845 §4.3 makes the
+    /// granule→time mapping `PCM sample position = granule position −
+    /// pre-skip`; without subtracting it the demuxer over-reports an Opus
+    /// stream's duration by `pre-skip / 48000` seconds (a non-Opus stream
+    /// never has an entry here, so its granule passes through unchanged).
+    opus_pre_skip: HashMap<u32, u16>,
 }
 
 impl OggDemuxer {
@@ -396,6 +407,7 @@ impl OggDemuxer {
             skeleton_segment_length_ok: None,
             preroll_seeks: 0,
             duplicate_serials: 0,
+            opus_pre_skip: HashMap::new(),
         }
     }
 
@@ -1030,6 +1042,23 @@ impl OggDemuxer {
         self.preroll_seeks
     }
 
+    /// Opus **pre-skip** for the content stream at `stream_index`, in 48 kHz
+    /// samples, or `None` for a non-Opus stream (or an unknown index).
+    ///
+    /// `docs/audio/opus/rfc7845-ogg-opus.txt` §5.1 field 4 defines pre-skip
+    /// as "the number of samples (at 48 kHz) to discard from the decoder
+    /// output when starting playback, and also the number to subtract from a
+    /// page's granule position to calculate its PCM sample position". The
+    /// demuxer reads it from the `OpusHead` ID header at open time and
+    /// already folds it into its own duration estimate (RFC 7845 §4.3:
+    /// `PCM sample position = granule position − pre-skip`); this accessor
+    /// exposes the raw value so a downstream Opus decoder can discard the
+    /// same leading samples it was told to, without re-parsing the header.
+    pub fn opus_pre_skip(&self, stream_index: u32) -> Option<u16> {
+        let serial = self.stream_serial(stream_index)?;
+        self.opus_pre_skip.get(&serial).copied()
+    }
+
     /// Current byte position of the underlying input.
     ///
     /// After a [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to) or
@@ -1274,6 +1303,18 @@ impl OggDemuxer {
     fn granule_to_micros_for_serial(&self, serial: u32, granule: i64) -> i64 {
         let Some(state) = self.state_by_serial.get(&serial) else {
             return 0;
+        };
+        // Opus pre-skip: the on-wire granule counts 48 kHz samples *including*
+        // the encoder-delay padding, so the playback-relevant sample count is
+        // `granule − pre-skip` (RFC 7845 §4.3). Subtract it before any
+        // time conversion. The `-1` "no packets finish on this page" sentinel
+        // is left untouched (it is not a sample count); a granule below the
+        // pre-skip clamps to 0 — for an EOS page RFC 7845 §4.5 makes that a
+        // legal "stream shorter than pre-skip" edge we report as zero-length
+        // rather than negative.
+        let granule = match self.opus_pre_skip.get(&serial) {
+            Some(&ps) if granule >= 0 => (granule - ps as i64).max(0),
+            _ => granule,
         };
         // This is the **track-relative** granule→time used by the duration
         // accumulator: it measures elapsed playback from the track's granule
@@ -1811,6 +1852,16 @@ impl OggDemuxer {
         let public_index = self.streams.len();
         let mut params = guess_params(&codec_id, first)?;
         params.extradata = first.to_vec();
+
+        // Opus carries its pre-skip in the OpusHead ID header (bytes 10..12,
+        // LE u16, RFC 7845 §5.1 field 4). Record it per-serial so the
+        // granule→time mapping can subtract it (RFC 7845 §4.3:
+        // `PCM sample position = granule position − pre-skip`).
+        if codec_id.as_str() == "opus" {
+            if let Some(ps) = opus_pre_skip(first) {
+                self.opus_pre_skip.insert(bos_page.serial, ps);
+            }
+        }
 
         let time_base = match codec_id.as_str() {
             "vorbis" | "flac" => {
@@ -3086,6 +3137,21 @@ fn parse_vorbis_id(p: &mut CodecParameters, packet: &[u8]) -> Result<()> {
         p.bit_rate = Some(br_nom as u64);
     }
     Ok(())
+}
+
+/// Read the Opus **pre-skip** from an `OpusHead` identification packet.
+///
+/// `docs/audio/opus/rfc7845-ogg-opus.txt` §5.1 field 4: the pre-skip is a
+/// 16-bit little-endian unsigned value at byte offset 10..12 of the header
+/// (after the 8-byte `"OpusHead"` magic, the 1-byte version, and the
+/// 1-byte output channel count). Returns `None` if `packet` is too short
+/// to reach the field (a malformed or truncated header), in which case the
+/// caller treats the stream as pre-skip-free.
+fn opus_pre_skip(packet: &[u8]) -> Option<u16> {
+    if packet.len() < 12 {
+        return None;
+    }
+    Some(u16::from_le_bytes([packet[10], packet[11]]))
 }
 
 fn parse_opus_id(p: &mut CodecParameters, packet: &[u8]) -> Result<()> {
