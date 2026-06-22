@@ -26,9 +26,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   untouched, and a granule below the pre-skip clamps to 0 (RFC 7845 §4.5's
   legal "stream shorter than pre-skip" edge reports zero-length rather than
   negative). Non-Opus streams are unaffected — they never carry a pre-skip
-  entry and pass through unchanged. New `tests/opus_pre_skip.rs` covers the
-  duration subtraction, the accessor, the zero-pre-skip pass-through, and the
-  non-Opus no-op.
+  entry and pass through unchanged.
+- **`seek_to` honours Opus pre-skip (RFC 7845 §4.3 / §4.6).** A `seek_to(pts)`
+  on an Opus stream takes `pts` as a *PCM sample position* (playback time),
+  but a page's on-wire granule counts `PCM position + pre-skip`, so the
+  bisection / dense-index floor lookup now offsets each page granule by the
+  stream's pre-skip before comparing it to the target. Without the offset a
+  seek would land `pre-skip / 48000` s early. The returned granule is still
+  the landed page's *raw* on-wire value (so a downstream decoder recovers the
+  same granule the file carries); the offset only changes which page floors
+  the target. Vorbis / FLAC / Speex keep the identity axis (offset 0) and are
+  byte-for-byte unchanged. New `tests/opus_pre_skip.rs` covers the duration
+  subtraction, the accessor, the zero-pre-skip pass-through, the non-Opus
+  no-op, the PCM-position floor seek, and the pre-skip-vs-zero seek
+  divergence.
 - **The demuxer anchors each stream's `start_time` onto the Skeleton fishead
   playback timeline.** `docs/container/ogg/ogg-skeleton-4.0.md` §"What
   decoding-related information is needed?" defines the fishead **basetime** as

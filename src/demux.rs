@@ -72,10 +72,17 @@ struct SeekKey {
 
 #[derive(Clone, Copy)]
 enum SeekKeyFlavor {
-    /// `key_of(g) == g`. Used by codecs whose stream time-base matches
-    /// their granule unit (Vorbis / Opus / FLAC / Speex), so `pts` IS
-    /// the target granule.
-    Identity,
+    /// `key_of(g) == g - granule_offset`. For Vorbis / FLAC / Speex the
+    /// offset is 0, so the page's raw granule IS the comparison key and
+    /// `pts` IS the target granule. For **Opus** the offset is the stream's
+    /// pre-skip: the user-supplied `pts` is a *PCM sample position*
+    /// (playback time, RFC 7845 §4.3), but a page's on-wire granule counts
+    /// 48 kHz samples *including* the pre-skip padding, so the comparison
+    /// axis is `granule − pre-skip = PCM sample position`. Subtracting the
+    /// offset on the page side lines both sides up in PCM-position space, so
+    /// a `seek_to(pts)` lands on the page whose PCM position floors the
+    /// target rather than `pre-skip / 48000` s early.
+    Identity { granule_offset: i64 },
     /// `key_of(g) == (g >> shift) + (g & ((1 << shift) - 1))`. Used by
     /// Theora: the encoded granule packs a keyframe index in the upper
     /// `64-shift` bits and a frame offset from that keyframe in the
@@ -93,7 +100,18 @@ impl SeekKey {
     fn identity(target: i64) -> Self {
         Self {
             target_key: target,
-            flavor: SeekKeyFlavor::Identity,
+            flavor: SeekKeyFlavor::Identity { granule_offset: 0 },
+        }
+    }
+
+    /// Identity axis offset by a per-stream granule bias — used for Opus,
+    /// whose pages carry `PCM position + pre-skip` (RFC 7845 §4.3). The
+    /// target stays in PCM-position space; the page side has the bias
+    /// subtracted by `key_of`.
+    fn identity_offset(target: i64, granule_offset: i64) -> Self {
+        Self {
+            target_key: target,
+            flavor: SeekKeyFlavor::Identity { granule_offset },
         }
     }
 
@@ -107,7 +125,21 @@ impl SeekKey {
     /// Map an on-wire page granule into the comparison key.
     fn key_of(&self, granule: i64) -> i64 {
         match self.flavor {
-            SeekKeyFlavor::Identity => granule,
+            // The `-1` "no packet finishes on this page" sentinel (RFC 3533
+            // §6) passes through so the comparator keeps treating it as
+            // "smaller than every real page" — matching `theora_frame_no`'s
+            // sentinel handling. For a real granule, subtract the per-stream
+            // bias (0 for Vorbis / FLAC / Speex; the pre-skip for Opus) so
+            // the axis is the PCM sample position, clamped at 0 so a page
+            // whose granule is below the bias (a pre-skip-region page) does
+            // not wrap negative and mis-sort.
+            SeekKeyFlavor::Identity { granule_offset } => {
+                if granule < 0 {
+                    granule
+                } else {
+                    (granule - granule_offset).max(0)
+                }
+            }
             SeekKeyFlavor::TheoraFrame { shift } => theora_frame_no(granule, shift),
         }
     }
@@ -2739,10 +2771,16 @@ impl Demuxer for OggDemuxer {
 
         // Build the codec-aware comparison axis for the bisection.
         //
-        // For Vorbis / Opus / FLAC / Speex the stream's `time_base` already
+        // For Vorbis / FLAC / Speex the stream's `time_base` already
         // matches the native granule unit (samples/Hz), so `pts` *is* the
         // target granule and every page's raw `granule_position` is the
         // comparison key — `target_key == pts`, `key_of(g) == g`.
+        //
+        // Opus is the same axis with a per-stream bias: its pages carry
+        // `PCM position + pre-skip` (RFC 7845 §4.3,
+        // `docs/audio/opus/rfc7845-ogg-opus.txt`), so `key_of(g) == g −
+        // pre-skip` lines the page side up with the PCM-position `pts`.
+        // A seek without this bias would land `pre-skip / 48000` s early.
         //
         // Theora packs a keyframe index and a per-keyframe offset into a
         // single granule value (`(kf << shift) | offset`) so the raw
@@ -2769,7 +2807,18 @@ impl Demuxer for OggDemuxer {
         let codec_id = self.streams[stream_index as usize].params.codec_id.clone();
         let stream_tb_for_key = self.streams[stream_index as usize].time_base;
         let seek_key: SeekKey = match codec_id.as_str() {
-            "vorbis" | "opus" | "flac" | "speex" => SeekKey::identity(pts),
+            // Opus pages carry `PCM position + pre-skip` (RFC 7845 §4.3), so
+            // the bisection axis offsets each page granule by the stream's
+            // pre-skip to compare against the PCM-position `pts`. The other
+            // audio mappings have no such bias (`identity` == offset 0).
+            "opus" => SeekKey::identity_offset(
+                pts,
+                self.opus_pre_skip
+                    .get(&wanted_serial)
+                    .map(|&p| p as i64)
+                    .unwrap_or(0),
+            ),
+            "vorbis" | "flac" | "speex" => SeekKey::identity(pts),
             "theora" => match self.theora_seek_key(wanted_serial, pts, stream_tb_for_key) {
                 Some(key) => key,
                 None => {

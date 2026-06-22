@@ -84,9 +84,25 @@ required by RFC 3533 §6.
 ### Seeking
 
 `seek_to(stream_index, pts)` performs a bounded bisection over the
-file using granule-position timestamps on Ogg pages. Vorbis, Opus,
-FLAC and Speex land on the greatest page whose granule is at or
-below the target.
+file using granule-position timestamps on Ogg pages. Vorbis, FLAC
+and Speex land on the greatest page whose granule is at or below the
+target.
+
+**Opus** is the same axis with a per-stream bias. Its `pts` is a
+*PCM sample position* (playback time), but a page's on-wire granule
+counts `PCM position + pre-skip` (`docs/audio/opus/rfc7845-ogg-opus.txt`
+§4.3: "PCM sample position = granule position − pre-skip"), so the
+comparison key is `granule − pre-skip` and the floor lands on the page
+whose PCM position is at or below the target rather than `pre-skip /
+48000` s early. The pre-skip is read once from the `OpusHead` ID
+header (bytes 10..12, LE u16, §5.1 field 4) at open time and surfaced
+via `OggDemuxer::opus_pre_skip(stream_index) -> Option<u16>` so a
+downstream Opus decoder can discard the same leading samples it was
+told to. The same bias is folded into the duration estimate (the
+last-page granule converts to `(granule − pre-skip) / 48000` seconds),
+so an Opus stream no longer over-reports its length by the pre-skip.
+The seek's returned granule is still the landed page's *raw* on-wire
+value.
 
 For Theora, the page's raw granule packs `(keyframe_idx << shift) |
 frame_offset`, so the comparison axis is the frame number
@@ -197,9 +213,12 @@ packet) are parsed during `open` and surfaced via
 `vendor` entry. Duration is estimated from the last page's granule
 position translated to microseconds.
 
-For an audio mapping (Vorbis / Opus / FLAC / Speex) the granule *is* a
-sample count and the stream's time-base is the granule rate, so the
-last-page granule converts to seconds directly. **Theora is the
+For a Vorbis / FLAC / Speex mapping the granule *is* a sample count and
+the stream's time-base is the granule rate, so the last-page granule
+converts to seconds directly. **Opus** is the same up to its pre-skip
+bias: its granule counts `PCM position + pre-skip`, so the demuxer
+subtracts the pre-skip (`(granule − pre-skip) / 48000` seconds) before
+reporting duration — see the Seeking section above. **Theora is the
 exception**: its `granulepos` is the packed `(keyframe_idx << shift) |
 frame_offset` value (`docs/container/ogg/ogg-skeleton-4.0.md` §"What
 decoding-related information is needed?"), not a frame count, and the
