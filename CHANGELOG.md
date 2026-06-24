@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **End-to-end Theora demux→remux keyframe-index coverage.**
+  `tests/theora_remux_index.rs` demuxes a Theora-in-Ogg file (Skeleton fisbone
+  granuleshift 6, granules describing 2 keyframes among 4 frames), reuses the
+  reconstructed extradata to remux the packets through
+  `mux::open_with_skeleton_indexed`, and asserts the recovered Skeleton 4.0
+  index records exactly the 2 true keyframes — not one keypoint per frame. The
+  auto-index muxer keys off `PacketFlags::keyframe`, so this pins the
+  per-packet keyframe fix flowing correctly through a full demux→mux pipeline.
+
 ### Fixed
 
 - **Chained Speex / FLAC links now surface their Vorbis-comment metadata.**
