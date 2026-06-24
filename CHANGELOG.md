@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Per-packet `PacketFlags::keyframe` now tracks the granuleshift packing
+  instead of being blanket-`true`.** Every delivered content packet was
+  unconditionally flagged a keyframe. For audio mappings (Vorbis / Opus /
+  FLAC / Speex) that is correct — they declare granuleshift 0 and every packet
+  is an independent random-access point — but for Theora it mislabelled every
+  inter-frame as a random-access point. The granuleshift, carried by the
+  Skeleton 4.0 `fisbone\0` (`docs/container/ogg/ogg-skeleton-4.0.md`: "the
+  number of lower bits from the granulepos field that are used to provide
+  position information for sub-seekable units (like the keyframe shift in
+  theora)"), splits a page's granule into a keyframe index (high bits) and an
+  offset-since-keyframe (low `shift` bits). The new `granule_is_keyframe`
+  helper flags the last-on-page packet a keyframe exactly when that offset is
+  zero; non-granule-bearing packets on a shifted track are flagged `false`
+  rather than mislabelled. A Theora stream with no fisbone (granuleshift
+  unknown, defaulting to 0) keeps the conservative all-keyframe flagging so
+  random access is never under-reported. `tests/packet_keyframe.rs` pins the
+  Theora-with-fisbone, Theora-without-fisbone, and Vorbis (every-packet,
+  including the intermediate non-granule packet) cases; `src/demux.rs`
+  unit-tests the helper's boundary cases (shift 0, the `-1` sentinel,
+  `shift >= 63`, and agreement with `theora_frame_no`).
+
 ### Added
 
 - **Speex comment header surfaced as container metadata.** The Speex 2nd

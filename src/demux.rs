@@ -181,6 +181,30 @@ fn theora_frame_no(granule: i64, shift: u32) -> i64 {
     kf.saturating_add(off)
 }
 
+/// Whether the last frame finishing on a page with raw on-wire `granule` is a
+/// keyframe, for a track whose Skeleton fisbone declares `granuleshift`.
+///
+/// `docs/container/ogg/ogg-skeleton-4.0.md` defines the granuleshift as the
+/// "number of lower bits from the granulepos field that are used to provide
+/// position information for sub-seekable units (like the keyframe shift in
+/// theora)": the high `64 - shift` bits hold the index of the last keyframe and
+/// the low `shift` bits hold the offset of the current frame *since* that
+/// keyframe. The frame is therefore a keyframe exactly when that offset is
+/// zero — the frame coincides with the keyframe it counts from.
+///
+/// For a `shift == 0` track (every audio mapping — Vorbis / Opus / FLAC /
+/// Speex — packs no keyframe index, and every packet is an independent
+/// random-access point) this returns `true`. The `-1` "no packet finishes on
+/// this page" sentinel and a degenerate `shift >= 63` also return `true`
+/// (conservatively random-access, matching the seek axis's pass-through of
+/// those values) so callers never under-report a random-access point.
+fn granule_is_keyframe(granule: i64, shift: u32) -> bool {
+    if granule < 0 || shift == 0 || shift >= 63 {
+        return true;
+    }
+    (granule as u64) & ((1u64 << shift) - 1) == 0
+}
+
 /// Outcome of the Skeleton 4.0 keyframe-index fast-path lookup.
 ///
 /// Carries the byte offset chosen by the multi-stream minimisation
@@ -2561,10 +2585,29 @@ impl OggDemuxer {
             self.process_skeleton_page(page);
             return Ok(());
         }
-        let Some(stream) = self.state_by_serial.get_mut(&page.serial) else {
+        // Resolve this serial's codec id and granuleshift before taking the
+        // mutable `state_by_serial` borrow below — both `self.streams[..]` and
+        // `self.skeleton` are read here and would otherwise alias the
+        // `&mut stream`. The granuleshift is the per-track packing the
+        // Skeleton 4.0 fisbone declares ("the number of lower bits from the
+        // granulepos field that are used to provide position information for
+        // sub-seekable units (like the keyframe shift in theora)",
+        // `docs/container/ogg/ogg-skeleton-4.0.md`). Audio mappings declare 0;
+        // Theora declares the keyframe shift.
+        if !self.state_by_serial.contains_key(&page.serial) {
             // Unknown serial that isn't a BOS — skip silently.
             return Ok(());
-        };
+        }
+        let page_granuleshift = self
+            .skeleton
+            .as_ref()
+            .and_then(|sk| sk.bone_for_serial(page.serial))
+            .map(|b| b.granuleshift as u32)
+            .unwrap_or(0);
+        let stream = self
+            .state_by_serial
+            .get_mut(&page.serial)
+            .expect("serial present: checked above");
         let public_index = stream.public_index;
         let stream_idx = self.streams[public_index].index;
         let time_base = self.streams[public_index].time_base;
@@ -2700,10 +2743,28 @@ impl OggDemuxer {
             } else {
                 None
             };
+            // Keyframe flag (RFC 3533 carries no per-packet keyframe bit; the
+            // only random-access signal is the granuleshift-packed granulepos).
+            //
+            // * Audio mappings (granuleshift 0) — every packet is an
+            //   independent random-access point, so every packet is a keyframe.
+            // * Theora-style packed granule (granuleshift > 0) — only the
+            //   last-on-page packet carries a granule, and it is a keyframe
+            //   iff its offset-since-keyframe (the low `shift` bits) is zero
+            //   (`granule_is_keyframe`). A non-granule-bearing packet on such a
+            //   track cannot be proven a keyframe from framing alone, so it is
+            //   flagged `false` rather than mislabelled random-access.
+            let keyframe = if page_granuleshift == 0 {
+                true
+            } else if is_last && page.granule_position >= 0 {
+                granule_is_keyframe(page.granule_position, page_granuleshift)
+            } else {
+                false
+            };
             let mut pkt = Packet::new(stream_idx, time_base, data);
             pkt.pts = pts;
             pkt.dts = pts;
-            pkt.flags.keyframe = true;
+            pkt.flags.keyframe = keyframe;
             pkt.flags.unit_boundary = is_last;
             self.out_queue.push_back(pkt);
         }
@@ -3433,6 +3494,68 @@ fn read_some(r: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
             Ok(n) => return Ok(n),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod granule_tests {
+    use super::{granule_is_keyframe, theora_frame_no};
+
+    #[test]
+    fn shift_zero_is_always_keyframe() {
+        // Audio mappings declare granuleshift 0; every packet is a
+        // random-access point.
+        assert!(granule_is_keyframe(0, 0));
+        assert!(granule_is_keyframe(1024, 0));
+        assert!(granule_is_keyframe(i64::MAX, 0));
+    }
+
+    #[test]
+    fn negative_sentinel_is_keyframe() {
+        // The RFC 3533 §6 "-1" no-packet-finishes sentinel passes through as a
+        // conservative random-access point (no granule-bearing packet is ever
+        // delivered for it, but the helper must not under-report).
+        assert!(granule_is_keyframe(-1, 6));
+        assert!(granule_is_keyframe(-1, 0));
+    }
+
+    #[test]
+    fn theora_shift_offset_zero_is_keyframe() {
+        // shift = 6: keyframe iff the low 6 bits (offset since keyframe) == 0.
+        // (0<<6)|0 == 0, (128<<6)|0 == 8192 -> keyframes.
+        assert!(granule_is_keyframe(0, 6));
+        assert!(granule_is_keyframe(8192, 6));
+        // (0<<6)|30 == 30, (64<<6)|32 == 4128 -> inter frames.
+        assert!(!granule_is_keyframe(30, 6));
+        assert!(!granule_is_keyframe(4128, 6));
+    }
+
+    #[test]
+    fn degenerate_shift_is_keyframe_not_overflow() {
+        // shift >= 63 leaves no room for a keyframe index; treat as a
+        // random-access point rather than overflowing the 1<<shift mask.
+        assert!(granule_is_keyframe(123, 63));
+        assert!(granule_is_keyframe(123, 64));
+    }
+
+    #[test]
+    fn keyframe_decision_agrees_with_frame_extraction() {
+        // A frame is a keyframe exactly when its absolute frame number equals
+        // the keyframe index it counts from, i.e. its offset half is zero.
+        for shift in [1u32, 4, 6, 10] {
+            for kf in [0i64, 1, 5, 200] {
+                let mask = (1i64 << shift) - 1;
+                for off in [0i64, 1, mask] {
+                    let g = (kf << shift) | off;
+                    let is_kf = granule_is_keyframe(g, shift);
+                    assert_eq!(is_kf, off == 0, "g={g} shift={shift}");
+                    if is_kf {
+                        // The keyframe's absolute frame number is the kf index.
+                        assert_eq!(theora_frame_no(g, shift), kf);
+                    }
+                }
+            }
         }
     }
 }
