@@ -49,19 +49,36 @@ fn speex_header(rate: u32, channels: u32, bitrate: i32) -> Vec<u8> {
     p
 }
 
-/// A minimal empty Speex comment packet (vorbis_comment layout).
-fn speex_comment() -> Vec<u8> {
+/// A Speex comment packet — the bare vorbis_comment layout (no magic
+/// prefix), per the Speex manual §7.3.
+fn speex_comment(comments: &[(&str, &str)]) -> Vec<u8> {
     let mut p = Vec::new();
     let vendor = b"oxideav-test";
     p.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
     p.extend_from_slice(vendor);
-    p.extend_from_slice(&0u32.to_le_bytes()); // 0 user comments
+    p.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for (k, v) in comments {
+        let entry = format!("{k}={v}");
+        p.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        p.extend_from_slice(entry.as_bytes());
+    }
     p
 }
 
 /// Build a complete Speex-in-Ogg blob: ID header, comment header, then
 /// `data_pages` audio pages with sample-count granules.
 fn build_speex(serial: u32, rate: u32, channels: u32, bitrate: i32, data_pages: i64) -> Vec<u8> {
+    build_speex_with_comments(serial, rate, channels, bitrate, data_pages, &[])
+}
+
+fn build_speex_with_comments(
+    serial: u32,
+    rate: u32,
+    channels: u32,
+    bitrate: i32,
+    data_pages: i64,
+    comments: &[(&str, &str)],
+) -> Vec<u8> {
     let mut out = Vec::new();
     let mut seq = 0u32;
     out.extend(build_page(
@@ -72,7 +89,7 @@ fn build_speex(serial: u32, rate: u32, channels: u32, bitrate: i32, data_pages: 
         &speex_header(rate, channels, bitrate),
     ));
     seq += 1;
-    out.extend(build_page(0, 0, serial, seq, &speex_comment()));
+    out.extend(build_page(0, 0, serial, seq, &speex_comment(comments)));
     seq += 1;
     for i in 1..=data_pages {
         let last = i == data_pages;
@@ -207,4 +224,25 @@ fn flac_duration_uses_sample_rate_time_base() {
     let micros = demux.duration_micros().expect("duration");
     let expect = (16_384i64 * 1_000_000) / 44_100;
     assert_eq!(micros, expect);
+}
+
+#[test]
+fn speex_comment_header_populates_metadata() {
+    // The Speex 2nd packet is a bare vorbis_comment (no magic prefix). The
+    // demuxer must surface it as container metadata like the other codecs.
+    let blob = build_speex_with_comments(
+        0x5BEE_0005,
+        16_000,
+        1,
+        0,
+        2,
+        &[("TITLE", "Clean Room"), ("ARTIST", "OxideAV")],
+    );
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(blob));
+    let demux = oxideav_ogg::demux::open(reader, &NullCodecResolver).expect("open");
+    let md = demux.metadata();
+    let get = |k: &str| md.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
+    assert_eq!(get("title"), Some("Clean Room"));
+    assert_eq!(get("artist"), Some("OxideAV"));
+    assert_eq!(get("vendor"), Some("oxideav-test"));
 }

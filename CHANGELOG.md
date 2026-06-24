@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Speex comment header surfaced as container metadata.** The Speex 2nd
+  header packet is the bare Vorbis-comment structure (Speex manual §7.3,
+  `docs/audio/speex/speex-manual.pdf` — "the second packet contains the Speex
+  comment header. The format used is the Vorbis comment format"), carrying no
+  `0x03 "vorbis"`-style magic prefix unlike the Vorbis/Theora/Opus comment
+  packets. The demuxer now parses it directly into `Demuxer::metadata()`,
+  closing the one audio mapping whose tags were previously dropped.
+  `tests/id_header_params.rs::speex_comment_header_populates_metadata` pins it.
+
 - **Speex + FLAC identification headers parsed for `sample_rate` /
   `channels` (+ Speex `bit_rate`), with a sample-rate time-base.** The
   demuxer previously parsed only the Vorbis and Opus ID headers; Speex and

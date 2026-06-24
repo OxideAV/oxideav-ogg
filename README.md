@@ -241,10 +241,14 @@ augmented with a minimal empty `OpusTags` comment block.
 ### Metadata
 
 Vorbis-comment blocks (Vorbis packet #2, OpusTags, Theora comment
-packet) are parsed during `open` and surfaced via
-`Demuxer::metadata()` as lowercase `(key, value)` pairs plus a
-`vendor` entry. Duration is estimated from the last page's granule
-position translated to microseconds.
+packet, the FLAC §8.1 type-4 block, and the **Speex** comment header)
+are parsed during `open` and surfaced via `Demuxer::metadata()` as
+lowercase `(key, value)` pairs plus a `vendor` entry. The Speex comment
+header (the 2nd packet) is the one with no magic prefix: the Speex
+manual §7.3 (`docs/audio/speex/speex-manual.pdf`) specifies it as the
+bare Vorbis-comment structure, so the demuxer parses it directly rather
+than skipping an identifier. Duration is estimated from the last page's
+granule position translated to microseconds.
 
 For a Vorbis / FLAC / Speex mapping the granule *is* a sample count and
 the stream's time-base is the granule rate, so the last-page granule

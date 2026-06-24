@@ -2172,6 +2172,18 @@ impl OggDemuxer {
                         parse_vorbis_comment(&p[7..], &mut self.metadata);
                     }
                 }
+                "speex" if packets.len() >= 2 => {
+                    // The Speex comment header is the 2nd packet. Unlike
+                    // Vorbis/Theora/Opus it carries no magic prefix: the
+                    // Speex manual §7.3 (`docs/audio/speex/speex-manual.pdf`)
+                    // states "the second packet contains the Speex comment
+                    // header. The format used is the Vorbis comment format"
+                    // — i.e. the bare vorbis_comment structure (vendor
+                    // length + vendor + comment count + comments), with no
+                    // `0x03 "vorbis"`-style identifier and no trailing
+                    // framing bit. Parse it directly.
+                    parse_vorbis_comment(&packets[1], &mut self.metadata);
+                }
                 "flac" => {
                     // FLAC-in-Ogg carries each metadata block in its own
                     // header packet after the mapping packet (RFC 9639 §10.1,
