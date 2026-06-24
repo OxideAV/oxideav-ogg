@@ -199,6 +199,24 @@ calls that actually backed the offset up; `OggDemuxer::input_position()`
 exposes the resume byte offset for callers that want to compare the two
 seek variants.
 
+#### Keyframe-aware seek
+
+Preroll handles inter-*packet* warm-up (audio window overlap); a Theora
+track needs inter-*frame* warm-up — it cannot begin decoding at an arbitrary
+inter-frame and must resume from the last keyframe at or before the target.
+The granule packing already encodes that keyframe: the high bits are the
+keyframe index, the low `granuleshift` bits the offset since it
+(`docs/container/ogg/ogg-skeleton-4.0.md`).
+`OggDemuxer::seek_to_keyframe(stream_index, pts)` runs the normal `seek_to`,
+reads the landed page's keyframe index, and — when the landing isn't already
+a keyframe — re-seeks to that keyframe's own frame so forward decoding starts
+on an intra page. Unlike `seek_to_with_preroll`, the **returned granule
+changes**: it is the keyframe page's on-wire granule (its offset half zero),
+and the caller decodes forward, discarding frames until it reaches the
+requested `pts`. A granuleshift-0 mapping (every audio codec — each packet is
+already a random-access point) or a landing already on a keyframe makes the
+call identical to `seek_to`.
+
 ### Per-packet timing & flags
 
 Ogg's only timing signal is a page's `granulepos`, which RFC 3533 §6 pins to

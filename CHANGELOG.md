@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`OggDemuxer::seek_to_keyframe(stream_index, pts)`** — keyframe-aware seek
+  for sub-seekable (keyframe-bearing) mappings. A bare `seek_to` lands on the
+  page whose frame number floors the target, which for Theora may be an
+  inter-frame the decoder cannot start from. `seek_to_keyframe` reads the
+  landed page's keyframe index out of the granuleshift packing
+  (`docs/container/ogg/ogg-skeleton-4.0.md` — the low `shift` bits are the
+  offset-since-keyframe, the high bits the keyframe index) and, when the
+  landing isn't already a keyframe, re-seeks to that keyframe's own page so
+  forward decoding starts on an intra frame. The returned granule is the
+  keyframe page's (offset half zero); the caller decodes forward and discards
+  frames until it reaches the requested `pts`. Granuleshift-0 mappings (every
+  audio codec — each packet already a random-access point) and a landing
+  already on a keyframe pass through identical to `seek_to`.
+  `tests/seek_keyframe.rs` pins the inter→keyframe back-up, the already-on-
+  keyframe identity, and the audio identity.
+
 - **`OggDemuxer::stream_granuleshift(stream_index)`** surfaces the per-stream
   granuleshift the per-packet keyframe decision is derived from (`Some(0)` for
   an audio mapping or a stream with no fisbone, the Skeleton 4.0 `fisbone\0`

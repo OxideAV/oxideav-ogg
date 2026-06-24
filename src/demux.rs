@@ -1259,6 +1259,81 @@ impl OggDemuxer {
         Ok(landed_granule)
     }
 
+    /// Keyframe-aware seek for a sub-seekable (keyframe-bearing) mapping.
+    ///
+    /// A bare [`Demuxer::seek_to`] lands on the page whose *frame number*
+    /// floors the target — but a Theora-style codec cannot begin decoding at
+    /// an arbitrary inter-frame: it must resume from the last keyframe at or
+    /// before the target. The granule packing encodes exactly that keyframe:
+    /// `docs/container/ogg/ogg-skeleton-4.0.md` defines the granuleshift as
+    /// the count of low bits holding "position information for sub-seekable
+    /// units (like the keyframe shift in theora)", so a page's granule splits
+    /// into a keyframe index `g >> shift` (high bits) and an
+    /// offset-since-keyframe `g & ((1 << shift) - 1)` (low bits). This method
+    /// runs the normal `seek_to`, reads the landed page's keyframe index, and
+    /// — when the landing isn't already on that keyframe — re-seeks to the
+    /// keyframe's own frame so forward decoding starts on an intra page.
+    ///
+    /// The returned granule is the **keyframe page's** on-wire granule (its
+    /// offset half is zero), and the input is positioned at that page, so the
+    /// caller decodes forward from the keyframe and discards frames until it
+    /// reaches the originally-requested `pts`. (This differs from
+    /// [`seek_to_with_preroll`](Self::seek_to_with_preroll), whose return
+    /// value is unchanged from `seek_to` because audio preroll is a fixed
+    /// *count* of warm-up packets rather than a keyframe boundary.)
+    ///
+    /// Behaves exactly like `seek_to` (same input position, same return
+    /// value) when the stream has granuleshift 0 — every audio mapping, where
+    /// each packet is already an independent random-access point — or when the
+    /// landed page is itself a keyframe. Returns the same `Error::Unsupported`
+    /// as `seek_to` for a Theora stream lacking a usable Skeleton fisbone.
+    pub fn seek_to_keyframe(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        let serial = self.serial_for_stream(stream_index).ok_or_else(|| {
+            Error::unsupported(format!("Ogg: no logical stream for index {stream_index}"))
+        })?;
+        // Resolve the granuleshift + frame rate before the seek perturbs state.
+        let bone = self
+            .skeleton
+            .as_ref()
+            .and_then(|s| s.bone_for_serial(serial));
+        let shift = bone.map(|b| b.granuleshift as u32).unwrap_or(0);
+        let rate = bone.map(|b| (b.granule_rate.numerator, b.granule_rate.denominator));
+        let stream_tb = self.streams[stream_index as usize].time_base;
+
+        let landed = self.seek_to(stream_index, pts)?;
+
+        // granuleshift 0 (audio, or no fisbone): every page is already a
+        // random-access point. A `-1` landed granule (should not occur for a
+        // successful seek) likewise passes through.
+        if shift == 0 || shift >= 63 || landed < 0 {
+            return Ok(landed);
+        }
+        let mask = (1i64 << shift) - 1;
+        if landed & mask == 0 {
+            // The landed page is itself the keyframe — nothing to back up to.
+            return Ok(landed);
+        }
+        let keyframe_frame = landed >> shift;
+        // Translate the keyframe's absolute frame number back into the
+        // stream's time-base so we can re-seek to it. `frame_tb` is the
+        // time-base in which one tick is one frame (1 frame = gr_den / gr_num
+        // seconds); rescaling a frame count from it into the stream's
+        // time-base yields the keyframe's pts. Without a usable rate we cannot
+        // perform the translation, so fall back to the frame-floor landing.
+        let Some((gr_num, gr_den)) = rate else {
+            return Ok(landed);
+        };
+        if gr_num <= 0 || gr_den <= 0 {
+            return Ok(landed);
+        }
+        let frame_tb = TimeBase::new(gr_den, gr_num);
+        let keyframe_pts = frame_tb.rescale(keyframe_frame, stream_tb);
+        // Re-seek to the keyframe. The frame-floor bisection lands on the
+        // page whose frame number is `<= keyframe_frame`; since the keyframe
+        // is an exact frame on the wire, that is the keyframe page itself.
+        self.seek_to(stream_index, keyframe_pts)
+    }
+
     /// Look up the requested stream's on-wire serial number.
     fn serial_for_stream(&self, stream_index: u32) -> Option<u32> {
         for (serial, state) in &self.state_by_serial {
