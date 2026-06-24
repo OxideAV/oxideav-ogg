@@ -73,6 +73,26 @@ each logical bitstream and assigns a `CodecId`:
 All other streams are reported as `CodecId::new("unknown")` so the
 registry can still walk them; decode will fail for unregistered codecs.
 
+For Vorbis, Opus, **Speex** and **FLAC** the demuxer parses the
+identification header during `open` to populate the stream's
+`sample_rate` / `channels` (and the nominal `bit_rate` where the header
+carries one). The Speex header is the fixed 80-byte little-endian struct
+of the Speex manual §7.3 / table 7.1
+(`docs/audio/speex/speex-manual.pdf`): `rate` (offset 36),
+`nb_channels` (offset 48, clamped to mono/stereo since Speex supports
+only those), and `bitrate` (offset 52, with the encoder's `-1`
+"unknown" sentinel suppressed). The FLAC parameters come from the
+STREAMINFO block embedded in the `0x7F "FLAC"` mapping packet (RFC 9639
+§8.2 / §10.1, `docs/audio/flac/rfc9639-flac.pdf`): the bit-packed
+`u(20)` sample rate + `u(3)` (channels − 1) at STREAMINFO offset 10.
+Because the Speex and FLAC granule is a *sample count* just like
+Vorbis ("the granulepos is the number of the last sample encoded in
+that packet" — Speex manual §7.3; "the number of the last sample" —
+RFC 9639 §10.1), each stream is now stamped with a `1/sample_rate`
+time-base rather than the `1/1_000_000` placeholder, so duration
+estimates and seek targets translate the granule correctly instead of
+mis-scaling it by the sample rate.
+
 Each codec has a fixed number of header packets the demuxer absorbs
 before delivering content packets (Vorbis 3, Opus 2, Theora 3, Speex
 2). **FLAC** is the one mapping that declares its header-packet count

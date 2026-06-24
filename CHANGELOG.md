@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Speex + FLAC identification headers parsed for `sample_rate` /
+  `channels` (+ Speex `bit_rate`), with a sample-rate time-base.** The
+  demuxer previously parsed only the Vorbis and Opus ID headers; Speex and
+  FLAC streams were left with `sample_rate == None`, `channels == None`, and
+  the `1/1_000_000` placeholder time-base. Both mappings carry a
+  *sample-count* granule (Speex manual §7.3 / table 7.1,
+  `docs/audio/speex/speex-manual.pdf` — "the granulepos is the number of the
+  last sample encoded in that packet"; FLAC RFC 9639 §10.1,
+  `docs/audio/flac/rfc9639-flac.pdf` — "the granule position is the number of
+  the last sample contained in the last completed packet"), so the wrong
+  time-base mis-scaled both duration estimates and seek targets. `parse_speex_id`
+  reads the fixed 80-byte little-endian header (`rate` @36, `nb_channels` @48
+  clamped to mono/stereo per the codec's own limits, `bitrate` @52 with the
+  `-1` "unknown" sentinel suppressed); `parse_flac_id` reads the STREAMINFO
+  block embedded in the mapping packet (RFC 9639 §8.2 Table 3 — `u(20)` sample
+  rate, `u(3)` channels−1 bit-packed big-endian at STREAMINFO offset 10). Both
+  now stamp the stream with a `1/sample_rate` time-base alongside Vorbis/FLAC,
+  so a Speex or FLAC track reports its true length and seeks land on the right
+  page. `tests/id_header_params.rs` pins rate/channel/bitrate extraction, the
+  unknown-bitrate suppression, the corrupt-channel clamp, the high-sample-rate
+  (192 kHz) STREAMINFO bit math, and the corrected sample-rate-based duration.
+
 - **FLAC-in-Ogg header-packet count read from the mapping header (RFC 9639
   §10.1).** A FLAC-in-Ogg logical bitstream declares the number of header
   packets *after* the first in a 2-byte big-endian field at bytes 7..9 of the

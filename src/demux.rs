@@ -1897,7 +1897,14 @@ impl OggDemuxer {
         }
 
         let time_base = match codec_id.as_str() {
-            "vorbis" | "flac" => {
+            // Vorbis / FLAC / Speex all carry a sample-count granule
+            // (Vorbis I §4.3; FLAC RFC 9639 §10.1 "the number of the last
+            // sample"; Speex manual §7.3 "the granulepos is the number of
+            // the last sample encoded in that packet"), so the native
+            // granule unit is `1/sample_rate` once the ID header reveals the
+            // rate. Without a rate we cannot translate the granule to a time
+            // and fall back to the 1 µs placeholder.
+            "vorbis" | "flac" | "speex" => {
                 if let Some(sr) = params.sample_rate {
                     TimeBase::new(1, sr as i64)
                 } else {
@@ -3177,6 +3184,8 @@ fn guess_params(codec_id: &CodecId, first: &[u8]) -> Result<CodecParameters> {
     match codec_id.as_str() {
         "vorbis" => parse_vorbis_id(&mut p, first)?,
         "opus" => parse_opus_id(&mut p, first)?,
+        "speex" => parse_speex_id(&mut p, first)?,
+        "flac" => parse_flac_id(&mut p, first)?,
         _ => {}
     }
     Ok(p)
@@ -3233,6 +3242,101 @@ fn parse_opus_id(p: &mut CodecParameters, packet: &[u8]) -> Result<()> {
     p.channels = Some(channels as u16);
     // Opus always decodes to 48 kHz; "input_sample_rate" is informational.
     p.sample_rate = Some(if input_rate > 0 { input_rate } else { 48_000 });
+    Ok(())
+}
+
+/// Parse the **Ogg/Speex identification header** (the first packet of a
+/// Speex-in-Ogg logical bitstream) for `rate`, `nb_channels`, and `bitrate`.
+///
+/// Per the Speex manual §7.3 / table 7.1
+/// (`docs/audio/speex/speex-manual.pdf`) the header is a fixed 80-byte
+/// struct whose integer fields are all little-endian:
+///
+/// | offset | size | field                    |
+/// |--------|------|--------------------------|
+/// | 0      | 8    | `speex_string` (`"Speex "`)|
+/// | 8      | 20   | `speex_version`          |
+/// | 28     | 4    | `speex_version_id`       |
+/// | 32     | 4    | `header_size`            |
+/// | 36     | 4    | `rate`                   |
+/// | 40     | 4    | `mode`                   |
+/// | 44     | 4    | `mode_bitstream_version` |
+/// | 48     | 4    | `nb_channels`            |
+/// | 52     | 4    | `bitrate`                |
+/// | 56     | 4    | `frame_size`             |
+/// | 60     | 4    | `vbr`                    |
+/// | 64     | 4    | `frames_per_packet`      |
+/// | 68     | 4    | `extra_headers`          |
+/// | 72     | 4    | `reserved1`              |
+/// | 76     | 4    | `reserved2`              |
+///
+/// `bitrate` is informational and signed (the manual encodes a `-1`
+/// "unknown" sentinel as the encoder's default); only a strictly-positive
+/// value is surfaced. `nb_channels` other than 1 or 2 is clamped to a sane
+/// 1/2 because Speex itself only supports mono and stereo, and a corrupt
+/// field must not propagate an absurd channel count downstream.
+fn parse_speex_id(p: &mut CodecParameters, packet: &[u8]) -> Result<()> {
+    // We need to reach `nb_channels` (offset 48..52) at minimum; the full
+    // 80-byte header is the norm but we read only the fields we surface.
+    if packet.len() < 52 {
+        return Err(Error::invalid("Speex identification header too short"));
+    }
+    let rate = u32::from_le_bytes([packet[36], packet[37], packet[38], packet[39]]);
+    let nb_channels = u32::from_le_bytes([packet[48], packet[49], packet[50], packet[51]]);
+    if rate == 0 {
+        return Err(Error::invalid("Speex ID header has zero sample rate"));
+    }
+    p.sample_rate = Some(rate);
+    // Speex is mono or stereo only (manual §7.3). Treat any other value as a
+    // corrupt field and clamp rather than report e.g. 65535 channels.
+    p.channels = Some(if nb_channels == 2 { 2 } else { 1 });
+    if packet.len() >= 56 {
+        let bitrate = i32::from_le_bytes([packet[52], packet[53], packet[54], packet[55]]);
+        if bitrate > 0 {
+            p.bit_rate = Some(bitrate as u64);
+        }
+    }
+    Ok(())
+}
+
+/// Parse the **FLAC-in-Ogg mapping packet** (the first packet of a
+/// FLAC-in-Ogg logical bitstream) for `sample_rate` and `channels`,
+/// reading the embedded STREAMINFO block.
+///
+/// RFC 9639 §10.1 (`docs/audio/flac/rfc9639-flac.pdf`, Table 24) lays the
+/// mapping packet out as `0x7F "FLAC"` (5) + 2-byte mapping version +
+/// 2-byte BE header-packet count + `"fLaC"` (4) + a 4-byte metadata block
+/// header + the 34-byte STREAMINFO block. STREAMINFO therefore begins at
+/// packet offset 17.
+///
+/// Within STREAMINFO (RFC 9639 §8.2, Table 3) the fields are bit-packed
+/// big-endian: `u(16)` min block size, `u(16)` max block size, `u(24)` min
+/// frame size, `u(24)` max frame size — i.e. 10 bytes — then `u(20)` sample
+/// rate, `u(3)` (channels − 1), `u(5)` (bits per sample − 1). The
+/// rate/channel/depth triple is the 4 bytes at STREAMINFO offset 10
+/// (packet offset 27): the top 20 bits are the sample rate, the next 3 are
+/// channels − 1, the next 5 are bits-per-sample − 1.
+fn parse_flac_id(p: &mut CodecParameters, packet: &[u8]) -> Result<()> {
+    // STREAMINFO starts at offset 17; we need through its byte 13 (the
+    // rate/channels/bps triple ends at STREAMINFO offset 14 == packet 31).
+    const STREAMINFO_OFF: usize = 17;
+    if packet.len() < STREAMINFO_OFF + 14 {
+        // Not enough bytes for STREAMINFO's rate/channel/depth field; leave
+        // the params unpopulated rather than erroring — the mapping packet
+        // is otherwise well-formed and downstream FLAC decode still works
+        // off the raw header packets in `extradata`.
+        return Ok(());
+    }
+    let si = &packet[STREAMINFO_OFF..];
+    // Bytes 10..14 of STREAMINFO hold sample_rate(20) | channels-1(3) |
+    // bps-1(5) | high 4 bits of total-samples. Read 4 bytes big-endian.
+    let packed = u32::from_be_bytes([si[10], si[11], si[12], si[13]]);
+    let sample_rate = packed >> 12; // top 20 bits
+    let channels = ((packed >> 9) & 0x07) + 1; // next 3 bits, stored as (n-1)
+    if sample_rate != 0 {
+        p.sample_rate = Some(sample_rate);
+    }
+    p.channels = Some(channels as u16);
     Ok(())
 }
 
