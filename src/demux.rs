@@ -933,6 +933,33 @@ impl OggDemuxer {
             .map(|(serial, _)| *serial)
     }
 
+    /// Per-stream **granuleshift** — the number of low bits of a page's
+    /// `granulepos` that carry the offset-since-keyframe for a sub-seekable
+    /// (keyframe-bearing) mapping, as declared by the stream's Skeleton 4.0
+    /// `fisbone\0` (`docs/container/ogg/ogg-skeleton-4.0.md`: "the number of
+    /// lower bits from the granulepos field that are used to provide position
+    /// information for sub-seekable units (like the keyframe shift in
+    /// theora)").
+    ///
+    /// Returns `Some(0)` for an audio mapping (Vorbis / Opus / FLAC / Speex —
+    /// every packet is a random-access point) and for any stream the demuxer
+    /// found no `fisbone\0` for; a Theora stream with a fisbone reports its
+    /// declared keyframe shift. `None` for an out-of-range `stream_index`.
+    /// Exposed alongside [`opus_pre_skip`](Self::opus_pre_skip) so callers
+    /// reasoning about per-packet [`oxideav_core::packet::PacketFlags::keyframe`]
+    /// — which the demuxer derives from this shift — can unpack a page's raw
+    /// granule into its `(keyframe_index, offset)` halves themselves.
+    pub fn stream_granuleshift(&self, stream_index: u32) -> Option<u8> {
+        let serial = self.stream_serial(stream_index)?;
+        Some(
+            self.skeleton
+                .as_ref()
+                .and_then(|sk| sk.bone_for_serial(serial))
+                .map(|b| b.granuleshift)
+                .unwrap_or(0),
+        )
+    }
+
     /// Number of tracks under the Skeleton "Track order" addressing
     /// scheme (`docs/container/ogg/ogg-skeleton-message-headers.wiki`
     /// §"Track order").

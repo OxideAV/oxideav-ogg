@@ -199,6 +199,47 @@ calls that actually backed the offset up; `OggDemuxer::input_position()`
 exposes the resume byte offset for callers that want to compare the two
 seek variants.
 
+### Per-packet timing & flags
+
+Ogg's only timing signal is a page's `granulepos`, which RFC 3533 §6 pins to
+"the last packet completed on that page". The demuxer therefore stamps the
+**last packet finishing on a page** with that granule as its `pts`/`dts`;
+earlier packets on the same page get `None` (a container-aware consumer that
+needs intermediate timestamps derives them from codec-level knowledge, e.g.
+Opus TOC parsing). The final packet on each page is also flagged
+`PacketFlags::unit_boundary` so a re-muxer can recreate similar page
+boundaries.
+
+`PacketFlags::keyframe` follows the granuleshift packing the Skeleton 4.0
+`fisbone\0` declares (`docs/container/ogg/ogg-skeleton-4.0.md`: the
+granuleshift is "the number of lower bits from the granulepos field that are
+used to provide position information for sub-seekable units (like the keyframe
+shift in theora)"):
+
+- **Audio mappings** (Vorbis / Opus / FLAC / Speex) declare granuleshift `0`
+  — every packet is an independent random-access point, so every delivered
+  content packet is a keyframe.
+- **Theora** declares a non-zero keyframe shift. The granule splits into a
+  keyframe index (high bits) and an offset-since-keyframe (low `shift` bits);
+  the last-on-page packet is a keyframe exactly when that offset is zero. A
+  non-granule-bearing packet on a shifted track cannot be proven a keyframe
+  and is flagged `false` rather than mislabelled random-access.
+- A Theora stream **with no fisbone** (granuleshift unknown, defaulting to 0)
+  keeps the conservative all-keyframe flagging so random access is never
+  under-reported.
+
+This flag flows end-to-end into the muxer-built Skeleton 4.0 keyframe index
+(`open_with_skeleton_indexed`, below), which records a keypoint per
+keyframe-flagged page — so a demux→remux of a Theora track produces an index
+of its *keyframes*, not one entry per frame.
+
+`OggDemuxer::stream_granuleshift(stream_index)` surfaces the per-stream
+granuleshift the keyframe decision is derived from (`Some(0)` for an audio
+mapping or a stream with no fisbone, the declared shift for a Theora stream
+with one), alongside `opus_pre_skip` / `stream_serial` / `stream_link_index`,
+for callers that want to unpack a page's raw granule into its
+`(keyframe_index, offset)` halves themselves.
+
 ### Muxing
 
 The muxer packs incoming packets into pages with a proper CRC32,

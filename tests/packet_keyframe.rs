@@ -227,6 +227,19 @@ fn theora_keyframe_flag_follows_granuleshift_offset() {
         got, expected_keyframe,
         "Theora keyframe flags must track the granule offset-since-keyframe"
     );
+
+    // The per-stream granuleshift accessor surfaces the fisbone's value the
+    // keyframe decision is derived from.
+    assert_eq!(
+        dmx.stream_granuleshift(0),
+        Some(6),
+        "Theora stream reports its fisbone granuleshift"
+    );
+    assert_eq!(
+        dmx.stream_granuleshift(99),
+        None,
+        "out-of-range stream index reports None"
+    );
 }
 
 /// Theora data pages with NO Skeleton fisbone — the demuxer cannot know the
@@ -338,6 +351,9 @@ fn vorbis_every_packet_is_keyframe_including_intermediate() {
     let codecs = NullCodecResolver;
     let mut dmx = oxideav_ogg::demux::open_concrete(reader, &codecs).expect("open ok");
     assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "vorbis");
+    // An audio mapping with no fisbone reports granuleshift 0 (every packet a
+    // random-access point).
+    assert_eq!(dmx.stream_granuleshift(0), Some(0));
 
     let mut flags_seen = Vec::new();
     let mut pts_seen = Vec::new();

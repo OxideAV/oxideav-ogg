@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`OggDemuxer::stream_granuleshift(stream_index)`** surfaces the per-stream
+  granuleshift the per-packet keyframe decision is derived from (`Some(0)` for
+  an audio mapping or a stream with no fisbone, the Skeleton 4.0 `fisbone\0`
+  declared shift for a Theora stream), alongside the existing `opus_pre_skip` /
+  `stream_serial` / `stream_link_index` accessors, so callers can unpack a
+  page's raw granule into its `(keyframe_index, offset)` halves themselves.
+  README gains a "Per-packet timing & flags" section documenting the `pts` /
+  `unit_boundary` / `keyframe` assignment rules.
+
 - **End-to-end Theora demux→remux keyframe-index coverage.**
   `tests/theora_remux_index.rs` demuxes a Theora-in-Ogg file (Skeleton fisbone
   granuleshift 6, granules describing 2 keyframes among 4 frames), reuses the
