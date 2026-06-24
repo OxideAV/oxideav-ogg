@@ -293,3 +293,85 @@ fn mux_last_page_sets_eos_flag() {
     }
     assert!(last_flag & 0x04 != 0, "last page must have EOS flag set");
 }
+
+// --- Theora header reconstruction (the mux side must split the Xiph-laced
+//     extradata blob back into its 3 constituent header packets, exactly as
+//     it already does for Vorbis). A Theora header blob muxed as one giant
+//     packet is unparseable. ---
+
+fn theora_id_packet() -> Vec<u8> {
+    let mut p = vec![0x80];
+    p.extend_from_slice(b"theora");
+    // 35 placeholder bytes so the packet is a plausible Theora identification
+    // header length; the demuxer's sniffer only reads the first 7 bytes.
+    p.extend_from_slice(&[0u8; 35]);
+    p
+}
+
+fn theora_comment_packet() -> Vec<u8> {
+    let mut p = vec![0x81];
+    p.extend_from_slice(b"theora");
+    p.extend_from_slice(&0u32.to_le_bytes()); // vendor length
+    p.extend_from_slice(&0u32.to_le_bytes()); // user comment count
+    p
+}
+
+fn theora_setup_packet() -> Vec<u8> {
+    let mut p = vec![0x82];
+    p.extend_from_slice(b"theora");
+    // A longer setup packet so the three header packets have distinct sizes,
+    // making a "muxed as one blob" regression unambiguous.
+    p.extend_from_slice(&[0u8; 64]);
+    p
+}
+
+#[test]
+fn mux_then_demux_theora_splits_three_header_packets() {
+    let id = theora_id_packet();
+    let com = theora_comment_packet();
+    let setup = theora_setup_packet();
+    let extradata = xiph_lace_three(&[&id, &com, &setup]);
+    let stream = single_stream(0, "theora", extradata.clone(), TimeBase::new(1, 1_000_000));
+
+    let bytes = mux_to_bytes(vec![stream.clone()], |m| {
+        for i in 1..=4i64 {
+            let mut pkt = Packet::new(0, stream.time_base, vec![0xCD; 8 + i as usize]);
+            pkt.pts = Some(i);
+            pkt.dts = pkt.pts;
+            pkt.flags.unit_boundary = true;
+            m.write_packet(&pkt).unwrap();
+        }
+    });
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut demux = oxideav_ogg::demux::open(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux muxed Theora");
+    let streams = demux.streams();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(
+        streams[0].params.codec_id.as_str(),
+        "theora",
+        "the muxed stream must sniff back to Theora — only possible if its \
+         first header packet on the wire is the bare 0x80 'theora' id, i.e. \
+         the blob was split into 3 packets rather than muxed as one"
+    );
+
+    // The demuxer reconstructs the same Xiph-laced extradata (3 packets) it
+    // would for a native Theora file. A single-blob mux would instead make
+    // the first packet a 0x02-lacing-prefixed mega-packet, which neither
+    // sniffs as Theora nor reproduces the original extradata.
+    assert_eq!(
+        streams[0].params.extradata, extradata,
+        "round-tripped extradata must match the original 3-packet xiph blob"
+    );
+
+    let mut pkts = Vec::new();
+    while let Ok(p) = demux.next_packet() {
+        pkts.push(p);
+    }
+    assert_eq!(
+        pkts.len(),
+        4,
+        "all 4 data packets round-trip after the headers"
+    );
+}

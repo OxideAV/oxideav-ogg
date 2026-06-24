@@ -984,7 +984,13 @@ fn extract_codec_headers(codec_id: &CodecId, extradata: &[u8]) -> Vec<Vec<u8>> {
         return Vec::new();
     }
     match codec_id.as_str() {
-        "vorbis" => parse_xiph_lacing(extradata).unwrap_or_default(),
+        // Vorbis and Theora both store their 3-packet header sequence
+        // (identification, comment, setup) as a single Xiph-laced blob in
+        // `extradata` — the inverse of the demuxer's `xiph_lace_three`. Both
+        // must be split back into their constituent packets so each rides on
+        // the wire as a distinct Ogg packet; a Theora header blob muxed as one
+        // packet would be unparseable by a Theora decoder.
+        "vorbis" | "theora" => parse_xiph_lacing(extradata).unwrap_or_default(),
         "opus" => {
             // OpusHead followed by a synthetic minimal OpusTags. (Original
             // tags are dropped during demux — they're not load-bearing.)

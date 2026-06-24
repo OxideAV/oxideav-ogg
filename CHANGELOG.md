@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Theora mux now splits its Xiph-laced extradata into 3 header packets.**
+  The README documented (and the demux build side already did) that "for
+  Vorbis and Theora the 3-packet sequence is parsed out of the Xiph-laced
+  blob", but `extract_codec_headers` only routed `"vorbis"` through
+  `parse_xiph_lacing`; Theora fell through to the catch-all that emits the
+  whole blob as a single Ogg packet. A Theora stream muxed via `open` /
+  `open_with_skeleton` therefore wrote one malformed mega-packet (a
+  `0x02`-lacing-prefixed blob) where a decoder expects the bare
+  `0x80 "theora"` identification packet, so the result neither sniffed back
+  as Theora nor reproduced the original extradata. Theora now shares the
+  Vorbis split path. `tests/mux_roundtrip.rs::mux_then_demux_theora_splits_three_header_packets`
+  pins the mux→demux round-trip (codec re-sniffs as `theora`, extradata
+  byte-matches the original 3-packet blob, all data packets recovered).
+
 - **Per-packet `PacketFlags::keyframe` now tracks the granuleshift packing
   instead of being blanket-`true`.** Every delivered content packet was
   unconditionally flagged a keyframe. For audio mappings (Vorbis / Opus /
