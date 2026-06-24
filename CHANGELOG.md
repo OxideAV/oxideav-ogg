@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Chained Speex / FLAC links now surface their Vorbis-comment metadata.**
+  The open-time metadata sweep parsed all five mappings (Vorbis, Opus, Theora,
+  Speex, FLAC), but the per-stream path that runs when a chained link's header
+  packets complete *mid-file* (`populate_metadata_for`) handled only
+  Vorbis / Opus / Theora, silently dropping a chained Speex or FLAC link's
+  tags — and FLAC besides, since it only looked at the second header packet
+  while a FLAC comment block can sit in any post-mapping packet. Both call
+  sites now share one `parse_codec_comment(codec_id, &header_packets, …)`
+  helper, so every mapping behaves identically in the single-link and chained
+  cases. `tests/chained_metadata.rs` pins a Vorbis→FLAC and a Vorbis→Speex
+  chain, asserting the second link's title / artist / vendor surface after
+  the drain that discovers the mid-file BOS.
+
 - **Theora mux now splits its Xiph-laced extradata into 3 header packets.**
   The README documented (and the demux build side already did) that "for
   Vorbis and Theora the 3-packet sequence is parsed out of the Xiph-laced

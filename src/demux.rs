@@ -2171,65 +2171,21 @@ impl OggDemuxer {
     /// (Vorbis packet #2, Opus packet #2, Theora packet #2) and expose it
     /// as container metadata.
     fn populate_metadata(&mut self) {
-        for state in self.state_by_serial.values() {
-            let codec_id = self.streams[state.public_index].params.codec_id.clone();
-            let packets = &state.header_packets;
-            match codec_id.as_str() {
-                "vorbis" if packets.len() >= 2 => {
-                    // 2nd packet starts with 0x03 "vorbis" (7 bytes) then the comment body.
-                    let p = &packets[1];
-                    if p.len() > 7 && &p[1..7] == b"vorbis" {
-                        parse_vorbis_comment(&p[7..], &mut self.metadata);
-                    }
-                }
-                "opus" if packets.len() >= 2 => {
-                    // 2nd packet is OpusTags: 8-byte "OpusTags" magic, then the comment body.
-                    let p = &packets[1];
-                    if p.len() > 8 && &p[..8] == b"OpusTags" {
-                        parse_vorbis_comment(&p[8..], &mut self.metadata);
-                    }
-                }
-                "theora" if packets.len() >= 2 => {
-                    // 2nd packet: 0x81 "theora" (7 bytes) then comment body.
-                    let p = &packets[1];
-                    if p.len() > 7 && &p[1..7] == b"theora" {
-                        parse_vorbis_comment(&p[7..], &mut self.metadata);
-                    }
-                }
-                "speex" if packets.len() >= 2 => {
-                    // The Speex comment header is the 2nd packet. Unlike
-                    // Vorbis/Theora/Opus it carries no magic prefix: the
-                    // Speex manual §7.3 (`docs/audio/speex/speex-manual.pdf`)
-                    // states "the second packet contains the Speex comment
-                    // header. The format used is the Vorbis comment format"
-                    // — i.e. the bare vorbis_comment structure (vendor
-                    // length + vendor + comment count + comments), with no
-                    // `0x03 "vorbis"`-style identifier and no trailing
-                    // framing bit. Parse it directly.
-                    parse_vorbis_comment(&packets[1], &mut self.metadata);
-                }
-                "flac" => {
-                    // FLAC-in-Ogg carries each metadata block in its own
-                    // header packet after the mapping packet (RFC 9639 §10.1,
-                    // `docs/audio/flac/rfc9639-flac.pdf`). The Vorbis-comment
-                    // block is one of them: a 4-byte metadata block header
-                    // (§8.1 — low 7 bits of byte 0 are the block type; 4 =
-                    // Vorbis comment) directly followed by the standard
-                    // vorbis_comment payload (§"In a Vorbis comment metadata
-                    // block, the metadata block header is directly followed by
-                    // 4 bytes" — vendor length + vendor + comment count + …,
-                    // with no `0x03 "vorbis"` prefix and no trailing framing
-                    // bit). Skip the mapping packet (index 0) and scan the
-                    // remaining header packets for the type-4 block.
-                    for p in packets.iter().skip(1) {
-                        if p.len() >= 4 && (p[0] & 0x7F) == 4 {
-                            parse_vorbis_comment(&p[4..], &mut self.metadata);
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
+        // Snapshot (codec_id, header_packets) per stream first so the shared
+        // `parse_codec_comment` helper can borrow `self.metadata` mutably
+        // without aliasing the `self.state_by_serial` / `self.streams` reads.
+        let per_stream: Vec<(CodecId, Vec<Vec<u8>>)> = self
+            .state_by_serial
+            .values()
+            .map(|state| {
+                (
+                    self.streams[state.public_index].params.codec_id.clone(),
+                    state.header_packets.clone(),
+                )
+            })
+            .collect();
+        for (codec_id, packets) in per_stream {
+            parse_codec_comment(&codec_id, &packets, &mut self.metadata);
         }
     }
 
@@ -2814,24 +2770,81 @@ impl OggDemuxer {
     /// given stream and append it to the demuxer's metadata list.
     fn populate_metadata_for(&mut self, public_index: usize) {
         let codec_id = self.streams[public_index].params.codec_id.clone();
-        let second_packet: Option<Vec<u8>> = self
+        // Take the stream's full header-packet list — FLAC's comment block can
+        // be in any post-mapping header packet, not just the second — so the
+        // chained / mid-file path covers every mapping the open-time
+        // `populate_metadata` does (previously only vorbis/opus/theora,
+        // dropping a chained Speex or FLAC link's tags).
+        let header_packets: Option<Vec<Vec<u8>>> = self
             .state_by_serial
             .values()
             .find(|s| s.public_index == public_index)
-            .and_then(|s| s.header_packets.get(1).cloned());
-        let Some(p) = second_packet else { return };
-        match codec_id.as_str() {
-            "vorbis" if p.len() > 7 && &p[1..7] == b"vorbis" => {
-                parse_vorbis_comment(&p[7..], &mut self.metadata);
+            .map(|s| s.header_packets.clone());
+        let Some(packets) = header_packets else {
+            return;
+        };
+        parse_codec_comment(&codec_id, &packets, &mut self.metadata);
+    }
+}
+
+/// Parse a logical bitstream's Vorbis-comment-style tags out of its captured
+/// header packets and append them to `out`. Shared by the open-time
+/// [`OggDemuxer::populate_metadata`] sweep and the per-stream
+/// [`OggDemuxer::populate_metadata_for`] path used when a chained link's
+/// headers complete mid-file, so every mapping behaves identically in both
+/// the single-link and chained cases.
+fn parse_codec_comment(codec_id: &CodecId, packets: &[Vec<u8>], out: &mut Vec<(String, String)>) {
+    match codec_id.as_str() {
+        "vorbis" if packets.len() >= 2 => {
+            // 2nd packet starts with 0x03 "vorbis" (7 bytes) then the comment body.
+            let p = &packets[1];
+            if p.len() > 7 && &p[1..7] == b"vorbis" {
+                parse_vorbis_comment(&p[7..], out);
             }
-            "opus" if p.len() > 8 && &p[..8] == b"OpusTags" => {
-                parse_vorbis_comment(&p[8..], &mut self.metadata);
-            }
-            "theora" if p.len() > 7 && &p[1..7] == b"theora" => {
-                parse_vorbis_comment(&p[7..], &mut self.metadata);
-            }
-            _ => {}
         }
+        "opus" if packets.len() >= 2 => {
+            // 2nd packet is OpusTags: 8-byte "OpusTags" magic, then the comment body.
+            let p = &packets[1];
+            if p.len() > 8 && &p[..8] == b"OpusTags" {
+                parse_vorbis_comment(&p[8..], out);
+            }
+        }
+        "theora" if packets.len() >= 2 => {
+            // 2nd packet: 0x81 "theora" (7 bytes) then comment body.
+            let p = &packets[1];
+            if p.len() > 7 && &p[1..7] == b"theora" {
+                parse_vorbis_comment(&p[7..], out);
+            }
+        }
+        "speex" if packets.len() >= 2 => {
+            // The Speex comment header is the 2nd packet. Unlike
+            // Vorbis/Theora/Opus it carries no magic prefix: the Speex manual
+            // §7.3 (`docs/audio/speex/speex-manual.pdf`) states "the second
+            // packet contains the Speex comment header. The format used is the
+            // Vorbis comment format" — i.e. the bare vorbis_comment structure
+            // (vendor length + vendor + comment count + comments), with no
+            // `0x03 "vorbis"`-style identifier and no trailing framing bit.
+            // Parse it directly.
+            parse_vorbis_comment(&packets[1], out);
+        }
+        "flac" => {
+            // FLAC-in-Ogg carries each metadata block in its own header packet
+            // after the mapping packet (RFC 9639 §10.1,
+            // `docs/audio/flac/rfc9639-flac.pdf`). The Vorbis-comment block is
+            // one of them: a 4-byte metadata block header (§8.1 — low 7 bits of
+            // byte 0 are the block type; 4 = Vorbis comment) directly followed
+            // by the standard vorbis_comment payload (vendor length + vendor +
+            // comment count + …, with no `0x03 "vorbis"` prefix and no trailing
+            // framing bit). Skip the mapping packet (index 0) and scan the
+            // remaining header packets for the type-4 block.
+            for p in packets.iter().skip(1) {
+                if p.len() >= 4 && (p[0] & 0x7F) == 4 {
+                    parse_vorbis_comment(&p[4..], out);
+                    break;
+                }
+            }
+        }
+        _ => {}
     }
 }
 
