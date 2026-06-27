@@ -2521,6 +2521,26 @@ impl KeyPoint {
 /// Variable-byte integer encoder used by Skeleton 4.0 index keypoint
 /// offsets and timestamps. Encodes `n` little-endian in 7-bit chunks;
 /// the high bit is set on the *last* byte. Always emits at least one byte.
+/// The `Content-Type` MIME the in-tree Skeleton spec states verbatim for a
+/// codec, or `None` when the codec's MIME is not spelled out under
+/// `docs/container/ogg/`.
+///
+/// `docs/container/ogg/ogg-skeleton-4.0.md` §3 / §"fisbone secondary header
+/// packet" works out exactly two codec MIME types — `audio/vorbis` and
+/// `video/theora` ("Content-type: mime type of the content … e.g.
+/// `audio/vorbis`, `video/theora`"). The complete codec→MIME registry it then
+/// points at (`MIME_Types_and_File_Extensions#Codec_MIME_types`) is an
+/// external Xiph wiki page that is **not** mirrored in this repo, so any other
+/// mapping (Opus, FLAC, Speex) is deliberately left for the caller rather than
+/// guessed — guessing would reach outside the clean-room allow-list.
+fn default_content_type_for(codec: &str) -> Option<&'static str> {
+    match codec {
+        "vorbis" => Some("audio/vorbis"),
+        "theora" => Some("video/theora"),
+        _ => None,
+    }
+}
+
 pub fn write_vbi_u64(out: &mut Vec<u8>, mut n: u64) {
     loop {
         let chunk = (n & 0x7F) as u8;
@@ -2611,6 +2631,65 @@ impl Skeleton {
     /// Append a 4.0 keyframe index packet.
     pub fn push_index(&mut self, index: SkelIndex) {
         self.indexes.push(index);
+    }
+
+    /// Build a complete Skeleton describing a set of content streams — a
+    /// `fishead` ident header plus one `fisbone` per stream — ready to hand
+    /// to [`crate::mux::open_with_skeleton`].
+    ///
+    /// This is the write-side companion to the demuxer's
+    /// [`crate::demux::open_concrete`]→[`OggDemuxer::skeleton`] read path: it
+    /// derives, from each [`oxideav_core::StreamInfo`], the per-track fields
+    /// the Skeleton spec requires
+    /// (`docs/container/ogg/ogg-skeleton-4.0.md` §"How to describe the logical
+    /// bitstreams within an Ogg container?"):
+    ///
+    /// * **serial** — the stream's `index`, matching the muxer's own
+    ///   `derive_serial` so the fisbone keys onto the page serial the muxer
+    ///   will assign;
+    /// * **granule rate** — the inverse of the stream `time_base` (a
+    ///   `1/48000` audio base yields a `48000/1` granule rate in Hz; a video
+    ///   `1/fps` base yields its fps), since "the granule rate represents the
+    ///   data rate in Hz at which content is sampled";
+    /// * **number of header packets** — the codec's fixed header count
+    ///   ([`crate::codec_id::header_packet_count`]: Vorbis 3, Opus 2, Theora 3,
+    ///   Speex 2);
+    /// * **Content-Type** — set to the MIME type the in-tree spec states
+    ///   verbatim for the two codecs it works out (`audio/vorbis`,
+    ///   `video/theora`; `docs/container/ogg/ogg-skeleton-4.0.md` §3 worked
+    ///   example and §"fisbone secondary header packet"). Other codecs are
+    ///   left without a `Content-Type` for the caller to fill via
+    ///   [`FisBone::set_content_type`] — the full codec→MIME registry lives in
+    ///   an external Xiph wiki page not mirrored under `docs/container/ogg/`,
+    ///   so guessing it here would be a clean-room fishing expedition.
+    ///
+    /// `granuleshift`, `preroll`, `basegranule`, `Role`, and `Name` are left
+    /// at their defaults (0 / absent): the Ogg framing in a `StreamInfo` does
+    /// not reveal Theora's keyframe shift or a codec's preroll, and Role/Name
+    /// are authoring choices. Callers set them on the returned fisbones (e.g.
+    /// `skel.bones[0].granuleshift = 6; skel.bones[0].set_role(&role)`) before
+    /// muxing.
+    ///
+    /// The `serial` of the Skeleton bitstream itself is left `None` so the
+    /// muxer picks one past the largest content serial (it cannot collide);
+    /// set [`Skeleton::serial`] to override.
+    pub fn from_streams(streams: &[oxideav_core::StreamInfo], version: Version) -> Skeleton {
+        let mut skel = Skeleton::new();
+        skel.set_head(FisHead::new(version));
+        for s in streams {
+            // Granule rate is the inverse of the time base: a 1/rate base
+            // means `rate` granules per second.
+            let tb = s.time_base.as_rational();
+            let granule_rate = Rational::new(tb.den, tb.num);
+            let codec = &s.params.codec_id;
+            let mut bone = FisBone::new(s.index, granule_rate);
+            bone.num_headers = crate::codec_id::header_packet_count(codec) as u32;
+            if let Some(mime) = default_content_type_for(codec.as_str()) {
+                bone.set_header("Content-Type", mime);
+            }
+            skel.push_bone(bone);
+        }
+        skel
     }
 
     /// Look up the fisbone describing the content stream with the
@@ -5525,6 +5604,48 @@ mod tests {
             assert_eq!(Role::parse(&r.to_wire()), r);
             assert_eq!(format!("{r}"), raw);
         }
+    }
+
+    #[test]
+    fn from_streams_inverts_time_base_into_granule_rate() {
+        use oxideav_core::{CodecId, CodecParameters, StreamInfo, TimeBase};
+        let mut params = CodecParameters::audio(CodecId::new("vorbis"));
+        params.sample_rate = Some(44_100);
+        let s = StreamInfo {
+            index: 7,
+            time_base: TimeBase::new(1, 44_100),
+            duration: None,
+            start_time: Some(0),
+            params,
+        };
+        let skel = Skeleton::from_streams(std::slice::from_ref(&s), Version::V4_0);
+        assert_eq!(skel.bones.len(), 1);
+        // Serial follows the stream index (matches the muxer's derive_serial).
+        assert_eq!(skel.bones[0].serial, 7);
+        // Granule rate is the inverse of the 1/44100 time base.
+        assert_eq!(skel.bones[0].granule_rate, Rational::new(44_100, 1));
+        assert_eq!(skel.bones[0].num_headers, 3);
+        // The Skeleton's own serial is left for the muxer to pick.
+        assert!(skel.serial.is_none());
+        assert_eq!(skel.head.as_ref().unwrap().version, Version::V4_0);
+    }
+
+    #[test]
+    fn from_streams_3_0_emits_3_0_fishead() {
+        use oxideav_core::{CodecId, CodecParameters, StreamInfo, TimeBase};
+        let s = StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, 8_000),
+            duration: None,
+            start_time: Some(0),
+            params: CodecParameters::audio(CodecId::new("speex")),
+        };
+        let skel = Skeleton::from_streams(std::slice::from_ref(&s), Version::V3_0);
+        let head = skel.head.as_ref().unwrap();
+        assert_eq!(head.version, Version::V3_0);
+        // 3.0 fishead has no segment-length / content-byte-offset fields.
+        assert!(head.segment_length.is_none());
+        assert!(head.content_byte_offset.is_none());
     }
 
     #[test]

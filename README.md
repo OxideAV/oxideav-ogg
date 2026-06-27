@@ -519,6 +519,19 @@ largest content-stream serial (so it cannot collide). The
 `open` factory continues to produce Skeleton-free output byte-for-byte
 by delegating to `open_with_skeleton(_, _, None)`.
 
+To build the `Skeleton` argument from the streams you're about to mux,
+`Skeleton::from_streams(&streams, Version::V4_0)` derives a `fishead`
+plus one `fisbone` per content stream — serial from the stream `index`
+(matching the muxer's serial assignment), granule rate as the inverse of
+the stream `time_base`, header-packet count from the codec, and
+`Content-Type` for the two codecs the in-tree spec states verbatim
+(`audio/vorbis`, `video/theora`). It is the write-side companion to the
+demuxer's `skeleton()` read path: a Skeleton parsed on demux can be
+rebuilt from `StreamInfo` and re-emitted. Per-track authoring fields the
+Ogg framing cannot reveal (`granuleshift`, `preroll`, `Role`, `Name`, and
+the MIME of un-mirrored codecs) are left at their defaults for the caller
+to set — via the typed writers below — before muxing.
+
 When the attached fishead is 4.0, `write_trailer` **backfills** the
 *Segment length in bytes* and *Content byte offset* fields with the
 measured values and rewrites the BOS page in place (same page length,

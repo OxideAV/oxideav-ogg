@@ -28,6 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Skeleton::from_streams(&[StreamInfo], Version)`** — build a complete
+  Skeleton (a `fishead` plus one `fisbone` per content stream) directly from
+  the demuxer's / caller's `StreamInfo` list, the write-side companion to the
+  demuxer's `skeleton()` read path. Derives each fisbone's serial (the stream
+  `index`, matching the muxer's `derive_serial`), granule rate (the inverse of
+  the stream `time_base` — a `1/48000` audio base → `48000/1` Hz, a `1/fps`
+  video base → its fps), number of header packets
+  (`codec_id::header_packet_count`), and the `Content-Type` MIME for the two
+  codecs the in-tree spec states verbatim (`audio/vorbis`, `video/theora`).
+  Other codecs are left without a `Content-Type` for the caller to fill — the
+  full codec→MIME registry lives in an external Xiph wiki page not mirrored
+  under `docs/container/ogg/`, so guessing it would reach outside the
+  clean-room allow-list. `granuleshift` / `preroll` / `Role` / `Name` are left
+  at defaults (Ogg framing in a `StreamInfo` does not reveal them) for callers
+  to set before handing the result to `mux::open_with_skeleton`. Pins:
+  `tests/skeleton_mux.rs::from_streams_*` (mux→demux round-trip) plus src unit
+  tests for the time-base inversion and 3.0/4.0 fishead selection.
+
 - **Typed Skeleton message-header / UTC *writers* (write-side symmetry).** The
   module already carried a typed *reader* for every
   `docs/container/ogg/ogg-skeleton-message-headers.wiki` field and the

@@ -953,3 +953,73 @@ fn backfilled_fishead_page_crc_is_valid() {
         );
     }
 }
+
+/// `Skeleton::from_streams` derives a complete Skeleton (fishead + one
+/// fisbone per content stream) directly from `&[StreamInfo]`, which then
+/// muxes and demuxes round-trip — the convenience write path that mirrors
+/// the demuxer's `skeleton()` read path.
+#[test]
+fn from_streams_builds_round_trippable_skeleton() {
+    use oxideav_ogg::skeleton::ContentType;
+
+    let id = vorbis_id_packet(2, 48_000);
+    let com = vorbis_comment_packet();
+    let setup = vorbis_setup_packet();
+    let extradata = xiph_lace_three(&[&id, &com, &setup]);
+    // Vorbis at 48 kHz: a 1/48000 time base must yield a 48000/1 granule rate.
+    let stream = single_stream(0, "vorbis", extradata, TimeBase::new(1, 48_000));
+
+    let skel = Skeleton::from_streams(std::slice::from_ref(&stream), Version::V4_0);
+    // Derivation sanity before muxing.
+    assert_eq!(skel.bones.len(), 1);
+    assert_eq!(skel.bones[0].serial, 0);
+    assert_eq!(skel.bones[0].granule_rate, Rational::new(48_000, 1));
+    assert_eq!(skel.bones[0].num_headers, 3); // Vorbis has 3 header packets.
+    assert_eq!(skel.bones[0].header("Content-Type"), Some("audio/vorbis"));
+    assert_eq!(skel.head.as_ref().unwrap().version, Version::V4_0);
+
+    let bytes = mux_with_skeleton(vec![stream], skel, 4);
+
+    // Demux and confirm the Skeleton reconstructs field-for-field.
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux from_streams Skeleton");
+    let recovered = dmx.skeleton().expect("Skeleton recovered");
+    assert_eq!(recovered.bones.len(), 1);
+    let bone = &recovered.bones[0];
+    assert_eq!(bone.serial, 0);
+    assert_eq!(bone.granule_rate, Rational::new(48_000, 1));
+    assert_eq!(bone.num_headers, 3);
+    assert_eq!(
+        bone.content_type().unwrap().unwrap(),
+        ContentType::parse("audio/vorbis").unwrap()
+    );
+}
+
+/// A Theora stream maps to the spec-stated `video/theora` MIME and a
+/// granule rate that inverts a frame-rate time base. An un-documented codec
+/// (no MIME mirrored under docs/) is left without a Content-Type for the
+/// caller to fill — never guessed.
+#[test]
+fn from_streams_content_type_only_for_documented_codecs() {
+    // Theora at 30 fps: a 1/30 time base -> 30/1 granule rate (fps).
+    let theora = single_stream(0, "theora", vec![0x80], TimeBase::new(1, 30));
+    // Speex: MIME is not spelled out under docs/container/ogg/, so no
+    // Content-Type is set.
+    let speex = single_stream(1, "speex", vec![], TimeBase::new(1, 16_000));
+
+    let skel = Skeleton::from_streams(&[theora, speex], Version::V4_0);
+    assert_eq!(skel.bones.len(), 2);
+
+    assert_eq!(skel.bones[0].granule_rate, Rational::new(30, 1));
+    assert_eq!(skel.bones[0].num_headers, 3); // Theora: 3 header packets.
+    assert_eq!(skel.bones[0].header("Content-Type"), Some("video/theora"));
+
+    assert_eq!(skel.bones[1].granule_rate, Rational::new(16_000, 1));
+    assert_eq!(skel.bones[1].num_headers, 2); // Speex: 2 header packets.
+    assert_eq!(
+        skel.bones[1].header("Content-Type"),
+        None,
+        "un-mirrored codec MIME is left for the caller, not guessed"
+    );
+}
