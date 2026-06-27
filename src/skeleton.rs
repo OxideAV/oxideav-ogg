@@ -306,6 +306,37 @@ impl FisHead {
         let raw = self.utc_str()?;
         Some(Utc::parse(&raw))
     }
+
+    /// Write a verbatim ASCII string into the 20-byte `fishead` UTC slot
+    /// (bytes 44..63) — the write-side inverse of [`Self::utc_str`].
+    ///
+    /// The text is copied into the slot and any unused tail bytes are
+    /// zero-padded (matching the NUL-terminated convention [`Self::utc_str`]
+    /// reads back). Returns `true` when the string fits, `false` (leaving
+    /// the slot untouched) when it would exceed 20 bytes — the spec fixes
+    /// the slot width, so an over-long anchor cannot be stored and the
+    /// caller must shorten it (e.g. drop fractional-second digits).
+    pub fn set_utc_str(&mut self, s: &str) -> bool {
+        let bytes = s.as_bytes();
+        if bytes.len() > self.utc.len() {
+            return false;
+        }
+        self.utc = [0u8; 20];
+        self.utc[..bytes.len()].copy_from_slice(bytes);
+        true
+    }
+
+    /// Write a structured [`Utc`] anchor into the `fishead` UTC slot — the
+    /// write-side inverse of [`Self::utc_time`]. Formats the value via
+    /// [`Utc::to_string_basic`] (the documented `YYYYMMDDTHHMMSS.sssZ`
+    /// ISO-8601 basic convention) and stores it through [`Self::set_utc_str`],
+    /// so `head.utc_time()` returns `Some(Ok(utc))` afterwards. Returns
+    /// `false` (slot untouched) only if the formatted string exceeds the
+    /// 20-byte slot, which happens only with an implausibly long fractional
+    /// part.
+    pub fn set_utc(&mut self, utc: &Utc) -> bool {
+        self.set_utc_str(&utc.to_string_basic())
+    }
 }
 
 /// Structured value of the `fishead` UTC field, parsed from the documented
@@ -717,6 +748,33 @@ impl Role {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+
+    /// Render this `Role` back to its on-wire `Role` value string, the
+    /// inverse of [`Role::parse`].
+    ///
+    /// Emits the role tag ([`RoleKind::as_wire`]) followed by each
+    /// `;key=value` parameter in declaration order — so the wiki's
+    /// `video/alternate;angle=nw` form round-trips. A value-less
+    /// parameter emits the bare `;key`. `Role::parse(role.to_wire())`
+    /// reproduces an equal value (a well-known kind canonicalises to
+    /// lowercase; an `Other(tag)` kind preserves its casing).
+    pub fn to_wire(&self) -> String {
+        let mut s = self.kind.as_wire().to_string();
+        for (k, v) in &self.parameters {
+            if v.is_empty() {
+                s.push_str(&format!(";{k}"));
+            } else {
+                s.push_str(&format!(";{k}={v}"));
+            }
+        }
+        s
+    }
+}
+
+impl core::fmt::Display for Role {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.to_wire())
+    }
 }
 
 /// One numeric argument inside a `Display-hint` parametric form.
@@ -958,6 +1016,92 @@ impl DisplayHint {
             }),
         }
     }
+
+    /// Render this `Display-hint` back to its on-wire value string, the
+    /// inverse of [`DisplayHint::parse`].
+    ///
+    /// Each documented form re-emits its canonical tag and the same
+    /// argument shape it was parsed from: `pip(x,y)` / `pip(x,y,w,h)`,
+    /// `mask(url)` / `mask(url,x,y)` / `mask(url,x,y,w,h)`,
+    /// `transparent(p%)`, and `Other { tag, arguments }` →
+    /// `tag(arg,arg,…)` (or a bare `tag()` for an empty argument list).
+    /// Coordinates render via [`DisplayCoord::to_wire`] so the
+    /// pixel-vs-percent distinction survives the round-trip.
+    pub fn to_wire(&self) -> String {
+        match self {
+            DisplayHint::Pip {
+                x,
+                y,
+                width,
+                height,
+            } => match (width, height) {
+                (Some(w), Some(h)) => format!(
+                    "pip({},{},{},{})",
+                    x.to_wire(),
+                    y.to_wire(),
+                    w.to_wire(),
+                    h.to_wire()
+                ),
+                _ => format!("pip({},{})", x.to_wire(), y.to_wire()),
+            },
+            DisplayHint::Mask {
+                image,
+                x,
+                y,
+                width,
+                height,
+            } => match (x, y, width, height) {
+                (Some(x), Some(y), Some(w), Some(h)) => format!(
+                    "mask({image},{},{},{},{})",
+                    x.to_wire(),
+                    y.to_wire(),
+                    w.to_wire(),
+                    h.to_wire()
+                ),
+                (Some(x), Some(y), _, _) => {
+                    format!("mask({image},{},{})", x.to_wire(), y.to_wire())
+                }
+                _ => format!("mask({image})"),
+            },
+            DisplayHint::Transparent { percent } => format!("transparent({percent}%)"),
+            DisplayHint::Other { tag, arguments } => {
+                format!("{tag}({})", arguments.join(","))
+            }
+        }
+    }
+}
+
+impl core::fmt::Display for DisplayHint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.to_wire())
+    }
+}
+
+impl DisplayCoord {
+    /// Render a single coordinate token, the inverse of
+    /// [`DisplayCoord::parse`]: a raw integer for [`DisplayCoord::Pixels`]
+    /// and a `%`-suffixed value for [`DisplayCoord::Percent`]. A
+    /// whole-number percent renders without a trailing `.0` (so
+    /// `Percent(20.0)` → `"20%"`, matching the wiki's `pip(20%,20%)`
+    /// worked example) while a fractional percent keeps its decimal.
+    pub fn to_wire(&self) -> String {
+        match self {
+            DisplayCoord::Pixels(p) => p.to_string(),
+            DisplayCoord::Percent(pct) => {
+                if pct.fract() == 0.0 {
+                    format!("{}%", *pct as i64)
+                } else {
+                    format!("{pct}%")
+                }
+            }
+        }
+    }
+}
+
+impl core::fmt::Display for DisplayCoord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.to_wire())
+    }
 }
 
 /// Top-level "type" component of a `Content-Type` MIME value.
@@ -1169,6 +1313,36 @@ impl ContentType {
     /// subtype, and parameter names are not case sensitive").
     pub fn subtype_eq(&self, expected: &str) -> bool {
         self.subtype.eq_ignore_ascii_case(expected)
+    }
+
+    /// Render this `ContentType` back to its on-wire `Content-Type`
+    /// value string, the inverse of [`ContentType::parse`].
+    ///
+    /// Emits `<kind>/<subtype>` followed by each `;key=value` parameter
+    /// in declaration order (a parameter with an empty value emits the
+    /// bare `;key`, matching how [`ContentType::parse`] preserves a
+    /// value-less parameter token). The result feeds straight into
+    /// [`FisBone::set_header`] / [`FisBone::set_content_type`], and
+    /// `ContentType::parse(ct.to_wire())` reproduces an equal value
+    /// (modulo the case-folding the `kind` bucket applies — an
+    /// `Other(token)` kind preserves its original casing, while a
+    /// well-known kind re-emits in canonical lowercase).
+    pub fn to_wire(&self) -> String {
+        let mut s = format!("{}/{}", self.kind.as_wire(), self.subtype);
+        for (k, v) in &self.parameters {
+            if v.is_empty() {
+                s.push_str(&format!(";{k}"));
+            } else {
+                s.push_str(&format!(";{k}={v}"));
+            }
+        }
+        s
+    }
+}
+
+impl core::fmt::Display for ContentType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.to_wire())
     }
 }
 
@@ -1442,6 +1616,94 @@ impl FisBone {
             .iter()
             .find(|h| h.name.eq_ignore_ascii_case(name))
             .map(|h| h.value.as_str())
+    }
+
+    /// Typed setter for the mandatory `Content-Type` message header
+    /// (`docs/container/ogg/ogg-skeleton-message-headers.wiki`
+    /// §Content-type) — the write-side inverse of [`Self::content_type`].
+    /// Serialises the [`ContentType`] via [`ContentType::to_wire`] and
+    /// stores it under `Content-Type`, so
+    /// `bone.content_type()` returns an equal value afterwards.
+    pub fn set_content_type(&mut self, ct: &ContentType) {
+        self.set_header("Content-Type", ct.to_wire());
+    }
+
+    /// Typed setter for the mandatory `Role` message header
+    /// (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Role) —
+    /// the write-side inverse of [`Self::role`]. Serialises via
+    /// [`Role::to_wire`] (tag plus any `;key=value` parameters).
+    pub fn set_role(&mut self, role: &Role) {
+        self.set_header("Role", role.to_wire());
+    }
+
+    /// Typed setter for the `Display-hint` message header
+    /// (`docs/container/ogg/ogg-skeleton-message-headers.wiki`
+    /// §Display-hint) — the write-side inverse of [`Self::display_hint`].
+    /// Serialises via [`DisplayHint::to_wire`].
+    pub fn set_display_hint(&mut self, hint: &DisplayHint) {
+        self.set_header("Display-hint", hint.to_wire());
+    }
+
+    /// Typed setter for the `Language` message header
+    /// (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Language)
+    /// — the write-side inverse of [`Self::languages`]. The wiki spells
+    /// the value as a comma-separated list with the dominating language
+    /// first; this joins `tags` with `, ` in order (matching the wiki's
+    /// `Language: en-US, fr` worked example). Empty / whitespace-only
+    /// entries are dropped so a stray blank tag never emits a
+    /// `Language: en-US, , fr`. With no usable tag the header is removed
+    /// entirely rather than left as an empty value.
+    pub fn set_languages<S: AsRef<str>>(&mut self, tags: &[S]) {
+        let joined = tags
+            .iter()
+            .map(|t| t.as_ref().trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if joined.is_empty() {
+            self.remove_header("Language");
+        } else {
+            self.set_header("Language", joined);
+        }
+    }
+
+    /// Typed setter for the `Altitude` stack-order message header
+    /// (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Altitude)
+    /// — the write-side inverse of [`Self::altitude`]. Stores the signed
+    /// z-index value as its decimal string (the wiki's `Altitude: -150`
+    /// worked example round-trips).
+    pub fn set_altitude(&mut self, altitude: i64) {
+        self.set_header("Altitude", altitude.to_string());
+    }
+
+    /// Typed setter for the `Title` free-text message header
+    /// (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Title) —
+    /// the write-side inverse of [`Self::title`]. The value is stored
+    /// verbatim (no quoting is applied: the wiki's quotes are a
+    /// typographic convention, not part of the on-wire value — callers
+    /// that want the quoted form pass it already quoted).
+    pub fn set_title<S: Into<String>>(&mut self, title: S) {
+        self.set_header("Title", title.into());
+    }
+
+    /// Typed setter for the `Name` track-identifier message header
+    /// (`docs/container/ogg/ogg-skeleton-message-headers.wiki` §Name) —
+    /// the write-side inverse of [`Self::name`]. The value is stored
+    /// verbatim; callers that need to guarantee the §Name `NCName`
+    /// grammar gate on [`Name::is_well_formed`] first.
+    pub fn set_name<S: Into<String>>(&mut self, name: S) {
+        self.set_header("Name", name.into());
+    }
+
+    /// Remove a message header by case-insensitive name, returning `true`
+    /// if a header was present and removed. The inverse companion of
+    /// [`Self::set_header`] — used by [`Self::set_languages`] to clear an
+    /// emptied list, and exposed for callers building fisbones
+    /// incrementally.
+    pub fn remove_header(&mut self, name: &str) -> bool {
+        let before = self.headers.len();
+        self.headers.retain(|h| !h.name.eq_ignore_ascii_case(name));
+        self.headers.len() != before
     }
 
     /// Typed `Role` accessor.
@@ -5228,5 +5490,56 @@ mod tests {
         sk.push_index(known);
         // Target 6 s -> known's last floor is t=5 s (off 12000).
         assert_eq!(sk.seek_offset_for_time(6.0), Some(12_000));
+    }
+
+    #[test]
+    fn display_coord_to_wire_whole_percent_has_no_decimal() {
+        // The wiki's pip(20%,20%) example uses a whole-number percent;
+        // to_wire must not re-emit it as "20.0%".
+        assert_eq!(DisplayCoord::Percent(20.0).to_wire(), "20%");
+        assert_eq!(DisplayCoord::Pixels(40).to_wire(), "40");
+        assert_eq!(DisplayCoord::Pixels(-7).to_wire(), "-7");
+    }
+
+    #[test]
+    fn display_coord_to_wire_fractional_percent_keeps_decimal() {
+        // The wiki permits fractional percents (e.g. 12.5%).
+        assert_eq!(DisplayCoord::Percent(12.5).to_wire(), "12.5%");
+    }
+
+    #[test]
+    fn content_type_to_wire_is_parse_inverse() {
+        for raw in ["audio/vorbis", "video/theora", "audio/ogg;codecs=opus"] {
+            let ct = ContentType::parse(raw).unwrap();
+            assert_eq!(ct.to_wire(), raw);
+            assert_eq!(ContentType::parse(&ct.to_wire()).unwrap(), ct);
+            assert_eq!(format!("{ct}"), raw);
+        }
+    }
+
+    #[test]
+    fn role_to_wire_is_parse_inverse() {
+        for raw in ["audio/main", "video/alternate;angle=nw"] {
+            let r = Role::parse(raw);
+            assert_eq!(r.to_wire(), raw);
+            assert_eq!(Role::parse(&r.to_wire()), r);
+            assert_eq!(format!("{r}"), raw);
+        }
+    }
+
+    #[test]
+    fn display_hint_to_wire_is_parse_inverse() {
+        for raw in [
+            "pip(20%,20%)",
+            "pip(40,40,690,60)",
+            "mask(http://x/i.png)",
+            "mask(http://x/i.png,30%,25%)",
+            "mask(http://x/i.png,20,20,400,320)",
+            "transparent(25%)",
+        ] {
+            let h = DisplayHint::parse(raw).unwrap();
+            assert_eq!(h.to_wire(), raw);
+            assert_eq!(DisplayHint::parse(&h.to_wire()).unwrap(), h);
+        }
     }
 }

@@ -1039,6 +1039,29 @@ than failing the whole query, matching the skip-malformed tolerance of the
 other `Skeleton`-level resolvers. Spec reference:
 `docs/container/ogg/ogg-skeleton-message-headers.wiki` §"Altitude".
 
+#### Typed message-header writers (write-side symmetry)
+
+Every typed *reader* above (`FisBone::content_type()` / `role()` /
+`display_hint()` / `languages()` / `altitude()` / `title()` / `name()` and
+`FisHead::utc_time()`) now has an inverse *writer* so callers build a fisbone
+from structured values rather than hand-formatting the on-wire string:
+`FisBone::set_content_type` / `set_role` / `set_display_hint` /
+`set_languages` / `set_altitude` / `set_title` / `set_name` /
+`remove_header`, plus `FisHead::set_utc` / `set_utc_str`. The value types
+carry the serialisers the setters use — `ContentType::to_wire`,
+`Role::to_wire`, `DisplayHint::to_wire`, `DisplayCoord::to_wire` (all also
+`Display`), and the pre-existing `Utc::to_string_basic` — so a written value
+reads back equal: `bone.set_role(&r); bone.role() == Some(r)`. `set_languages`
+joins the tags `", "`-separated with the dominating language first (the wiki
+§Language `en-US, fr` shape), drops blank fragments, and removes the header
+entirely for an empty list; `set_utc_str` zero-pads the fixed 20-byte
+`fishead` slot and refuses (rather than truncates) an over-long anchor. This
+closes the demux→mux round-trip loop end to end: a `Skeleton` parsed by the
+demuxer can be reconstructed field-for-field and handed straight to
+`mux::open_with_skeleton`. Spec reference:
+`docs/container/ogg/ogg-skeleton-message-headers.wiki`,
+`docs/container/ogg/ogg-skeleton-4.0.md`.
+
 ### Page-loss detection (RFC 3533 §6)
 
 Every Ogg page header carries a `page_sequence_number` that "is

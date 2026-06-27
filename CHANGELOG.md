@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed Skeleton message-header / UTC *writers* (write-side symmetry).** The
+  module already carried a typed *reader* for every
+  `docs/container/ogg/ogg-skeleton-message-headers.wiki` field and the
+  `fishead` UTC slot; this adds the inverse setters so callers build a fisbone
+  from structured values instead of hand-formatting wire strings:
+  `FisBone::set_content_type` / `set_role` / `set_display_hint` /
+  `set_languages` / `set_altitude` / `set_title` / `set_name` /
+  `remove_header`, and `FisHead::set_utc` / `set_utc_str`. Each is the exact
+  inverse of its reader (`ContentType::to_wire`, `Role::to_wire`,
+  `DisplayHint::to_wire`, `DisplayCoord::to_wire`, plus `Display` impls on
+  those types and `Utc::to_string_basic`): `bone.content_type()` /
+  `role()` / `display_hint()` / `languages()` / `altitude()` / `title()` /
+  `name()` and `head.utc_time()` return a value equal to the one written.
+  `set_languages` joins tags `", "`-separated with the dominating language
+  first (wiki §Language `en-US, fr` shape), dropping blank fragments and
+  removing the header entirely when the list is empty. `set_utc_str` zero-pads
+  the fixed 20-byte slot and refuses an over-long anchor rather than
+  truncating. `tests/skeleton_setters.rs` pins each reader↔writer round-trip
+  plus full `to_bytes`/`parse` survival.
+
 - **`OggDemuxer::seek_to_keyframe(stream_index, pts)`** — keyframe-aware seek
   for sub-seekable (keyframe-bearing) mappings. A bare `seek_to` lands on the
   page whose frame number floors the target, which for Theora may be an
