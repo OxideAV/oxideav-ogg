@@ -297,6 +297,16 @@ Per-stream header packets are reconstructed from each stream's
 out of the Xiph-laced blob; for Opus the single `OpusHead` packet is
 augmented with a minimal empty `OpusTags` comment block.
 
+A packet larger than one Ogg page — ≥ 65025 bytes laces to ≥ 256
+segments and a page holds at most 255 (RFC 3533 §6 field 4) — is
+**distributed over several pages** (§5). The muxer flushes any partial
+page first, then fills successive pages 255 segments at a time; each
+intermediate page ends on a 255-valued segment so the next page carries
+the `continued` flag (§6 field 3), and the packet's terminator lands on
+the final page. This mirrors the demuxer's multi-page reassembly, so a
+large Vorbis setup codebook or Theora keyframe round-trips byte-exact
+through mux → demux (`tests/large_packet_mux.rs`).
+
 ### Metadata
 
 Vorbis-comment blocks (Vorbis packet #2, OpusTags, Theora comment

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Muxer now spans a packet larger than one Ogg page across multiple pages
+  (RFC 3533 §4 / §5).** A single page holds at most 255 lacing segments, so a
+  content or header packet of ~64 KB or more (255×255 = 65025 bytes laces to
+  256 segments) could not fit one page — and the muxer previously fed all the
+  segments into a single `Page`, tripping the `Page::to_bytes` 255-segment
+  assertion (a panic). Real Vorbis setup codebooks and Theora keyframes
+  routinely exceed this. `write_packet` now flushes the partial page first,
+  then `append_packet_spanning` fills successive pages 255 segments at a time;
+  every intermediate page ends on a 255-valued segment so `flush_page` marks
+  the following page `continued` (§6 field 3) automatically, and the packet's
+  terminator (`< 255`, or the trailing `0` for an exact multiple of 255) lands
+  on the final page. The demuxer already reassembled such packets
+  byte-for-byte (`tests/multipage_packet.rs`); this restores the write-side
+  symmetry. `tests/large_packet_mux.rs` round-trips content packets at the
+  65025 / 70000 / 130050 / 200000-byte sizes plus a 96 KB header packet through
+  mux → demux byte-exact.
+
 ### Added
 
 - **Typed Skeleton message-header / UTC *writers* (write-side symmetry).** The

@@ -461,6 +461,54 @@ impl OggMuxer {
             .ok_or_else(|| Error::invalid(format!("unknown stream index {stream_index}")))
     }
 
+    /// Append a packet whose lacing exceeds one page's 255-segment limit,
+    /// "distributed over several pages" per RFC 3533 §5. The builder is
+    /// filled up to 255 segments at a time; each time it is full, a page is
+    /// flushed and reassembly continues on the next page. Because every
+    /// intermediate page ends on a 255-valued lacing segment (the packet is
+    /// still open), `flush_page` marks the following page `continued`
+    /// (RFC 3533 §6 field 3) automatically. The packet's terminator segment
+    /// (`< 255`, or the trailing `0` for an exact multiple of 255) lands on
+    /// the final page, which is left in the builder for the caller's normal
+    /// flush logic (granule carry-through, `unit_boundary`, header-page
+    /// flush) to finish.
+    ///
+    /// Precondition: the builder is empty (the caller flushes any partial
+    /// page first), so the spanning packet starts on a fresh page boundary
+    /// and its first page is never spuriously continued.
+    fn append_packet_spanning(
+        &mut self,
+        stream_index: u32,
+        lacing: &[u8],
+        data: &[u8],
+    ) -> Result<()> {
+        let mut seg_off = 0usize; // index into `lacing`
+        let mut data_off = 0usize; // byte index into `data`
+        while seg_off < lacing.len() {
+            let writer = self.writer_for(stream_index)?;
+            let room = 255 - writer.buffered.lacing.len();
+            // Take as many segments as fit on the current page.
+            let take = room.min(lacing.len() - seg_off);
+            let chunk = &lacing[seg_off..seg_off + take];
+            let chunk_bytes: usize = chunk.iter().map(|&v| v as usize).sum();
+            writer.buffered.lacing.extend_from_slice(chunk);
+            writer
+                .buffered
+                .data
+                .extend_from_slice(&data[data_off..data_off + chunk_bytes]);
+            seg_off += take;
+            data_off += chunk_bytes;
+            // If there is still packet left, the page is full (255 segments)
+            // — flush it as a non-forced page so the remainder spills onto a
+            // fresh `continued` page. The very last chunk is *not* flushed
+            // here; it stays in the builder for the caller to finalize.
+            if seg_off < lacing.len() {
+                self.flush_page(stream_index, false)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Emit a single Skeleton-stream page carrying `packet_bytes` as one
     /// whole packet, with the supplied header flags. Granule is always 0
     /// (Skeleton itself defines no time-axis content) and the sequence
@@ -876,26 +924,53 @@ impl Muxer for OggMuxer {
         let stream_index = packet.stream_index;
         let lacing_for_packet = lace(packet.data.len());
 
-        let writer = self.writer_for(stream_index)?;
-        let is_header = writer.headers_remaining > 0;
+        let (is_header, needs_boundary_flush) = {
+            let writer = self.writer_for(stream_index)?;
+            (
+                writer.headers_remaining > 0,
+                writer.buffered.lacing.len() + lacing_for_packet.len() > 255
+                    && !writer.buffered.is_empty(),
+            )
+        };
 
-        // Flush early if this packet's lacing wouldn't fit in 255 segments.
-        if writer.buffered.lacing.len() + lacing_for_packet.len() > 255 {
+        // A single Ogg page holds at most 255 lacing segments (RFC 3533 §6
+        // field 4). A packet ≥ 255×255 = 65025 bytes laces to ≥ 256 segments
+        // (e.g. 65025 → 255 full + a 0 terminator), so it cannot fit one page
+        // even when the page is otherwise empty — it MUST be "distributed
+        // over several pages" (§5). `append_packet_spanning` fills the
+        // current builder up to 255 segments, flushes a `continued`-marked
+        // page (the flush sets `starts_continued` because its last segment is
+        // 255), and repeats until the whole packet is laced. For the common
+        // case (a packet that fits) it is a single append with no early flush.
+        //
+        // When the packet would not fit alongside the already-buffered
+        // segments, flush the partial page first so the packet starts on a
+        // fresh page boundary (and an oversized packet's spanning split
+        // begins on an empty builder, as `append_packet_spanning` requires).
+        if needs_boundary_flush {
             self.flush_page(stream_index, false)?;
         }
 
-        let writer = self.writer_for(stream_index)?;
-        writer.buffered.lacing.extend_from_slice(&lacing_for_packet);
-        writer.buffered.data.extend_from_slice(&packet.data);
+        if lacing_for_packet.len() > 255 {
+            self.append_packet_spanning(stream_index, &lacing_for_packet, &packet.data)?;
+        } else {
+            let writer = self.writer_for(stream_index)?;
+            writer.buffered.lacing.extend_from_slice(&lacing_for_packet);
+            writer.buffered.data.extend_from_slice(&packet.data);
+        }
 
         if is_header {
-            // Header packets each get their own page with granule 0.
+            // Header packets each get their own page with granule 0. A header
+            // packet that already spanned pages above has left its final
+            // partial page in the builder; flushing here closes it.
+            let writer = self.writer_for(stream_index)?;
             writer.headers_remaining -= 1;
             writer.buffered.granule_position = 0;
             self.flush_page(stream_index, true)?;
             return Ok(());
         }
 
+        let writer = self.writer_for(stream_index)?;
         // Audio/video packet. The page's granule_position is set from the
         // most recent pts seen on this page (this packet's pts wins if
         // present; otherwise the buffered value carries through). A new
