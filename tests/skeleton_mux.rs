@@ -1023,3 +1023,86 @@ fn from_streams_content_type_only_for_documented_codecs() {
         "un-mirrored codec MIME is left for the caller, not guessed"
     );
 }
+
+/// Full-fidelity Skeleton round-trip combining this round's write-side
+/// additions: `Skeleton::from_streams` builds the base, the typed setters
+/// populate the message headers and the substream/preroll fields are set
+/// directly, then mux -> demux recovers every fisbone field byte-for-byte.
+#[test]
+fn rich_skeleton_round_trips_every_fisbone_field() {
+    use oxideav_ogg::skeleton::{ContentType, DisplayHint, Role};
+
+    let id = vorbis_id_packet(2, 48_000);
+    let com = vorbis_comment_packet();
+    let setup = vorbis_setup_packet();
+    let extradata = xiph_lace_three(&[&id, &com, &setup]);
+    let stream = single_stream(0, "vorbis", extradata, TimeBase::new(1, 48_000));
+
+    let mut skel = Skeleton::from_streams(std::slice::from_ref(&stream), Version::V4_0);
+    {
+        let bone = &mut skel.bones[0];
+        // Substream / preroll / keyframe-shift fields the Ogg framing can't
+        // infer, set directly.
+        bone.preroll = 2;
+        bone.granuleshift = 0;
+        bone.basegranule = 96_000;
+        bone.num_headers = 3;
+        // Typed message-header writers.
+        bone.set_role(&Role::parse("audio/main"));
+        bone.set_name("main_audio");
+        bone.set_languages(&["en-US", "fr"]);
+        bone.set_altitude(-3);
+        bone.set_display_hint(&DisplayHint::parse("transparent(15%)").unwrap());
+    }
+    // Fishead anchors.
+    if let Some(head) = skel.head.as_mut() {
+        head.presentation_time = Rational::new(7, 1);
+        head.basetime = Rational::new(3600, 1);
+    }
+
+    let bytes = mux_with_skeleton(vec![stream], skel.clone(), 4);
+
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux rich Skeleton");
+    let got = dmx.skeleton().expect("Skeleton recovered");
+
+    // Fishead anchors survived.
+    let head = got.head.as_ref().unwrap();
+    assert_eq!(head.version, Version::V4_0);
+    assert_eq!(head.presentation_time, Rational::new(7, 1));
+    assert_eq!(head.basetime, Rational::new(3600, 1));
+
+    // Fisbone fixed fields survived.
+    assert_eq!(got.bones.len(), 1);
+    let bone = &got.bones[0];
+    assert_eq!(bone.serial, 0);
+    assert_eq!(bone.granule_rate, Rational::new(48_000, 1));
+    assert_eq!(bone.num_headers, 3);
+    assert_eq!(bone.preroll, 2);
+    assert_eq!(bone.granuleshift, 0);
+    assert_eq!(bone.basegranule, 96_000);
+
+    // Typed message-header round-trips (write via setters -> read via typed
+    // accessors after a full mux/demux cycle).
+    assert_eq!(
+        bone.content_type().unwrap().unwrap(),
+        ContentType::parse("audio/vorbis").unwrap()
+    );
+    assert_eq!(bone.role().unwrap(), Role::parse("audio/main"));
+    assert_eq!(bone.name().unwrap().raw(), "main_audio");
+    assert_eq!(bone.languages().unwrap(), vec!["en-US", "fr"]);
+    assert_eq!(bone.dominant_language(), Some("en-US"));
+    assert_eq!(bone.altitude().unwrap().unwrap(), -3);
+    assert_eq!(
+        bone.display_hint().unwrap().unwrap(),
+        DisplayHint::parse("transparent(15%)").unwrap()
+    );
+
+    // Skeleton-level resolvers consume the recovered headers.
+    assert_eq!(got.bone_for_name("main_audio").map(|b| b.serial), Some(0));
+    assert_eq!(
+        got.stream_start_seconds(0),
+        Some(96_000.0 / 48_000.0 + 3600.0)
+    );
+}
