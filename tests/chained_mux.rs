@@ -72,6 +72,33 @@ fn xiph_lace_three(packets: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// A large Vorbis "setup" packet whose `len` payload bytes force the
+/// header packet to span multiple Ogg pages (real codebooks exceed 64 KB).
+fn big_vorbis_setup(len: usize) -> Vec<u8> {
+    let mut p = Vec::with_capacity(7 + len);
+    p.push(0x05);
+    p.extend_from_slice(b"vorbis");
+    p.extend((0..len).map(|i| (i * 31 + 7) as u8));
+    p
+}
+
+fn vorbis_stream_with_setup(index: u32, sample_rate: u32, setup: &[u8]) -> StreamInfo {
+    let id = vorbis_id_packet(2, sample_rate);
+    let com = vorbis_comment_packet();
+    let extradata = xiph_lace_three(&[&id, &com, setup]);
+    let mut params = CodecParameters::audio(CodecId::new("vorbis"));
+    params.channels = Some(2);
+    params.sample_rate = Some(sample_rate);
+    params.extradata = extradata;
+    StreamInfo {
+        index,
+        time_base: TimeBase::new(1, sample_rate as i64),
+        duration: None,
+        start_time: Some(0),
+        params,
+    }
+}
+
 fn vorbis_stream(index: u32, sample_rate: u32) -> StreamInfo {
     let id = vorbis_id_packet(2, sample_rate);
     let com = vorbis_comment_packet();
@@ -366,6 +393,50 @@ fn chained_grouped_link_round_trips() {
     assert!(
         (dur - 180_000).abs() <= 2,
         "grouped+chained duration = max(group)+link1 = 80+100 = 180 ms, got {dur}",
+    );
+}
+
+#[test]
+fn chained_link_with_multipage_header_round_trips() {
+    // A chained link whose Vorbis setup header exceeds one Ogg page
+    // (>65025 bytes → ≥256 lacing segments) must span pages. begin_new_link
+    // writes the new link's header packets through the same write_packet →
+    // append_packet_spanning path as write_header, so the spanning header of
+    // a *chained* link must round-trip exactly like a first-link one.
+    let link_a = vorbis_stream(0, 48_000);
+    let big_setup = big_vorbis_setup(70_000);
+    let link_b = vorbis_stream_with_setup(0, 48_000, &big_setup);
+
+    let shared = SharedBuf::default();
+    let writer: Box<dyn WriteSeek> = Box::new(shared.clone());
+    let mut mux = oxideav_ogg::mux::open_concrete(writer, std::slice::from_ref(&link_a)).unwrap();
+    mux.write_header().unwrap();
+    feed_link(&mut mux, &link_a, 0xAA, 2);
+    mux.begin_new_link(std::slice::from_ref(&link_b)).unwrap();
+    feed_link(&mut mux, &link_b, 0xBB, 3);
+    mux.write_trailer().unwrap();
+    drop(mux);
+
+    let bytes = shared.0.lock().unwrap().get_ref().clone();
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut demux = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux chain with multipage header");
+    let mut counts: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    while let Ok(p) = demux.next_packet() {
+        *counts.entry(p.data[0]).or_default() += 1;
+    }
+    assert_eq!(demux.link_count(), 2, "two links despite spanning header");
+    assert_eq!(counts.get(&0xAA), Some(&2));
+    assert_eq!(counts.get(&0xBB), Some(&3));
+
+    // The chained link's rebuilt extradata must carry the full big setup
+    // packet back (Xiph-laced 3-packet blob longer than the bare ID packet).
+    let streams = demux.streams();
+    assert_eq!(streams.len(), 2);
+    let restored_big = streams.iter().any(|s| s.params.extradata.len() > 65_000);
+    assert!(
+        restored_big,
+        "the chained link's >64KB setup header must survive round-trip"
     );
 }
 

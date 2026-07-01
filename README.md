@@ -424,7 +424,9 @@ and chaining is mutually exclusive with an attached Skeleton (its control
 section + trailer-time segment-length backfill describe a single link);
 both are guarded with errors. `tests/chained_mux.rs` round-trips 2- and
 3-link chains, a grouped-then-chained topology (`max(group) + link1`
-duration), and global serial uniqueness through mux → demux.
+duration), a chained link whose >64 KB Vorbis setup header spans multiple
+pages (the `append_packet_spanning` path exercised on a non-first link),
+and global serial uniqueness through mux → demux.
 
 #### 'Nil' pages and multi-page packets (§4 / §5)
 
