@@ -273,6 +273,103 @@ fn serials_are_globally_unique_across_links() {
 }
 
 #[test]
+fn chained_mux_duration_sums_per_link() {
+    // Link A: 3 packets @ 48 kHz, granule step 960 → last granule 2880 →
+    // 60 ms. Link B: 5 packets @ 48 kHz → last granule 4800 → 100 ms.
+    // The demuxer sums per-link durations for a chained file, so total
+    // must be 160 ms — mirroring tests/chained_duration.rs but with a
+    // muxer-produced file rather than a hand-built one.
+    let link_a = vorbis_stream(0, 48_000);
+    let link_b = vorbis_stream(0, 48_000);
+
+    let shared = SharedBuf::default();
+    let writer: Box<dyn WriteSeek> = Box::new(shared.clone());
+    let mut mux = oxideav_ogg::mux::open_concrete(writer, std::slice::from_ref(&link_a)).unwrap();
+    mux.write_header().unwrap();
+    feed_link(&mut mux, &link_a, 0xAA, 3);
+    mux.begin_new_link(std::slice::from_ref(&link_b)).unwrap();
+    feed_link(&mut mux, &link_b, 0xBB, 5);
+    mux.write_trailer().unwrap();
+    drop(mux);
+
+    let bytes = shared.0.lock().unwrap().get_ref().clone();
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut demux = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux chained mux for duration");
+    demux.build_seek_index().expect("build seek index");
+    let dur = demux.duration_micros().expect("duration recorded");
+    assert!(
+        (dur - 160_000).abs() <= 2,
+        "chained mux duration should sum per-link (60+100 ms), got {dur}",
+    );
+}
+
+#[test]
+fn chained_grouped_link_round_trips() {
+    // The most general RFC 3533 §4 topology: a link that GROUPS two
+    // concurrently-multiplexed streams, chained to a second single-stream
+    // link. begin_new_link takes a slice, so a grouped link is just a
+    // multi-stream slice. On read-back the grouped link's two streams
+    // share link 0, and the chained link's stream is link 1; chained
+    // duration is max(group) + link1.
+    let group0 = vorbis_stream(0, 48_000);
+    let group1 = vorbis_stream(1, 48_000);
+    let link1 = vorbis_stream(0, 48_000);
+
+    let shared = SharedBuf::default();
+    let writer: Box<dyn WriteSeek> = Box::new(shared.clone());
+    let group = [group0.clone(), group1.clone()];
+    let mut mux = oxideav_ogg::mux::open_concrete(writer, &group).unwrap();
+    mux.write_header().unwrap();
+    // Interleave the two grouped streams: stream 0 gets 4 packets (80 ms),
+    // stream 1 gets 3 packets (60 ms).
+    for i in 1..=4i64 {
+        let granule = 960 * i;
+        let mut pkt = Packet::new(0, group0.time_base, vec![0xA0, i as u8]);
+        pkt.pts = Some(granule);
+        pkt.flags.unit_boundary = true;
+        mux.write_packet(&pkt).unwrap();
+        if i <= 3 {
+            let mut pkt1 = Packet::new(1, group1.time_base, vec![0xA1, i as u8]);
+            pkt1.pts = Some(granule);
+            pkt1.flags.unit_boundary = true;
+            mux.write_packet(&pkt1).unwrap();
+        }
+    }
+    // Chain a second, single-stream link: 5 packets (100 ms).
+    mux.begin_new_link(std::slice::from_ref(&link1)).unwrap();
+    feed_link(&mut mux, &link1, 0xB0, 5);
+    mux.write_trailer().unwrap();
+    drop(mux);
+
+    let bytes = shared.0.lock().unwrap().get_ref().clone();
+    let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut demux = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)
+        .expect("demux grouped+chained mux output");
+
+    let mut counts: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    while let Ok(p) = demux.next_packet() {
+        *counts.entry(p.data[0]).or_default() += 1;
+    }
+    // Two links: the group (link 0) + the chained link (link 1).
+    assert_eq!(demux.link_count(), 2, "one grouped link + one chained link");
+    // Three logical streams total (2 grouped + 1 chained).
+    assert_eq!(demux.streams().len(), 3, "3 logical streams");
+    assert_eq!(counts.get(&0xA0), Some(&4), "grouped stream 0: 4 packets");
+    assert_eq!(counts.get(&0xA1), Some(&3), "grouped stream 1: 3 packets");
+    assert_eq!(counts.get(&0xB0), Some(&5), "chained link: 5 packets");
+
+    // The two grouped streams share link 0; the chained stream is link 1.
+    demux.build_seek_index().unwrap();
+    let dur = demux.duration_micros().expect("duration recorded");
+    // max(80 ms group0, 60 ms group1) + 100 ms link1 = 180 ms.
+    assert!(
+        (dur - 180_000).abs() <= 2,
+        "grouped+chained duration = max(group)+link1 = 80+100 = 180 ms, got {dur}",
+    );
+}
+
+#[test]
 fn begin_new_link_before_content_is_rejected() {
     let link = vorbis_stream(0, 48_000);
     let shared = SharedBuf::default();

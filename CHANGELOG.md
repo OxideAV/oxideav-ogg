@@ -28,6 +28,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Chained-stream muxing (RFC 3533 §4 sequential multiplexing).**
+  `mux::open_concrete(output, streams) -> OggMuxer` returns the concrete muxer
+  (the object-safe `Muxer` trait cannot express a new link, which takes a fresh
+  `&[StreamInfo]`), and `OggMuxer::begin_new_link(streams)` starts a new chain
+  link: it finalizes the current link — draining and EOS-terminating every one
+  of its logical bitstreams so "the eos page of a given logical bitstream is
+  immediately followed by the bos page of the next" — then writes the new
+  link's BOS + secondary-header pages. Because the slice may carry more than
+  one stream, a link can itself be a group of concurrently-multiplexed streams,
+  so the muxer emits the full §4 chain-of-groups topology. Serials are tracked
+  file-wide and any collision (later links reusing `StreamInfo::index 0`) is
+  bumped to the next free value, honouring the §4 unique-serial MUST — a muxed
+  chain demuxes back with `duplicate_serial_count() == 0`. `link_index()` /
+  `stream_serial(index)` expose the current-link state. A new link may only
+  begin after a content data page (the demuxer keys link boundaries on
+  BOS-after-non-BOS) and chaining is mutually exclusive with an attached
+  Skeleton; both are guarded with errors. `tests/chained_mux.rs` round-trips
+  2- and 3-link chains, a grouped-then-chained topology, and global serial
+  uniqueness through mux → demux.
+
 - **`Skeleton::from_streams(&[StreamInfo], Version)`** — build a complete
   Skeleton (a `fishead` plus one `fisbone` per content stream) directly from
   the demuxer's / caller's `StreamInfo` list, the write-side companion to the

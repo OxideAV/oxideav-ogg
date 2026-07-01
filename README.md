@@ -396,6 +396,36 @@ Chained duration sums per link with each grouped link contributing the
 **max** over its concurrently-multiplexed streams (so
 `max(A,B,C) + D`). `tests/chained_grouped.rs` pins all of this.
 
+#### Mux-side: writing chained links
+
+The write-side counterpart of the demuxer's chained-read path is
+`oxideav_ogg::mux::open_concrete(output, streams) -> OggMuxer`, the
+concrete muxer whose `begin_new_link(streams)` starts a new chain link.
+(The object-safe `Muxer` trait can't express it — a new link takes a
+fresh `&[StreamInfo]` — so the concrete type is the entry point, mirroring
+the demuxer's `open_concrete`.) `begin_new_link` finalizes the current
+link, draining and EOS-terminating every one of its logical bitstreams so
+"the eos page of a given logical bitstream is immediately followed by the
+bos page of the next" (RFC 3533 §4), then writes the new link's BOS +
+secondary-header pages. Because the slice may hold more than one stream, a
+new link can itself be a **group** of concurrently-multiplexed streams —
+so the muxer emits the full §4 *chain-of-groups* topology, not just plain
+back-to-back single-stream links.
+
+Serials are tracked file-wide: any collision (later links reusing
+`StreamInfo::index` `0`, the common case) is bumped to the next free value,
+honouring the §4 "unique serial number within the scope of the physical
+bitstream" MUST — a muxed chain demuxes back with `duplicate_serial_count()
+== 0`. `OggMuxer::link_index()` returns the current link (matching the
+demuxer's `stream_link_index` on read-back) and `stream_serial(index)`
+the current link's on-wire serial. A new link may only begin after a
+content data page (the demuxer keys link boundaries on BOS-after-non-BOS),
+and chaining is mutually exclusive with an attached Skeleton (its control
+section + trailer-time segment-length backfill describe a single link);
+both are guarded with errors. `tests/chained_mux.rs` round-trips 2- and
+3-link chains, a grouped-then-chained topology (`max(group) + link1`
+duration), and global serial uniqueness through mux → demux.
+
 #### 'Nil' pages and multi-page packets (§4 / §5)
 
 A *nil page* (§4: "containing no content but simply a page header with
