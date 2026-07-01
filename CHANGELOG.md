@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.6...v0.1.7) - 2026-07-01
+
+### Other
+
+- chained link with a multi-page (spanning) Vorbis setup header
+- chained-mux duration + grouped-link round-trips, README/CHANGELOG
+- chained-stream muxing via OggMuxer::begin_new_link (RFC 3533 §4)
+- full-fidelity demux->mux->demux Skeleton round-trip test
+- Skeleton::from_streams builder (write-side companion to skeleton())
+- mux spans a packet larger than one page across pages (RFC 3533 §4/§5)
+- typed Skeleton message-header / UTC writers (write-side symmetry)
+- keyframe-aware seek_to_keyframe for Theora (granuleshift keyframe-index)
+- add OggDemuxer::stream_granuleshift accessor + README per-packet-flags section
+- end-to-end Theora demux->remux keyframe-index test
+- chained Speex/FLAC links surface Vorbis-comment metadata mid-file
+- mux splits Theora Xiph-laced extradata into 3 header packets
+- per-packet keyframe flag tracks granuleshift packing (Theora inter-frames no longer mislabelled)
+- surface Speex comment header as container metadata
+- parse Speex + FLAC ID headers for rate/channels + sample-rate time-base
+- FLAC-in-Ogg header-packet count + Vorbis-comment metadata (RFC 9639 §10.1)
+- seek_to honours Opus pre-skip on the bisection axis (RFC 7845 §4.3)
+- Opus pre-skip granule semantics (RFC 7845 §4.3)
+- chained-file-aware Skeleton 4.0 segment-length index-validity check
+- anchor stream start_time onto the Skeleton fishead basetime/basegranule
+- typed Skeleton fishead presentation/basetime accessors (unknown vs zero)
+- tidy process_page BOS-handling comment (no behaviour change)
+- fuzz the §4 duplicate-serial restart path (continued_edge)
+- document §4 unique-serial-number enforcement in README
+- integration tests for §4 unique-serial-number detection
+- enforce RFC 3533 §4 unique-serial-number MUST (duplicate_serial_count)
+- document §4 mixed grouping+chaining + nil-page / multi-page coverage in README
+- byte-exact tests for clean multi-page packet reassembly (RFC 3533 §5)
+- coverage for RFC 3533 §4 nil (zero-segment) pages
+- end-to-end tests for RFC 3533 §4 mixed grouping + chaining topology
+- Theora duration estimate unpacks granuleshift via Skeleton fisbone
+- Skeleton content-type resolvers (bones_with_content_kind / bones_with_content_type)
+- dominant-language addressing (wiki §Language dominant-first rule)
+- file-level Skeleton 4.0 index helpers (indexed_duration_seconds + seek_offset_for_time)
+- Skeleton track stack-order resolver (message-headers §Altitude)
+- refresh to current status, drop per-round changelog cruft
+
 ### Fixed
 
 - **Muxer now spans a packet larger than one Ogg page across multiple pages
