@@ -5,7 +5,7 @@
 //! the 255-segment limit, when an explicit flush is requested, or at trailer
 //! time. Granule positions come from `Packet::pts` for non-header packets.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
 
 use oxideav_core::{CodecId, Error, Packet, Result, StreamInfo};
@@ -203,26 +203,47 @@ fn open_inner(
     skeleton: Option<Skeleton>,
     auto_index: Option<AutoIndexConfig>,
 ) -> Result<Box<dyn Muxer>> {
-    let mut per_stream = HashMap::with_capacity(streams.len());
-    let mut max_serial: u32 = 0;
-    for s in streams {
-        let serial = derive_serial(s);
-        max_serial = max_serial.max(serial);
-        let headers_remaining = codec_id::header_packet_count(&s.params.codec_id);
-        per_stream.insert(
-            s.index,
-            StreamWriter {
-                serial,
-                seq_no: 0,
-                buffered: PageBuilder::new(),
-                headers_remaining,
-                bos_emitted: false,
-                pending_bytes: None,
-            },
-        );
-    }
+    Ok(Box::new(open_concrete_inner(
+        output, streams, skeleton, auto_index,
+    )?))
+}
+
+/// Open a concrete [`OggMuxer`] rather than a boxed `dyn Muxer`.
+///
+/// The concrete type exposes chained-stream muxing via
+/// [`OggMuxer::begin_new_link`] — RFC 3533 §4 sequential multiplexing —
+/// which the object-safe [`Muxer`] trait cannot express (a new link takes
+/// a fresh `&[StreamInfo]`). It is the write-side companion to
+/// [`crate::demux::open_concrete`]: a chained file the demuxer partitions
+/// into per-link streams can be reproduced link-for-link. Callers that do
+/// not need chaining should prefer [`open`].
+pub fn open_concrete(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<OggMuxer> {
+    open_concrete_inner(output, streams, None, None)
+}
+
+fn open_concrete_inner(
+    output: Box<dyn WriteSeek>,
+    streams: &[StreamInfo],
+    skeleton: Option<Skeleton>,
+    auto_index: Option<AutoIndexConfig>,
+) -> Result<OggMuxer> {
+    let mut used_serials: HashSet<u32> = HashSet::new();
+    let (per_stream, stream_order, max_serial) = build_link_writers(streams, &mut used_serials);
     let skeleton_writer = skeleton.map(|sk| {
-        let serial = sk.serial.unwrap_or(max_serial.wrapping_add(1));
+        let serial = match sk.serial {
+            Some(s) => s,
+            None => {
+                // Pick a serial past the largest content serial, skipping
+                // any already claimed so it cannot collide (RFC 3533 §4
+                // unique-serial MUST).
+                let mut cand = max_serial.wrapping_add(1);
+                while used_serials.contains(&cand) {
+                    cand = cand.wrapping_add(1);
+                }
+                cand
+            }
+        };
+        used_serials.insert(serial);
         SkeletonWriter {
             skel: sk,
             serial,
@@ -238,7 +259,7 @@ fn open_inner(
     let mut auto_states: Vec<AutoIndexState> = Vec::new();
     if let (Some(cfg), Some(sw)) = (auto_index, skeleton_writer.as_ref()) {
         for s in streams {
-            let serial = derive_serial(s);
+            let serial = per_stream[&s.index].serial;
             if sw.skel.indexes.iter().any(|idx| idx.serial == serial) {
                 continue;
             }
@@ -256,16 +277,56 @@ fn open_inner(
             });
         }
     }
-    Ok(Box::new(OggMuxer {
+    Ok(OggMuxer {
         output,
         streams: streams.to_vec(),
         per_stream,
-        stream_order: streams.iter().map(|s| s.index).collect(),
+        stream_order,
         header_written: false,
         trailer_written: false,
         skeleton: skeleton_writer,
         auto_index: auto_states,
-    }))
+        used_serials,
+        link_index: 0,
+        content_started: false,
+    })
+}
+
+/// Build the per-stream writers for one chain link, assigning each a
+/// globally-unique serial (RFC 3533 §4: "Each chained logical bitstream
+/// MUST have a unique serial number within the scope of the physical
+/// bitstream"). Serials already claimed by an earlier link — or by another
+/// stream of this link whose derived serial collides — are bumped to the
+/// next free value. Returns the writer map, the stream order, and the
+/// largest serial assigned (so the Skeleton serial can sit past it).
+fn build_link_writers(
+    streams: &[StreamInfo],
+    used_serials: &mut HashSet<u32>,
+) -> (HashMap<u32, StreamWriter>, Vec<u32>, u32) {
+    let mut per_stream = HashMap::with_capacity(streams.len());
+    let mut max_serial: u32 = 0;
+    for s in streams {
+        let mut serial = derive_serial(s);
+        while used_serials.contains(&serial) {
+            serial = serial.wrapping_add(1);
+        }
+        used_serials.insert(serial);
+        max_serial = max_serial.max(serial);
+        let headers_remaining = codec_id::header_packet_count(&s.params.codec_id);
+        per_stream.insert(
+            s.index,
+            StreamWriter {
+                serial,
+                seq_no: 0,
+                buffered: PageBuilder::new(),
+                headers_remaining,
+                bos_emitted: false,
+                pending_bytes: None,
+            },
+        );
+    }
+    let stream_order = streams.iter().map(|s| s.index).collect();
+    (per_stream, stream_order, max_serial)
 }
 
 /// Derive a stable serial number for a stream. Real-world muxers use random
@@ -275,7 +336,14 @@ fn derive_serial(s: &StreamInfo) -> u32 {
     s.index
 }
 
-struct OggMuxer {
+/// Concrete Ogg muxer.
+///
+/// Returned by [`open_concrete`]; the [`open`] / [`open_with_skeleton`] /
+/// [`open_with_skeleton_indexed`] factories box it as a `dyn Muxer`. The
+/// concrete type additionally exposes [`OggMuxer::begin_new_link`] for
+/// writing RFC 3533 §4 chained (sequentially multiplexed) physical
+/// bitstreams, which the object-safe [`Muxer`] trait cannot express.
+pub struct OggMuxer {
     output: Box<dyn WriteSeek>,
     /// Stream descriptors retained so write_header can reconstruct the
     /// codec-specific setup packets from each stream's extradata.
@@ -295,6 +363,21 @@ struct OggMuxer {
     /// empty otherwise). Each reserves a placeholder `index\0` page in
     /// the header section and is backfilled in place at trailer time.
     auto_index: Vec<AutoIndexState>,
+    /// Every `bitstream_serial_number` claimed so far across *all* chain
+    /// links (RFC 3533 §4: serials MUST be unique within the scope of the
+    /// physical bitstream). A new link's derived serials that collide are
+    /// bumped to the next free value.
+    used_serials: HashSet<u32>,
+    /// Zero-based index of the chain link currently being written. `0`
+    /// for a plain (single-link) file; incremented by
+    /// [`OggMuxer::begin_new_link`].
+    link_index: u32,
+    /// Whether any content data page (post-header) has been written for
+    /// the current link. A new link may only begin after content — the
+    /// demuxer detects a link boundary as a BOS page following a non-BOS
+    /// (data) page, so a link with no data page would not be recognised
+    /// as a separate link on read-back.
+    content_started: bool,
 }
 
 /// Keyframe-index collector for one content stream — the WRITE-side
@@ -1001,6 +1084,11 @@ impl Muxer for OggMuxer {
                 state.note_pts(ts);
             }
         }
+        // A content data page for this link now exists (even if still
+        // buffered) — record it so `begin_new_link` knows the link has
+        // real content preceding the next BOS.
+        self.content_started = true;
+
         if packet.flags.unit_boundary {
             self.flush_page(stream_index, true)?;
         }
@@ -1012,6 +1100,27 @@ impl Muxer for OggMuxer {
         if self.trailer_written {
             return Ok(());
         }
+        self.finalize_current_link()?;
+        self.backfill_auto_indexes()?;
+        self.backfill_skeleton_fishead()?;
+        self.output.flush()?;
+        self.trailer_written = true;
+        Ok(())
+    }
+}
+
+impl OggMuxer {
+    /// Drain every current-link stream's buffered page and stamp the
+    /// closing page of each with the EOS flag (RFC 3533 §6 field 5:
+    /// "set: this page is the last page in the logical bitstream").
+    ///
+    /// Shared by [`Muxer::write_trailer`] (end of file) and
+    /// [`OggMuxer::begin_new_link`] (end of a chain link): a chained
+    /// physical bitstream requires "the eos page of a given logical
+    /// bitstream is immediately followed by the bos page of the next"
+    /// (RFC 3533 §4), so every link's streams must be EOS-terminated
+    /// before the next link's BOS pages are written.
+    fn finalize_current_link(&mut self) -> Result<()> {
         let order = self.stream_order.clone();
         for idx in order {
             // Drain any in-progress builder into pending_bytes.
@@ -1037,11 +1146,135 @@ impl Muxer for OggMuxer {
                 self.write_pending_page(idx, pending)?;
             }
         }
-        self.backfill_auto_indexes()?;
-        self.backfill_skeleton_fishead()?;
-        self.output.flush()?;
-        self.trailer_written = true;
         Ok(())
+    }
+
+    /// Begin a new chain link (RFC 3533 §4 sequential multiplexing).
+    ///
+    /// Finalizes the current link — draining and EOS-terminating every one
+    /// of its logical bitstreams so "the eos page of a given logical
+    /// bitstream is immediately followed by the bos page of the next" —
+    /// then writes the BOS + secondary-header pages of `streams` as a
+    /// fresh link. Each new stream is assigned a serial that does not
+    /// collide with any serial used by an earlier link ("Each chained
+    /// logical bitstream MUST have a unique serial number within the scope
+    /// of the physical bitstream"): a stream whose derived serial is
+    /// already taken is bumped to the next free value.
+    ///
+    /// Subsequent [`Muxer::write_packet`] calls carry `stream_index`
+    /// values addressing the *new* link's `StreamInfo::index` numbering.
+    /// The demuxer recognises the boundary because the first BOS page of
+    /// the new link follows the previous link's data pages (a
+    /// BOS-after-non-BOS transition), assigning the new link its own
+    /// `link_index`.
+    ///
+    /// Errors:
+    /// * `write_header` has not run yet (a chain must have a first link);
+    /// * the current link has written no content data page — a link with
+    ///   only header pages would not be seen as a distinct link on
+    ///   read-back (the demuxer keys link boundaries on BOS-after-data);
+    /// * a Skeleton is attached — the muxer-built Skeleton control section
+    ///   describes a single link's streams and its trailer-time
+    ///   segment-length backfill assumes one link, so Skeleton + chaining
+    ///   are mutually exclusive in this muxer;
+    /// * `streams` is empty.
+    pub fn begin_new_link(&mut self, streams: &[StreamInfo]) -> Result<()> {
+        if !self.header_written {
+            return Err(Error::other(
+                "Ogg muxer: begin_new_link before write_header",
+            ));
+        }
+        if self.trailer_written {
+            return Err(Error::other(
+                "Ogg muxer: begin_new_link after write_trailer",
+            ));
+        }
+        if self.skeleton.is_some() || !self.auto_index.is_empty() {
+            return Err(Error::invalid(
+                "Ogg muxer: chained links are not supported alongside a Skeleton bitstream",
+            ));
+        }
+        if !self.content_started {
+            return Err(Error::invalid(
+                "Ogg muxer: begin_new_link requires at least one content packet in the current link",
+            ));
+        }
+        if streams.is_empty() {
+            return Err(Error::invalid("Ogg muxer: begin_new_link with no streams"));
+        }
+
+        // 1. EOS-terminate every current-link stream. Its last data page
+        //    is the non-BOS page the demuxer sees immediately before the
+        //    next link's BOS.
+        self.finalize_current_link()?;
+
+        // 2. Re-arm per-stream writers for the new link with globally
+        //    unique serials.
+        let (per_stream, stream_order, _max) = build_link_writers(streams, &mut self.used_serials);
+        self.per_stream = per_stream;
+        self.stream_order = stream_order;
+        self.streams = streams.to_vec();
+        self.link_index = self.link_index.saturating_add(1);
+        self.content_started = false;
+
+        // 3. Write the new link's BOS + remaining header packets, exactly
+        //    as write_header does for the first link (minus Skeleton,
+        //    which chaining excludes).
+        let stream_clone = self.streams.clone();
+        let mut header_queues: Vec<(u32, oxideav_core::TimeBase, Vec<Vec<u8>>)> =
+            Vec::with_capacity(stream_clone.len());
+        for s in &stream_clone {
+            let packets = extract_codec_headers(&s.params.codec_id, &s.params.extradata);
+            header_queues.push((s.index, s.time_base, packets));
+        }
+        // BOS page per content stream, written immediately so all BOS
+        // pages of the new link precede any of its data pages.
+        for (idx, _tb, packets) in &header_queues {
+            let Some(first) = packets.first() else {
+                continue;
+            };
+            let writer = self.writer_for(*idx)?;
+            if writer.headers_remaining == 0 {
+                continue;
+            }
+            let lacing = lace(first.len());
+            let page = Page {
+                flags: flags::FIRST_PAGE,
+                granule_position: 0,
+                serial: writer.serial,
+                seq_no: writer.seq_no,
+                lacing,
+                data: first.clone(),
+            };
+            writer.seq_no = writer.seq_no.wrapping_add(1);
+            writer.bos_emitted = true;
+            writer.headers_remaining -= 1;
+            let bytes = page.to_bytes();
+            self.output.write_all(&bytes)?;
+        }
+        // Remaining content-codec header packets — normal write_packet flow.
+        for (idx, tb, packets) in &header_queues {
+            for hp in packets.iter().skip(1) {
+                let pkt = Packet::new(*idx, *tb, hp.clone());
+                self.write_packet(&pkt)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The zero-based index of the chain link currently being written
+    /// (`0` before any [`begin_new_link`](Self::begin_new_link) call).
+    /// After N successful `begin_new_link` calls this returns N, matching
+    /// the demuxer's `stream_link_index` on read-back.
+    pub fn link_index(&self) -> u32 {
+        self.link_index
+    }
+
+    /// The on-wire `bitstream_serial_number` assigned to a stream of the
+    /// *current* link, keyed by its `StreamInfo::index`. Returns `None`
+    /// for an index not in the current link.
+    pub fn stream_serial(&self, stream_index: u32) -> Option<u32> {
+        self.per_stream.get(&stream_index).map(|w| w.serial)
     }
 }
 
