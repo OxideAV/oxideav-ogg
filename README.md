@@ -1,5 +1,7 @@
 # oxideav-ogg
 
+[![CI](https://github.com/OxideAV/oxideav-ogg/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-ogg/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-ogg.svg)](https://crates.io/crates/oxideav-ogg) [![docs.rs](https://docs.rs/oxideav-ogg/badge.svg)](https://docs.rs/oxideav-ogg) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **Ogg** container (RFC 3533) — page framing, CRC32
 checksumming, packet reassembly across page boundaries (including
 multi-page packets and 'nil' pages), the full §4 grouping + chaining
