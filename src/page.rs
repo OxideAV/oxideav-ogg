@@ -82,17 +82,41 @@ impl Page {
     }
 
     /// Serialize this page to bytes, computing the CRC.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the page violates the RFC 3533 §6 lacing invariants
+    /// (more than 255 segments, or `data` length ≠ lacing sum). Use
+    /// [`Page::try_to_bytes`] for a non-panicking variant when
+    /// serializing hand-built pages.
     pub fn to_bytes(&self) -> Vec<u8> {
-        assert!(
-            self.lacing.len() <= 255,
-            "Ogg page may carry at most 255 segments"
-        );
+        self.try_to_bytes()
+            .expect("Ogg page violates the RFC 3533 §6 lacing invariants")
+    }
+
+    /// Serialize this page to bytes, computing the CRC — the fallible
+    /// counterpart of [`Page::to_bytes`].
+    ///
+    /// Returns `Error::InvalidData` when the lacing table exceeds the
+    /// 255-segment limit (RFC 3533 §6: the segment count is one byte)
+    /// or when `data`'s length disagrees with the sum of the lacing
+    /// values, instead of panicking. Prefer this when serializing
+    /// pages assembled from untrusted or hand-built parts.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>> {
+        if self.lacing.len() > 255 {
+            return Err(Error::InvalidData(format!(
+                "Ogg page may carry at most 255 segments (got {})",
+                self.lacing.len()
+            )));
+        }
         let total_data: usize = self.lacing.iter().map(|&v| v as usize).sum();
-        assert_eq!(
-            self.data.len(),
-            total_data,
-            "page data length must match lacing sum"
-        );
+        if self.data.len() != total_data {
+            return Err(Error::InvalidData(format!(
+                "Ogg page data length {} does not match lacing sum {}",
+                self.data.len(),
+                total_data
+            )));
+        }
 
         let mut buf = Vec::with_capacity(27 + self.lacing.len() + self.data.len());
         buf.extend_from_slice(&CAPTURE_PATTERN);
@@ -109,7 +133,7 @@ impl Page {
 
         let crc = crc::checksum(&buf);
         buf[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
-        buf
+        Ok(buf)
     }
 
     /// Parse a single page from the start of `bytes`.
@@ -241,6 +265,40 @@ mod tests {
         let segs = parsed.packet_segments();
         assert_eq!(segs.len(), 1);
         assert!(segs[0].terminated);
+    }
+
+    #[test]
+    fn try_to_bytes_rejects_bad_lacing_without_panicking() {
+        // Body length disagrees with the lacing sum.
+        let p = Page {
+            flags: 0,
+            granule_position: 0,
+            serial: 1,
+            seq_no: 0,
+            lacing: vec![10],
+            data: vec![0u8; 30],
+        };
+        assert!(p.try_to_bytes().is_err());
+        // More than 255 segments.
+        let p = Page {
+            flags: 0,
+            granule_position: 0,
+            serial: 1,
+            seq_no: 0,
+            lacing: vec![0u8; 256],
+            data: Vec::new(),
+        };
+        assert!(p.try_to_bytes().is_err());
+        // A valid page serializes identically through both paths.
+        let p = Page {
+            flags: flags::FIRST_PAGE,
+            granule_position: 3,
+            serial: 9,
+            seq_no: 0,
+            lacing: vec![4],
+            data: vec![1, 2, 3, 4],
+        };
+        assert_eq!(p.try_to_bytes().unwrap(), p.to_bytes());
     }
 
     #[test]

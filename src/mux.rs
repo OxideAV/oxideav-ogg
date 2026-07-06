@@ -1298,7 +1298,7 @@ fn extract_codec_headers(codec_id: &CodecId, extradata: &[u8]) -> Vec<Vec<u8>> {
         // must be split back into their constituent packets so each rides on
         // the wire as a distinct Ogg packet; a Theora header blob muxed as one
         // packet would be unparseable by a Theora decoder.
-        "vorbis" | "theora" => parse_xiph_lacing(extradata).unwrap_or_default(),
+        "vorbis" | "theora" => xiph_unlace(extradata).unwrap_or_default(),
         "opus" => {
             // OpusHead followed by a synthetic minimal OpusTags. (Original
             // tags are dropped during demux — they're not load-bearing.)
@@ -1313,10 +1313,55 @@ fn extract_codec_headers(codec_id: &CodecId, extradata: &[u8]) -> Vec<Vec<u8>> {
     }
 }
 
-/// Parse a Xiph-laced 3-packet header blob (Vorbis/Theora layout). The first
-/// byte is `(packet_count - 1)`, followed by `(packet_count - 1)` lacing
-/// records (each a series of 0xFF terminators ending in a value < 0xFF).
-fn parse_xiph_lacing(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
+/// Xiph-lace codec header packets into the single-blob `extradata`
+/// format [`open`] expects for Vorbis and Theora streams (and the same
+/// layout MP4/MKV use for those codecs): one byte `(packet_count - 1)`,
+/// then for every packet but the last its length as a run of `0xFF`
+/// bytes ending in a value `< 0xFF`, then the packets' bytes
+/// back-to-back. The last packet's length is implicit (it runs to the
+/// end of the blob).
+///
+/// This is the inverse of [`xiph_unlace`] and matches the `extradata`
+/// the demuxer reports for such streams — so a codec crate that
+/// produced its header packets (e.g. `oxideav-vorbis`'s
+/// identification/comment/setup trio) can build a muxable
+/// `StreamInfo` without hand-rolling the lacing.
+///
+/// Returns `None` when `packets` is empty or holds more than 256
+/// entries (the count byte stores `packet_count - 1`).
+#[must_use]
+pub fn xiph_lace(packets: &[&[u8]]) -> Option<Vec<u8>> {
+    if packets.is_empty() || packets.len() > 256 {
+        return None;
+    }
+    let total: usize = packets.iter().map(|p| p.len()).sum();
+    let mut out = Vec::with_capacity(1 + packets.len() + total);
+    out.push((packets.len() - 1) as u8);
+    for p in &packets[..packets.len() - 1] {
+        let mut n = p.len();
+        while n >= 255 {
+            out.push(255);
+            n -= 255;
+        }
+        out.push(n as u8);
+    }
+    for p in packets {
+        out.extend_from_slice(p);
+    }
+    Some(out)
+}
+
+/// Parse a Xiph-laced header blob (Vorbis/Theora `extradata` layout)
+/// back into its constituent packets — the inverse of [`xiph_lace`].
+/// The first byte is `(packet_count - 1)`, followed by
+/// `(packet_count - 1)` lacing records (each a series of `0xFF`
+/// continuation bytes ending in a value `< 0xFF`); the last packet
+/// runs to the end of the blob.
+///
+/// Returns `None` when the blob is empty or its declared sizes
+/// overrun the buffer.
+#[must_use]
+pub fn xiph_unlace(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
     if buf.is_empty() {
         return None;
     }
@@ -1353,4 +1398,61 @@ fn parse_xiph_lacing(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
         i += sz;
     }
     Some(packets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xiph_lace_round_trips_three_packets() {
+        let id = vec![0x01u8; 30];
+        let comment = vec![0x03u8; 300]; // needs a 255-continuation size byte
+        let setup = vec![0x05u8; 700];
+        let blob = xiph_lace(&[&id, &comment, &setup]).unwrap();
+        assert_eq!(blob[0], 0x02); // 3 packets - 1
+        let packets = xiph_unlace(&blob).unwrap();
+        assert_eq!(packets, vec![id, comment, setup]);
+    }
+
+    #[test]
+    fn xiph_lace_handles_exact_255_multiples_and_empties() {
+        // A 255-byte packet laces its size as [255, 0].
+        let a = vec![0xAAu8; 255];
+        let b: Vec<u8> = Vec::new();
+        let c = vec![0xCCu8; 3];
+        let blob = xiph_lace(&[&a, &b, &c]).unwrap();
+        let packets = xiph_unlace(&blob).unwrap();
+        assert_eq!(packets, vec![a, b, c]);
+        // Single packet: no size records, just the count byte.
+        let solo = xiph_lace(&[&[1u8, 2, 3][..]]).unwrap();
+        assert_eq!(solo, vec![0x00, 1, 2, 3]);
+        assert_eq!(xiph_unlace(&solo).unwrap(), vec![vec![1u8, 2, 3]]);
+    }
+
+    #[test]
+    fn xiph_lace_rejects_empty_and_oversize_inputs() {
+        assert!(xiph_lace(&[]).is_none());
+        let one = [0u8; 1];
+        let too_many: Vec<&[u8]> = vec![&one; 257];
+        assert!(xiph_lace(&too_many).is_none());
+        // Unlace rejects an empty blob and a truncated size table.
+        assert!(xiph_unlace(&[]).is_none());
+        assert!(xiph_unlace(&[0x02, 255]).is_none());
+    }
+
+    #[test]
+    fn xiph_lace_matches_extract_codec_headers() {
+        // The muxer's extradata parser must accept what xiph_lace built.
+        let id = {
+            let mut p = vec![0x01u8];
+            p.extend_from_slice(b"vorbis");
+            p
+        };
+        let comment = vec![0x03u8; 12];
+        let setup = vec![0x05u8; 40];
+        let blob = xiph_lace(&[&id, &comment, &setup]).unwrap();
+        let packets = extract_codec_headers(&CodecId::new("vorbis"), &blob);
+        assert_eq!(packets, vec![id, comment, setup]);
+    }
 }

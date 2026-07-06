@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `framing` module: buffer-level packet ⇄ page layer for one logical
+  bitstream (`PageWriter`, `PacketAssembler`, `parse_pages`,
+  `pages_to_packets`) — the no-I/O, no-`StreamInfo` API codec crates
+  use to build/validate their own Ogg encapsulation, ported from the
+  implementation proven in `oxideav-vorbis`
+- `Page::try_to_bytes`: fallible serialization that reports RFC 3533
+  §6 lacing-invariant violations as `Error::InvalidData` instead of
+  panicking
+- `mux::xiph_lace` / `mux::xiph_unlace`: public helpers to build and
+  split the Xiph-laced Vorbis/Theora `extradata` blob the muxer and
+  demuxer exchange
+
 ## [0.1.7](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.6...v0.1.7) - 2026-07-03
 
 ### Other

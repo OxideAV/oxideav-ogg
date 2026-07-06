@@ -9,6 +9,7 @@
 pub mod codec_id;
 pub mod crc;
 pub mod demux;
+pub mod framing;
 pub mod mux;
 pub mod page;
 pub mod skeleton;
