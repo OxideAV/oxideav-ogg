@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mux::xiph_lace` / `mux::xiph_unlace`: public helpers to build and
   split the Xiph-laced Vorbis/Theora `extradata` blob the muxer and
   demuxer exchange
+- compile-tested "write an .ogg, read it back" example (lib.rs
+  doctest + README section): `mux::open` + `write_packet` on the
+  write side, `demux::open` + `next_packet` on the read side
 
 ## [0.1.7](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.6...v0.1.7) - 2026-07-03
 

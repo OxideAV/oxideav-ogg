@@ -309,6 +309,116 @@ the final page. This mirrors the demuxer's multi-page reassembly, so a
 large Vorbis setup codebook or Theora keyframe round-trips byte-exact
 through mux → demux (`tests/large_packet_mux.rs`).
 
+### Whole-file round-trip: write an `.ogg`, then read it back
+
+A complete, runnable program (also compile-tested as the crate's
+`lib.rs` doc example). Ogg is codec-agnostic — the packet payloads
+(the three Vorbis header packets and the audio packets) normally come
+from a codec crate such as `oxideav-vorbis`; minimal hand-built
+stand-ins keep it self-contained. `mux::xiph_lace` builds the
+Vorbis/Theora extradata blob from the three header packets:
+
+```rust
+use oxideav_core::{CodecId, CodecParameters, NullCodecResolver, Packet, StreamInfo, TimeBase};
+use oxideav_core::{ReadSeek, WriteSeek};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Codec packets normally come from a codec crate (e.g.
+    // oxideav-vorbis's encoder); these stand-ins are the minimal
+    // valid Vorbis header set.
+    let mut id_header = vec![0x01];
+    id_header.extend_from_slice(b"vorbis");
+    id_header.extend_from_slice(&0u32.to_le_bytes()); // vorbis_version
+    id_header.push(2); // audio_channels
+    id_header.extend_from_slice(&48_000u32.to_le_bytes()); // sample rate
+    id_header.extend_from_slice(&[0; 12]); // bitrate max/nominal/min
+    id_header.extend_from_slice(&[0xB8, 0x01]); // blocksizes + framing bit
+    let mut comment_header = vec![0x03];
+    comment_header.extend_from_slice(b"vorbis");
+    comment_header.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 1]); // empty comment + framing
+    let mut setup_header = vec![0x05];
+    setup_header.extend_from_slice(b"vorbis");
+    setup_header.extend_from_slice(&[0; 16]); // (real codebooks go here)
+
+    // ---- mux side: write packets into a fresh .ogg ----
+    let mut params = CodecParameters::audio(CodecId::new("vorbis"));
+    params.channels = Some(2);
+    params.sample_rate = Some(48_000);
+    // Vorbis/Theora carry their 3 header packets Xiph-laced in extradata.
+    params.extradata =
+        oxideav_ogg::mux::xiph_lace(&[&id_header, &comment_header, &setup_header]).unwrap();
+    let streams = vec![StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 48_000),
+        duration: None,
+        start_time: Some(0),
+        params,
+    }];
+
+    let path = std::env::temp_dir().join("oxideav-ogg-roundtrip.ogg");
+    let out: Box<dyn WriteSeek> = Box::new(std::fs::File::create(&path)?);
+    let mut mux = oxideav_ogg::mux::open(out, &streams)?;
+    mux.write_header()?; // BOS + header pages, rebuilt from extradata
+    for i in 1..=3i64 {
+        // Payload bytes come from your codec's encoder.
+        let mut pkt = Packet::new(0, TimeBase::new(1, 48_000), vec![0xAB; 64]);
+        pkt.pts = Some(960 * i); // granule position (Vorbis: end PCM sample)
+        pkt.flags.unit_boundary = true; // flush the page after this packet
+        mux.write_packet(&pkt)?;
+    }
+    mux.write_trailer()?; // flushes + marks the final page EOS
+
+    // ---- demux side: open the .ogg and iterate packets ----
+    let input: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&path)?);
+    let mut dmx = oxideav_ogg::demux::open(input, &NullCodecResolver)?;
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "vorbis"); // sniffed from BOS
+    assert_eq!(dmx.streams()[0].params.sample_rate, Some(48_000));
+    let mut count = 0;
+    loop {
+        match dmx.next_packet() {
+            // pkt.data is one codec packet — hand it to your decoder.
+            // (Header packets were consumed into extradata during open.)
+            Ok(pkt) => {
+                assert_eq!(pkt.data, vec![0xAB; 64]);
+                count += 1;
+            }
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    assert_eq!(count, 3);
+    std::fs::remove_file(&path)?;
+    Ok(())
+}
+```
+
+### Buffer-level framing (`framing` module)
+
+Codec crates that own their packet sequence (and its granule
+positions) often want the packet ⇄ page layer without `StreamInfo`,
+extradata reconstruction, or seekable I/O. The `framing` module is
+that layer, for one logical bitstream over in-memory buffers:
+
+- `framing::PageWriter` — push `(packet, granulepos)` pairs, get the
+  physical-bitstream bytes: 255-byte lacing segmentation, page
+  auto-emit at the 255-segment table limit (`continued` flag on the
+  spill page), page granule = last packet completed on the page
+  (`-1` when none does), BOS on the first page, `flush_page()` for
+  explicit boundaries (e.g. Vorbis §A.2 header-page rules), and
+  `finish()` which EOS-stamps the final page — patching an
+  already-emitted page in place, CRC recomputed.
+- `framing::PacketAssembler` — the strict inverse: feed pages, get
+  the packets that complete on each. Locks onto the first serial and
+  errors on serial switches or `continued`-flag/mid-packet
+  disagreements (where the tolerant demuxer would resync and count).
+- `framing::parse_pages` / `framing::pages_to_packets` —
+  whole-buffer conveniences.
+
+`tests/framing_stream_layer.rs` pins the two stacks against each
+other: `PageWriter` output demuxes through `demux::open`, and the
+muxer's output (including page-spanning packets) reassembles
+byte-exact through `PacketAssembler`.
+
 ### Metadata
 
 Vorbis-comment blocks (Vorbis packet #2, OpusTags, Theora comment
