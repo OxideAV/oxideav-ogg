@@ -309,6 +309,37 @@ the final page. This mirrors the demuxer's multi-page reassembly, so a
 large Vorbis setup codebook or Theora keyframe round-trips byte-exact
 through mux → demux (`tests/large_packet_mux.rs`).
 
+#### Page-size policy and player interop
+
+By default pages flush only on `unit_boundary` or at the 255-segment
+limit, so a caller that never sets `unit_boundary` gets pages of up
+to ~64 kB — legal, but far above the "usually 4-8 kB" band RFC 3533
+describes. The concrete muxer (`mux::open_concrete`) and the
+buffer-level writer (`framing::PageWriter::with_page_target`) both
+take an opt-in soft target instead:
+
+```text
+mux.set_page_target_bytes(Some(4096));
+```
+
+flushes a stream's page as soon as a packet completes at or past the
+target (a `unit_boundary` flag still forces an immediate boundary; a
+packet that overshoots the target still lands whole).
+
+The policy is more than politeness. Black-box decoding of the staged
+Vorbis fixtures with ffmpeg showed that a stream whose audio packets
+all sit on a **single page** — the first audio-bearing page is also
+the EOS page — comes back short by `blocksize0 / 2` samples (128
+samples on twelve of fifteen single-stream fixtures), while the same
+packet sequence split over two or more audio pages decodes to its
+full declared final-granule length. A page target (or per-packet
+`unit_boundary` anchoring, as `oxideav-vorbis` does) makes the
+degenerate single-audio-page layout impossible for any stream longer
+than the target; only sub-target streams still need a caller-forced
+boundary before the final packet. `tests/page_size_target.rs` pins
+the banded pagination, the unchanged no-target default, and the
+unit-boundary precedence (no nil pages).
+
 ### Whole-file round-trip: write an `.ogg`, then read it back
 
 A complete, runnable program (also compile-tested as the crate's

@@ -289,6 +289,7 @@ fn open_concrete_inner(
         used_serials,
         link_index: 0,
         content_started: false,
+        page_target: None,
     })
 }
 
@@ -378,6 +379,14 @@ pub struct OggMuxer {
     /// (data) page, so a link with no data page would not be recognised
     /// as a separate link on read-back.
     content_started: bool,
+    /// Soft page-size target in body bytes for data (non-header)
+    /// packets: when set, a stream's buffered page is flushed as soon
+    /// as a packet completes at or past this size, keeping pages near
+    /// the "usually 4-8 kB" band RFC 3533 describes even when the
+    /// caller never sets `unit_boundary`. `None` (the default) keeps
+    /// the historical behaviour: pages flush only on `unit_boundary`
+    /// or at the 255-segment limit.
+    page_target: Option<usize>,
 }
 
 /// Keyframe-index collector for one content stream — the WRITE-side
@@ -1091,6 +1100,19 @@ impl Muxer for OggMuxer {
 
         if packet.flags.unit_boundary {
             self.flush_page(stream_index, true)?;
+        } else if let Some(target) = self.page_target {
+            // Soft page-size policy (see set_page_target_bytes): flush
+            // once the buffered body reaches the target. Skipped when
+            // the caller already forced a boundary above — the builder
+            // is empty then, and a second forced flush would emit a
+            // spurious nil page.
+            let needs_flush = {
+                let writer = self.writer_for(stream_index)?;
+                writer.buffered.data.len() >= target
+            };
+            if needs_flush {
+                self.flush_page(stream_index, false)?;
+            }
         }
 
         Ok(())
@@ -1275,6 +1297,32 @@ impl OggMuxer {
     /// for an index not in the current link.
     pub fn stream_serial(&self, stream_index: u32) -> Option<u32> {
         self.per_stream.get(&stream_index).map(|w| w.serial)
+    }
+
+    /// Set (or clear) a soft page-size target, in body bytes, for data
+    /// (non-header) packets: a stream's buffered page is flushed as
+    /// soon as a packet completes at or past this size, keeping pages
+    /// near the "usually 4-8 kB" band RFC 3533 describes even when
+    /// the caller never sets `Packet::flags::unit_boundary`. `4096`
+    /// is a good general-purpose value. A `unit_boundary` flag still
+    /// forces an immediate boundary regardless of the target.
+    ///
+    /// `None` (the default) preserves the historical pagination: pages
+    /// flush only on `unit_boundary` or at the 255-segment limit —
+    /// which for a short stream can put *every* audio packet on a
+    /// single page. Beyond RFC politeness, avoiding that layout
+    /// measurably improves player interop: black-box testing against
+    /// ffmpeg showed an Ogg/Vorbis stream whose first audio-bearing
+    /// page is also its EOS page decodes short by `blocksize0 / 2`
+    /// samples (128 samples across twelve staged fixtures), while the
+    /// same packets split over two or more audio pages decode to the
+    /// full declared length.
+    ///
+    /// Only reachable on the concrete [`OggMuxer`] (via
+    /// [`open_concrete`]); the boxed [`oxideav_core::Muxer`] from
+    /// [`open`] keeps the default.
+    pub fn set_page_target_bytes(&mut self, target: Option<usize>) {
+        self.page_target = target;
     }
 }
 

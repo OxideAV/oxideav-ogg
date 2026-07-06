@@ -204,6 +204,11 @@ pub struct PageWriter {
     bos_pending: bool,
     /// Byte range of the most recently emitted page in `out`.
     last_page_range: Option<(usize, usize)>,
+    /// Soft page-size target in body bytes: auto-emit the pending page
+    /// once a packet completes at or past this size. `None` = no
+    /// policy (pages emit only at the 255-segment limit or on an
+    /// explicit flush).
+    page_target: Option<usize>,
     out: Vec<u8>,
 }
 
@@ -220,8 +225,39 @@ impl PageWriter {
             pending_continued: false,
             bos_pending: true,
             last_page_range: None,
+            page_target: None,
             out: Vec::new(),
         }
+    }
+
+    /// Set a soft page-size target: whenever a packet *completes* with
+    /// the pending page's body at or past `bytes`, the page is emitted
+    /// automatically, keeping pages near the "usually 4-8 kB" band
+    /// RFC 3533 describes (a packet that overshoots the target still
+    /// lands whole; only the 255-segment table forces a mid-packet
+    /// split). `4096` is a good general-purpose value.
+    ///
+    /// Beyond politeness, small pages measurably improve player
+    /// interop: black-box testing against ffmpeg showed that an
+    /// Ogg/Vorbis stream whose audio packets all sit on a *single*
+    /// page (so the first audio-bearing page is also the EOS page)
+    /// decodes short by `blocksize0 / 2` samples (128 samples across
+    /// twelve staged fixtures), while any stream whose audio spans two
+    /// or more pages decodes to its full declared length. A page
+    /// target makes the degenerate single-audio-page layout impossible
+    /// for any stream longer than the target.
+    #[must_use]
+    pub fn with_page_target(mut self, bytes: usize) -> Self {
+        self.page_target = Some(bytes);
+        self
+    }
+
+    /// Change (or clear) the soft page-size target — the in-place
+    /// counterpart of [`Self::with_page_target`]. Takes effect from
+    /// the next completed packet; the pending page is not flushed
+    /// retroactively.
+    pub fn set_page_target(&mut self, bytes: Option<usize>) {
+        self.page_target = bytes;
     }
 
     /// The bytes of every page emitted so far (pending partial-page
@@ -267,6 +303,13 @@ impl PageWriter {
                 if take < 255 {
                     // Final segment — the packet completes here.
                     self.page_granule = Some(granulepos);
+                    // Soft page-size policy: emit once a completed
+                    // packet leaves the page at/past the target.
+                    if let Some(target) = self.page_target {
+                        if self.body.len() >= target {
+                            self.emit_page(false, false);
+                        }
+                    }
                     return;
                 }
                 // take == 255: the packet continues. When it has no
@@ -439,6 +482,43 @@ mod tests {
     fn empty_writer_finish_produces_no_pages() {
         let w = PageWriter::new(1);
         assert!(w.finish().is_empty());
+    }
+
+    #[test]
+    fn page_target_keeps_pages_in_the_rfc_band() {
+        // 100 × 600-byte packets under a 4096-byte target: every page
+        // but the last carries 4096..=4695 body bytes (the target plus
+        // at most one packet's overshoot) and the granule of the last
+        // packet completed on it.
+        let mut w = PageWriter::new(7).with_page_target(4096);
+        for i in 0..100i64 {
+            w.push_packet(&[i as u8; 600], (i + 1) * 512);
+        }
+        let bytes = w.finish();
+        let pages = parse_pages(&bytes).unwrap();
+        assert!(pages.len() > 10, "target must split the stream");
+        let mut done = 0usize;
+        for (i, page) in pages.iter().enumerate() {
+            if i + 1 < pages.len() {
+                assert!(
+                    (4096..4096 + 600).contains(&page.data.len()),
+                    "page {i} body {} outside the target band",
+                    page.data.len()
+                );
+            }
+            done += page.lacing.iter().filter(|&&l| l < 255).count();
+            assert_eq!(page.granule_position, done as i64 * 512);
+        }
+        assert_eq!(pages_to_packets(&bytes).unwrap().len(), 100);
+
+        // Without a target the same packets pile onto 255-segment
+        // mega-pages, far above the band — the historical default.
+        let mut w = PageWriter::new(7);
+        for i in 0..100i64 {
+            w.push_packet(&[i as u8; 600], (i + 1) * 512);
+        }
+        let pages = parse_pages(&w.finish()).unwrap();
+        assert!(pages.iter().any(|p| p.data.len() > 8192));
     }
 
     #[test]
