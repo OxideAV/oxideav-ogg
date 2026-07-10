@@ -114,7 +114,52 @@ Multiplexed Ogg (e.g., Theora video + Vorbis audio in the same `.ogv`)
 is supported end-to-end: every BOS page yields its own `StreamInfo`,
 packets are reassembled per-stream across interleaved pages, and the
 muxer emits BOS pages for every stream before any non-BOS page as
-required by RFC 3533 §6.
+required by RFC 3533 §6. The mux side also enforces the Theora spec's
+multiplexed-stream mapping (`docs/video/theora/Theora.pdf` §A.3.2):
+the Theora identification page leads the BOS group even when the
+caller lists audio first, every stream's header pages are drained onto
+the wire before any data page, and data pages are released in
+increasing granule-time order across streams (per-stream release
+queues gated by a cross-stream watermark; the newest page of each
+stream is held back so the trailer can stamp EOS onto a real final
+page, and a stream whose pages are all on the wire closes with an
+RFC 3533 §4 nil EOS page).
+
+### Theora mapping
+
+The Theora encapsulation (`docs/video/theora/Theora.pdf` §6.2 +
+Appendix A) is implemented on both sides, keyed on the stream's own
+identification header — no Skeleton required. The `theora` module
+exposes the two building blocks: `TheoraIdHeader` (parse/build of the
+42-byte §6.2 layout) and `TheoraGranule` (the §A.2.3
+`(keyframe << KFGSHIFT) | frames-since-keyframe` split packing, with
+the version-dependent counting origin — frame-count for 3.2.1+,
+frame-index for VREV 0 — normalized to 0-based frame indices).
+
+* **Demux**: the BOS ID header populates picture-region
+  width/height, `frame_rate` (FRN/FRD), pixel format, `bit_rate`
+  (NOMBR) and a one-tick-per-frame time base. Every data packet gets
+  a 0-based frame-index `pts` (each Theora packet is exactly one
+  frame, so the page granule anchors all frames finishing on it) and
+  a keyframe flag proven from the granule packing. Duration unpacks
+  the final granule to a frame count. Streams whose ID header does
+  not parse degrade to the historical raw-granule behaviour.
+* **Mux**: packets carry codec-level `(frame index, keyframe flag)`
+  semantics — exactly what the demuxer emits and an encoder produces
+  — and the muxer packs the on-wire granules itself (KFGSHIFT and
+  version origin recovered from the extradata ID header, with a
+  running frame counter for pts-less packets). Header pagination
+  follows §A.2.1: ID header alone on the BOS page, the comment header
+  beginning the second page, a page break before the first frame
+  packet. A keyframe interval overflowing the `2^KFGSHIFT − 1` offset
+  field is rejected with an actionable error.
+
+Black-box validation: all 11 reference Theora bitstreams under
+`docs/video/theora/fixtures/` survive a demux→mux round trip with
+byte-identical decodes (`ffmpeg`), correct stream descriptions
+(`ffprobe`: frame indices, keyframe flags, dimensions, frame rate,
+duration), and `oggz-validate` acceptance — as do muxed Theora+Vorbis
+and Theora+Opus A/V files (see the `remux` / `merge` examples).
 
 ### Seeking
 
@@ -139,25 +184,28 @@ so an Opus stream no longer over-reports its length by the pre-skip.
 The seek's returned granule is still the landed page's *raw* on-wire
 value.
 
-For Theora, the page's raw granule packs `(keyframe_idx << shift) |
-frame_offset`, so the comparison axis is the frame number
-`(g >> shift) + (g & ((1 << shift) - 1))` rather than the raw
-granule value. The required `shift` and frame rate come from the
-per-stream Skeleton 4.0 `fisbone\0` (`granuleshift` and
-`granule_rate`, per `docs/container/ogg/ogg-skeleton-4.0.md`): the
-user's `pts` (microseconds) is rescaled into frame-rate units via
-[`TimeBase::rescale`] to produce the target frame number, and the
-bisection — both its index-floor lookup and its forward
-`find_next_page_for_serial` scan — compares mapped frame numbers
-against that target. The returned granule is the actual on-wire
-value of the landed page, so a downstream Theora decoder can
-recover the keyframe-index / offset pair as usual. A Theora stream
-that lacks a `fisbone\0` (or whose `fisbone\0` has
-`granuleshift == 0`) still returns `Error::Unsupported`: without
-the Skeleton-borne shift+rate we cannot translate `pts` to a frame
-number, and the conservative choice is to refuse rather than
-silently misinterpret the raw granule as a target. Codecs other
-than the five listed above continue to return `Error::Unsupported`.
+For Theora, the page's raw granule packs `(keyframe << shift) |
+frame_offset`, so the comparison axis is the absolute frame number
+rather than the raw granule value. The required `shift` (and the
+version-dependent counting origin) comes first from the stream's own
+identification header (`KFGSHIFT` + `VREV`,
+`docs/video/theora/Theora.pdf` §6.2 / §A.2.3) — so plain `.ogv` files
+seek with no Skeleton at all, with `pts` already in the stream's
+one-tick-per-frame time base. A stream whose ID header does not parse
+falls back to the per-stream Skeleton 4.0 `fisbone\0` (`granuleshift`
+and `granule_rate`, per `docs/container/ogg/ogg-skeleton-4.0.md`),
+rescaling the user's `pts` into frame-rate units via
+[`TimeBase::rescale`]. Either way the bisection — both its index-floor
+lookup and its forward `find_next_page_for_serial` scan — compares
+mapped frame numbers against the target, and the returned granule is
+the actual on-wire value of the landed page, so a downstream Theora
+decoder can recover the keyframe-index / offset pair as usual. A
+Theora stream with neither a parseable ID header nor a usable
+`fisbone\0` (one with `granuleshift == 0` is indistinguishable from
+"field never set") returns `Error::Unsupported`: the conservative
+choice is to refuse rather than silently misinterpret the raw granule
+as a target. Codecs other than the five listed above continue to
+return `Error::Unsupported`.
 
 For workloads with many seeks (scrubbing, looped playback) call
 `oxideav_ogg::demux::open_indexed` instead of `open`. It does a
