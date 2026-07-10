@@ -19,6 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spec's inconsistent mid-stream worked example is resolved against
   real reference bitstreams (consecutive keyframes carry 1|0, 2|0,
   3|0, …)
+- Theora demux is now driven by the stream's own identification
+  header, with no Skeleton required (previously Theora granule
+  handling needed a Skeleton 4.0 fisbone): stream description
+  (picture-region dimensions, FRN/FRD frame rate, pixel format, NOMBR
+  bit rate, one-tick-per-frame time base), per-packet pts as 0-based
+  absolute frame indices for EVERY data packet (the page granule
+  anchors all frames finishing on it, not just the last), keyframe
+  flags proven from the granule packing, duration from the unpacked
+  final frame count, and `seek_to` / `seek_to_keyframe` on plain
+  `.ogv` files. Verified against the reference bitstreams under
+  `docs/video/theora/fixtures/` and cross-checked with `ffprobe`
+  (frame indices, keyframe flags, dimensions, frame rate, and
+  duration all agree). Streams whose ID header does not parse keep
+  the historical raw-granule + fisbone behaviour
 
 ### Fixed
 

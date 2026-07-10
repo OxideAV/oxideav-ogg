@@ -11,6 +11,7 @@ use oxideav_core::{Demuxer, ReadSeek};
 use crate::codec_id;
 use crate::page::{self, Page};
 use crate::skeleton::{self, FisBone, FisHead, SkelIndex, Skeleton};
+use crate::theora::{TheoraGranule, TheoraIdHeader};
 
 /// Page budget for the `open()`-time header-collection wait
 /// ([`OggDemuxer::read_until_headers_collected`]). Guards against a
@@ -92,17 +93,20 @@ enum SeekKeyFlavor {
     /// a `seek_to(pts)` lands on the page whose PCM position floors the
     /// target rather than `pre-skip / 48000` s early.
     Identity { granule_offset: i64 },
-    /// `key_of(g) == (g >> shift) + (g & ((1 << shift) - 1))`. Used by
-    /// Theora: the encoded granule packs a keyframe index in the upper
-    /// `64-shift` bits and a frame offset from that keyframe in the
-    /// lower `shift` bits. The sum of the two is the absolute frame
-    /// number. With `shift == 0` the offset half is empty and the key
-    /// collapses to the raw granule, which is also a valid frame
-    /// number — so the same codec path can also drive seeks on
-    /// pre-Skeleton (shift-unset) fisbones, though that's vanishingly
-    /// rare in practice (Theora streams in the wild almost always
-    /// declare a non-zero shift).
-    TheoraFrame { shift: u32 },
+    /// `key_of(g) == (g >> shift) + (g & ((1 << shift) - 1)) - bias`.
+    /// Used by Theora: the encoded granule packs a keyframe index in
+    /// the upper `64-shift` bits and a frame offset from that keyframe
+    /// in the lower `shift` bits. The sum of the two is the absolute
+    /// frame number — offset by `bias = 1` on version 3.2.1+ streams,
+    /// whose upper half counts frames from 1 rather than indexing from
+    /// 0 (spec §A.2.3; the ID-header-derived key sets the bias, the
+    /// legacy fisbone-derived key keeps 0). With `shift == 0` the
+    /// offset half is empty and the key collapses to the raw granule,
+    /// which is also a valid frame number — so the same codec path can
+    /// also drive seeks on pre-Skeleton (shift-unset) fisbones, though
+    /// that's vanishingly rare in practice (Theora streams in the wild
+    /// almost always declare a non-zero shift).
+    TheoraFrame { shift: u32, bias: i64 },
 }
 
 impl SeekKey {
@@ -127,7 +131,20 @@ impl SeekKey {
     fn theora_frame(target_frame: i64, shift: u32) -> Self {
         Self {
             target_key: target_frame,
-            flavor: SeekKeyFlavor::TheoraFrame { shift },
+            flavor: SeekKeyFlavor::TheoraFrame { shift, bias: 0 },
+        }
+    }
+
+    /// Theora axis derived from the identification header: the
+    /// comparison key is the 0-based absolute frame index, so version
+    /// 3.2.1+ streams (frame-*count* upper half) carry `bias = 1`.
+    fn theora_frame_biased(target_frame: i64, gran: TheoraGranule) -> Self {
+        Self {
+            target_key: target_frame,
+            flavor: SeekKeyFlavor::TheoraFrame {
+                shift: gran.shift,
+                bias: i64::from(gran.count_from_one),
+            },
         }
     }
 
@@ -149,7 +166,14 @@ impl SeekKey {
                     (granule - granule_offset).max(0)
                 }
             }
-            SeekKeyFlavor::TheoraFrame { shift } => theora_frame_no(granule, shift),
+            SeekKeyFlavor::TheoraFrame { shift, bias } => {
+                let no = theora_frame_no(granule, shift);
+                if no < 0 {
+                    no
+                } else {
+                    no - bias
+                }
+            }
         }
     }
 }
@@ -270,6 +294,14 @@ struct LogicalStream {
     /// is a genuine RFC 3533 §4 unique-serial violation (a second grouped or
     /// chained BOS reusing the serial), not the expected initial drain.
     bos_processed: bool,
+    /// For Theora streams with a parsed ID header: the absolute frame
+    /// index the *next* data packet will carry, propagated forward from
+    /// the most recent granule-bearing page (each Theora data packet is
+    /// exactly one frame, so indices advance by one per packet). `None`
+    /// before the first anchor on a stream whose pages never carry a
+    /// granule (non-conformant; spec §A.2.2 requires one on every page
+    /// where a packet finishes).
+    theora_next_frame: Option<i64>,
 }
 
 /// Concrete Ogg demuxer state. Most callers should use the boxed
@@ -442,6 +474,15 @@ pub struct OggDemuxer {
     /// stream's duration by `pre-skip / 48000` seconds (a non-Opus stream
     /// never has an entry here, so its granule passes through unchanged).
     opus_pre_skip: HashMap<u32, u16>,
+    /// Per-serial Theora granule-position codec, parsed from the
+    /// identification header's `KFGSHIFT` + `VREV` fields at BOS time
+    /// (`docs/video/theora/Theora.pdf` §6.2 / §A.2.3). Present only
+    /// when the ID header parsed cleanly; a stream with an
+    /// unparseable ID header keeps the historical raw-granule
+    /// behaviour (Skeleton fisbone data may still cover it). Drives
+    /// per-packet frame-index pts, keyframe flags, duration, and
+    /// Skeleton-free seeking for Theora streams.
+    theora_granule: HashMap<u32, TheoraGranule>,
 }
 
 impl OggDemuxer {
@@ -473,6 +514,7 @@ impl OggDemuxer {
             preroll_seeks: 0,
             duplicate_serials: 0,
             opus_pre_skip: HashMap::new(),
+            theora_granule: HashMap::new(),
         }
     }
 
@@ -951,9 +993,11 @@ impl OggDemuxer {
     /// theora)").
     ///
     /// Returns `Some(0)` for an audio mapping (Vorbis / Opus / FLAC / Speex —
-    /// every packet is a random-access point) and for any stream the demuxer
-    /// found no `fisbone\0` for; a Theora stream with a fisbone reports its
-    /// declared keyframe shift. `None` for an out-of-range `stream_index`.
+    /// every packet is a random-access point) and for any stream with neither
+    /// a `fisbone\0` nor a parseable Theora identification header; a Theora
+    /// stream reports its fisbone-declared shift when a fisbone is present,
+    /// else its ID header's `KFGSHIFT`. `None` for an out-of-range
+    /// `stream_index`.
     /// Exposed alongside [`opus_pre_skip`](Self::opus_pre_skip) so callers
     /// reasoning about per-packet [`oxideav_core::packet::PacketFlags::keyframe`]
     /// — which the demuxer derives from this shift — can unpack a page's raw
@@ -965,6 +1009,12 @@ impl OggDemuxer {
                 .as_ref()
                 .and_then(|sk| sk.bone_for_serial(serial))
                 .map(|b| b.granuleshift)
+                .or_else(|| {
+                    // No fisbone: a Theora stream's own identification
+                    // header declares the same shift as KFGSHIFT
+                    // (`docs/video/theora/Theora.pdf` §6.2).
+                    self.theora_granule.get(&serial).map(|g| g.shift as u8)
+                })
                 .unwrap_or(0),
         )
     }
@@ -1295,7 +1345,8 @@ impl OggDemuxer {
     /// value) when the stream has granuleshift 0 — every audio mapping, where
     /// each packet is already an independent random-access point — or when the
     /// landed page is itself a keyframe. Returns the same `Error::Unsupported`
-    /// as `seek_to` for a Theora stream lacking a usable Skeleton fisbone.
+    /// as `seek_to` for a Theora stream lacking both a parseable
+    /// identification header and a usable Skeleton fisbone.
     pub fn seek_to_keyframe(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         let serial = self.serial_for_stream(stream_index).ok_or_else(|| {
             Error::unsupported(format!("Ogg: no logical stream for index {stream_index}"))
@@ -1305,13 +1356,17 @@ impl OggDemuxer {
             .skeleton
             .as_ref()
             .and_then(|s| s.bone_for_serial(serial));
-        let shift = bone.map(|b| b.granuleshift as u32).unwrap_or(0);
+        let id_gran = self.theora_granule.get(&serial).copied();
+        let shift = bone
+            .map(|b| b.granuleshift as u32)
+            .or(id_gran.map(|g| g.shift))
+            .unwrap_or(0);
         let rate = bone.map(|b| (b.granule_rate.numerator, b.granule_rate.denominator));
         let stream_tb = self.streams[stream_index as usize].time_base;
 
         let landed = self.seek_to(stream_index, pts)?;
 
-        // granuleshift 0 (audio, or no fisbone): every page is already a
+        // granuleshift 0 (audio, or no shift source): every page is already a
         // random-access point. A `-1` landed granule (should not occur for a
         // successful seek) likewise passes through.
         if shift == 0 || shift >= 63 || landed < 0 {
@@ -1322,21 +1377,31 @@ impl OggDemuxer {
             // The landed page is itself the keyframe — nothing to back up to.
             return Ok(landed);
         }
-        let keyframe_frame = landed >> shift;
-        // Translate the keyframe's absolute frame number back into the
-        // stream's time-base so we can re-seek to it. `frame_tb` is the
-        // time-base in which one tick is one frame (1 frame = gr_den / gr_num
-        // seconds); rescaling a frame count from it into the stream's
-        // time-base yields the keyframe's pts. Without a usable rate we cannot
-        // perform the translation, so fall back to the frame-floor landing.
-        let Some((gr_num, gr_den)) = rate else {
+        // Translate the landed granule's keyframe half back into a pts in
+        // the stream's time-base so we can re-seek to it.
+        let keyframe_pts = if let Some((gr_num, gr_den)) = rate {
+            // Fisbone-derived rate: `frame_tb` is the time-base in which
+            // one tick is one frame (1 frame = gr_den / gr_num seconds);
+            // rescaling the keyframe's frame number from it into the
+            // stream's time-base yields the keyframe's pts.
+            if gr_num <= 0 || gr_den <= 0 {
+                return Ok(landed);
+            }
+            let keyframe_frame = landed >> shift;
+            let frame_tb = TimeBase::new(gr_den, gr_num);
+            frame_tb.rescale(keyframe_frame, stream_tb)
+        } else if let Some(g) = id_gran {
+            // ID-header-derived stream: the stream time-base is one tick
+            // per frame, so the keyframe's 0-based frame index IS its pts.
+            match g.keyframe_index(landed) {
+                Some(k) => k,
+                None => return Ok(landed),
+            }
+        } else {
+            // No usable rate to translate with — fall back to the
+            // frame-floor landing.
             return Ok(landed);
         };
-        if gr_num <= 0 || gr_den <= 0 {
-            return Ok(landed);
-        }
-        let frame_tb = TimeBase::new(gr_den, gr_num);
-        let keyframe_pts = frame_tb.rescale(keyframe_frame, stream_tb);
         // Re-seek to the keyframe. The frame-floor bisection lands on the
         // page whose frame number is `<= keyframe_frame`; since the keyframe
         // is an exact frame on the wire, that is the keyframe page itself.
@@ -1501,6 +1566,23 @@ impl OggDemuxer {
             .and_then(|b| b.granule_to_seconds(granule))
         {
             return (secs * 1_000_000.0) as i64;
+        }
+        // Theora with a parsed ID header: the raw granule is the packed
+        // (keyframe, offset) pair, not a frame count — unpack it first
+        // (spec §A.2.3). The granule marks the END of the last frame's
+        // display interval, so the elapsed time is the frame *count*
+        // over the FRN/FRD rate (the stream time base is FRD/FRN
+        // seconds per frame).
+        if let Some(g) = self.theora_granule.get(&serial) {
+            if let Some(count) = g.frame_count(granule) {
+                let stream = &self.streams[state.public_index];
+                return (stream.time_base.seconds_of(count) * 1_000_000.0) as i64;
+            }
+            // A granule below the stream's counting origin (e.g. the
+            // header pages' granule 0) marks no elapsed content.
+            if granule >= 0 {
+                return 0;
+            }
         }
         let stream = &self.streams[state.public_index];
         (stream.time_base.seconds_of(granule) * 1_000_000.0) as i64
@@ -1814,6 +1896,35 @@ impl OggDemuxer {
         Some(SeekKey::theora_frame(target_frame, shift))
     }
 
+    /// Build the Theora seek axis from the stream's own identification
+    /// header (`docs/video/theora/Theora.pdf` §6.2 KFGSHIFT + FRN/FRD),
+    /// needing no Skeleton at all — the common case for real
+    /// Theora-in-Ogg files. `None` when the BOS ID header didn't parse
+    /// (the fisbone-based [`Self::theora_seek_key`] then gets its
+    /// chance).
+    ///
+    /// The stream's `time_base` is one tick per frame when the ID
+    /// header parsed (see `register_stream`), so the user's `pts` is
+    /// already the target 0-based frame index; the rescale below is an
+    /// identity in that case and only defends against callers that
+    /// rebuilt `StreamInfo` with a different base. A `KFGSHIFT` of 0 is
+    /// accepted here — unlike a zero fisbone `granuleshift` (which is
+    /// indistinguishable from "field never set"), the ID header is
+    /// authoritative: zero genuinely means the whole granule is the
+    /// frame half.
+    fn theora_seek_key_from_id(
+        &self,
+        serial: u32,
+        pts: i64,
+        time_base: TimeBase,
+    ) -> Option<SeekKey> {
+        let gran = *self.theora_granule.get(&serial)?;
+        let state = self.state_by_serial.get(&serial)?;
+        let stream_tb = self.streams[state.public_index].time_base;
+        let target_frame = time_base.rescale(pts, stream_tb);
+        Some(SeekKey::theora_frame_biased(target_frame, gran))
+    }
+
     fn skeleton_index_seek(
         &self,
         serial: u32,
@@ -2058,6 +2169,21 @@ impl OggDemuxer {
             }
         }
 
+        // Theora carries the container mapping's granule-position codec
+        // (KFGSHIFT split + VREV counting origin) in its ID header
+        // (`docs/video/theora/Theora.pdf` §6.2 / §A.2.3). Record it
+        // per-serial when the header parses; an unparseable header
+        // degrades to the historical raw-granule handling so hostile or
+        // truncated BOS packets cannot abort the whole demux.
+        let theora_id = if codec_id.as_str() == "theora" {
+            TheoraIdHeader::parse(first).ok()
+        } else {
+            None
+        };
+        if let Some(id) = theora_id.as_ref() {
+            self.theora_granule.insert(bos_page.serial, id.granule());
+        }
+
         let time_base = match codec_id.as_str() {
             // Vorbis / FLAC / Speex all carry a sample-count granule
             // (Vorbis I §4.3; FLAC RFC 9639 §10.1 "the number of the last
@@ -2075,6 +2201,16 @@ impl OggDemuxer {
             }
             // Opus uses a 48 kHz timebase regardless of input sample rate.
             "opus" => TimeBase::new(1, 48_000),
+            // Theora is fixed-frame-rate (spec §6.2 step 12: "Frames are
+            // sampled at the constant rate of FRN/FRD frames per second.
+            // The presentation time of the first frame is at zero
+            // seconds."), so one tick = one frame and per-packet pts are
+            // 0-based absolute frame indices. Falls back to the 1 µs
+            // placeholder when the ID header didn't parse.
+            "theora" => match theora_id.as_ref() {
+                Some(id) => TimeBase::new(id.frd as i64, id.frn as i64),
+                None => TimeBase::new(1, 1_000_000),
+            },
             _ => TimeBase::new(1, 1_000_000),
         };
 
@@ -2097,6 +2233,7 @@ impl OggDemuxer {
                 last_seq: None,
                 pending_valid: false,
                 bos_processed: false,
+                theora_next_frame: None,
             },
         );
         Ok(())
@@ -2733,11 +2870,17 @@ impl OggDemuxer {
             // Unknown serial that isn't a BOS — skip silently.
             return Ok(());
         }
+        // The Theora identification header is the authoritative source
+        // for the granule packing (`docs/video/theora/Theora.pdf` §6.2
+        // KFGSHIFT); a Skeleton fisbone's `granuleshift` covers streams
+        // whose ID header didn't parse.
+        let theora_gran = self.theora_granule.get(&page.serial).copied();
         let page_granuleshift = self
             .skeleton
             .as_ref()
             .and_then(|sk| sk.bone_for_serial(page.serial))
             .map(|b| b.granuleshift as u32)
+            .or(theora_gran.map(|g| g.shift))
             .unwrap_or(0);
         let stream = self
             .state_by_serial
@@ -2859,6 +3002,36 @@ impl OggDemuxer {
 
         let last_idx = completed.len().checked_sub(1);
         let mut headers_just_completed = false;
+        // Theora per-packet frame indexing, for streams whose ID header
+        // parsed (spec §A.2.2–§A.2.3): every data packet codes exactly
+        // one frame and every page on which a packet finishes MUST carry
+        // the granule of the last frame finishing there, so the page's
+        // granule anchors 0-based frame indices for *all* of its data
+        // packets (counted backwards from the last one). Pages that
+        // non-conformantly omit the granule fall back to the running
+        // `theora_next_frame` counter carried from the previous anchor.
+        let header_take = stream.headers_remaining.min(completed.len());
+        let data_count = (completed.len() - header_take) as i64;
+        let mut theora_frame: Option<i64> = None;
+        let mut theora_page_kf: Option<i64> = None;
+        if let Some(g) = theora_gran {
+            if data_count > 0 {
+                let anchor = if page.granule_position >= 0 {
+                    g.frame_index(page.granule_position)
+                } else {
+                    None
+                };
+                theora_frame = anchor
+                    .map(|last| last - (data_count - 1))
+                    .or(stream.theora_next_frame);
+                theora_page_kf = if page.granule_position >= 0 {
+                    g.keyframe_index(page.granule_position)
+                } else {
+                    None
+                };
+                stream.theora_next_frame = theora_frame.map(|f| f + data_count);
+            }
+        }
         for (i, data) in completed.into_iter().enumerate() {
             if stream.headers_remaining > 0 {
                 stream.header_packets.push(data);
@@ -2869,32 +3042,55 @@ impl OggDemuxer {
                 continue;
             }
             let is_last = Some(i) == last_idx;
-            // pts on the last-on-page packet carries the page's granule
-            // (Ogg's only timing signal); intermediate packets get None.
-            // Container-aware muxers that need per-packet pts should derive
-            // them from codec-specific knowledge (e.g. Opus TOC parsing).
-            let pts = if is_last && page.granule_position >= 0 {
-                Some(page.granule_position)
+            let (pts, keyframe) = if let Some(g) = theora_gran {
+                // Theora with a parsed ID header: pts is the 0-based
+                // absolute frame index (the stream time base is one
+                // frame per tick), assigned to EVERY data packet via the
+                // page's granule anchor. The keyframe flag is proven for
+                // the frame the anchor's upper half names (its
+                // offset-since-keyframe is zero exactly there); frames
+                // preceding it on the same page cannot be proven
+                // keyframes from framing alone — a page holding several
+                // keyframes only names the last — so they stay `false`.
+                let frame = theora_frame;
+                if let Some(f) = theora_frame {
+                    theora_frame = Some(f + 1);
+                }
+                let kf = frame.is_some() && frame == theora_page_kf
+                    || frame.is_none()
+                        && is_last
+                        && page.granule_position >= 0
+                        && g.is_keyframe(page.granule_position);
+                (frame, kf)
             } else {
-                None
-            };
-            // Keyframe flag (RFC 3533 carries no per-packet keyframe bit; the
-            // only random-access signal is the granuleshift-packed granulepos).
-            //
-            // * Audio mappings (granuleshift 0) — every packet is an
-            //   independent random-access point, so every packet is a keyframe.
-            // * Theora-style packed granule (granuleshift > 0) — only the
-            //   last-on-page packet carries a granule, and it is a keyframe
-            //   iff its offset-since-keyframe (the low `shift` bits) is zero
-            //   (`granule_is_keyframe`). A non-granule-bearing packet on such a
-            //   track cannot be proven a keyframe from framing alone, so it is
-            //   flagged `false` rather than mislabelled random-access.
-            let keyframe = if page_granuleshift == 0 {
-                true
-            } else if is_last && page.granule_position >= 0 {
-                granule_is_keyframe(page.granule_position, page_granuleshift)
-            } else {
-                false
+                // pts on the last-on-page packet carries the page's granule
+                // (Ogg's only timing signal); intermediate packets get None.
+                // Container-aware muxers that need per-packet pts should derive
+                // them from codec-specific knowledge (e.g. Opus TOC parsing).
+                let pts = if is_last && page.granule_position >= 0 {
+                    Some(page.granule_position)
+                } else {
+                    None
+                };
+                // Keyframe flag (RFC 3533 carries no per-packet keyframe bit; the
+                // only random-access signal is the granuleshift-packed granulepos).
+                //
+                // * Audio mappings (granuleshift 0) — every packet is an
+                //   independent random-access point, so every packet is a keyframe.
+                // * Theora-style packed granule (granuleshift > 0) — only the
+                //   last-on-page packet carries a granule, and it is a keyframe
+                //   iff its offset-since-keyframe (the low `shift` bits) is zero
+                //   (`granule_is_keyframe`). A non-granule-bearing packet on such a
+                //   track cannot be proven a keyframe from framing alone, so it is
+                //   flagged `false` rather than mislabelled random-access.
+                let keyframe = if page_granuleshift == 0 {
+                    true
+                } else if is_last && page.granule_position >= 0 {
+                    granule_is_keyframe(page.granule_position, page_granuleshift)
+                } else {
+                    false
+                };
+                (pts, keyframe)
             };
             let mut pkt = Packet::new(stream_idx, time_base, data);
             pkt.pts = pts;
@@ -3112,11 +3308,18 @@ impl Demuxer for OggDemuxer {
                     .unwrap_or(0),
             ),
             "vorbis" | "flac" | "speex" => SeekKey::identity(pts),
-            "theora" => match self.theora_seek_key(wanted_serial, pts, stream_tb_for_key) {
+            // The identification header is the preferred axis source
+            // (authoritative KFGSHIFT + version bias, no Skeleton
+            // needed); a fisbone-derived axis covers streams whose ID
+            // header didn't parse.
+            "theora" => match self
+                .theora_seek_key_from_id(wanted_serial, pts, stream_tb_for_key)
+                .or_else(|| self.theora_seek_key(wanted_serial, pts, stream_tb_for_key))
+            {
                 Some(key) => key,
                 None => {
                     return Err(Error::unsupported(format!(
-                        "Ogg: seek_to on stream {stream_index} ({}) requires a Skeleton fisbone with non-zero granuleshift and granule_rate",
+                        "Ogg: seek_to on stream {stream_index} ({}) requires a parseable identification header or a Skeleton fisbone with non-zero granuleshift and granule_rate",
                         codec_id.as_str()
                     )));
                 }
@@ -3451,9 +3654,44 @@ fn guess_params(codec_id: &CodecId, first: &[u8]) -> Result<CodecParameters> {
         "opus" => parse_opus_id(&mut p, first)?,
         "speex" => parse_speex_id(&mut p, first)?,
         "flac" => parse_flac_id(&mut p, first)?,
+        "theora" => parse_theora_id_params(&mut p, first),
         _ => {}
     }
     Ok(p)
+}
+
+/// Populate video `CodecParameters` from a Theora identification header
+/// (`docs/video/theora/Theora.pdf` §6.2).
+///
+/// Best-effort by design: a header that fails [`TheoraIdHeader::parse`]
+/// leaves the parameters bare (codec id + media type only) rather than
+/// erroring, so a hostile or truncated BOS packet degrades the stream
+/// description instead of aborting the whole container open. The
+/// dimensions reported are the *picture region* (`PICW`/`PICH` — what a
+/// player displays), falling back to the coded frame size
+/// (`FMBW`/`FMBH` × 16) when the picture region is zero-sized.
+fn parse_theora_id_params(p: &mut CodecParameters, packet: &[u8]) {
+    let Ok(id) = TheoraIdHeader::parse(packet) else {
+        return;
+    };
+    let (w, h) = if id.picw > 0 && id.pich > 0 {
+        (id.picw, id.pich)
+    } else {
+        (u32::from(id.fmbw) * 16, u32::from(id.fmbh) * 16)
+    };
+    p.width = Some(w);
+    p.height = Some(h);
+    p.frame_rate = Some(oxideav_core::Rational::new(id.frn as i64, id.frd as i64));
+    // Spec Table 6.4: PF 0 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4 (1 reserved).
+    p.pixel_format = match id.pf {
+        0 => Some(oxideav_core::PixelFormat::Yuv420P),
+        2 => Some(oxideav_core::PixelFormat::Yuv422P),
+        3 => Some(oxideav_core::PixelFormat::Yuv444P),
+        _ => None,
+    };
+    if id.nombr > 0 {
+        p.bit_rate = Some(u64::from(id.nombr));
+    }
 }
 
 fn parse_vorbis_id(p: &mut CodecParameters, packet: &[u8]) -> Result<()> {
