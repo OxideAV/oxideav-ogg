@@ -1974,6 +1974,21 @@ impl OggDemuxer {
             return Err(Error::invalid("Ogg BOS page has no packets"));
         }
         let first = &bos_page.data[segs[0].data.clone()];
+        // A non-fishead BOS reusing the Skeleton bitstream's own serial is an
+        // RFC 3533 §4 unique-serial violation ("Each grouped logical bitstream
+        // MUST have a unique serial number within the scope of the physical
+        // bitstream"). It must NOT register a public content stream: every
+        // subsequent page carrying this serial is routed to the Skeleton
+        // metadata path (the serial identifies the Skeleton bitstream), so the
+        // registered stream would be a phantom — a `streams()` entry that can
+        // never receive a single packet — and the Skeleton "Track order"
+        // serial↔index mapping would stop round-tripping (the serial resolves
+        // to track 0, the Skeleton, while the phantom occupies a content
+        // track). Refuse the registration; `process_page` (the single drain
+        // authority) counts the violation on `duplicate_serial_count`.
+        if Some(bos_page.serial) == self.skeleton_serial && !skeleton::is_fishead(first) {
+            return Ok(());
+        }
         // Skeleton BOS — `fishead\0` ident packet, Skeleton 3.0 / 4.0
         // (`docs/container/ogg/ogg-skeleton-{3,4}.0.md`). The Skeleton
         // logical bitstream has no content packets and is described as
@@ -1996,6 +2011,18 @@ impl OggDemuxer {
             // `skeleton_last_seq` and return.
             if self.skeleton_serial == Some(bos_page.serial) && self.skeleton.is_some() {
                 self.skeleton_last_seq = Some(bos_page.seq_no);
+                return Ok(());
+            }
+            // A SECOND `fishead\0` BOS on a *different* serial while a
+            // Skeleton is already recorded is a spec violation — the 3.0 /
+            // 4.0 encapsulation order makes the (single) Skeleton BOS "the
+            // very first BOS page in the Ogg stream". Keep the first
+            // Skeleton rather than letting a later fishead clobber its
+            // accumulated fisbone / index state (matching how
+            // `process_skeleton_page` ignores an in-stream second fishead
+            // packet). The impostor stream's pages are simply skipped as
+            // unknown-serial pages.
+            if self.skeleton.is_some() {
                 return Ok(());
             }
             let head = FisHead::parse(first)?;
@@ -2625,12 +2652,32 @@ impl OggDemuxer {
                 s.bos_processed = true;
             }
         } else if page.is_first() && is_skeleton_bos {
-            // `register_stream` for a `fishead\0` BOS initialises
-            // `skeleton_serial` rather than pushing a public stream; the BOS
-            // page carries the fishead packet it already parsed, so route to
-            // the Skeleton path below.
-            if !self.state_by_serial.contains_key(&page.serial) {
-                self.register_stream(&page)?;
+            // A BOS page on the Skeleton bitstream's own serial. Two cases:
+            //
+            //  * its first packet is a `fishead\0` — the expected idempotent
+            //    re-registration (`register_stream` refreshes
+            //    `skeleton_last_seq` and returns); route to the Skeleton path
+            //    below as before.
+            //  * its first packet is NOT a fishead — a content BOS reusing
+            //    the Skeleton's serial, an RFC 3533 §4 unique-serial
+            //    violation. `register_stream` refuses to create the phantom
+            //    content stream (see its guard); count the violation here so
+            //    `duplicate_serial_count` surfaces it. The page still routes
+            //    to the Skeleton path below, whose packet dispatch skips the
+            //    unrecognised payload.
+            let first_is_fishead = page
+                .packet_segments()
+                .first()
+                .map(|seg| skeleton::is_fishead(&page.data[seg.data.clone()]))
+                .unwrap_or(false);
+            if first_is_fishead {
+                if !self.state_by_serial.contains_key(&page.serial) {
+                    self.register_stream(&page)?;
+                }
+            } else if !self.seek_index_built {
+                // Same walker convention as `restart_serial_on_duplicate_bos`:
+                // the `build_seek_index` scan owns the tally once it has run.
+                self.duplicate_serials += 1;
             }
         } else if !page.is_first() {
             self.seen_nonbos_in_current_link = true;
