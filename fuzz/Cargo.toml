@@ -111,3 +111,55 @@ name = "skeleton_parse"
 path = "fuzz_targets/skeleton_parse.rs"
 test = false
 doc = false
+
+# Target 6: buffer-level framing layer (`framing::PageWriter` /
+# `PacketAssembler` / `parse_pages` / `pages_to_packets`). Write mode
+# drives fuzz-shaped packet sequences through PageWriter and asserts
+# HARD round-trip invariants (BOS/EOS placement, contiguous sequence
+# numbers, continued-flag/open-packet agreement, byte-exact packet
+# reassembly); read mode feeds hostile bytes to the strict layer and
+# checks a parse -> serialize -> parse fixpoint on every accepted page.
+[[bin]]
+name = "framing_layer"
+path = "fuzz_targets/framing_layer.rs"
+test = false
+doc = false
+
+# Target 7: mux -> demux round-trip. Fuzz-shaped packet sequences
+# (1-2 streams, Vorbis/Opus extradata reconstruction, spanning
+# packets, soft page target, optional chained second link) go through
+# the muxer and MUST come back from the demuxer byte-identical, in
+# order, on the right public stream, with all damage counters at zero
+# and the link count matching. Self-consistency is a valid oracle
+# under the clean-room wall — both sides are this crate.
+[[bin]]
+name = "mux_roundtrip"
+path = "fuzz_targets/mux_roundtrip.rs"
+test = false
+doc = false
+
+# Target 8: chained + grouped stream graphs. Constructs whole
+# physical-stream graphs (up to 3 links x 2 streams, serials from a
+# 4-entry pool so RFC 3533 §4 unique-serial violations are common,
+# optional Skeleton control section, fuzz flags/seq/granules,
+# corruption + truncation) and asserts the range contracts of the
+# link/serial/track accessors plus the track-order bijection, across
+# both the incremental drain and the build_seek_index full-file scan.
+[[bin]]
+name = "chain_graph"
+path = "fuzz_targets/chain_graph.rs"
+test = false
+doc = false
+
+# Target 9: hostile-graph seek storm. Valid-CRC pages whose
+# granules are non-monotonic / -1 / near-overflow, plus an optional
+# Skeleton whose fisbone and 4.0 index actively lie (granuleshift up
+# to 255, zero/negative rates and denominators, keypoints pointing
+# past EOF), stormed through seek_to / seek_to_with_preroll /
+# seek_to_keyframe with build_seek_index interleaved. Panic-freedom
+# plus in-range post-seek packet delivery are the oracles.
+[[bin]]
+name = "seek_hostile"
+path = "fuzz_targets/seek_hostile.rs"
+test = false
+doc = false
