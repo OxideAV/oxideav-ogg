@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- a content BOS page reusing the Skeleton bitstream's serial no longer
+  registers a phantom public stream (a `streams()` entry that could
+  never receive a packet — every page with that serial routes to the
+  Skeleton metadata path — and that broke the Skeleton "Track order"
+  serial↔index round-trip); the RFC 3533 §4 unique-serial violation is
+  now surfaced on `duplicate_serial_count`. Found by the new
+  `chain_graph` structure-aware fuzz target
+- a second `fishead\0` BOS on another serial no longer clobbers the
+  recorded Skeleton's fisbone/index state; the first Skeleton wins,
+  matching the in-stream second-fishead handling
+- `open()` no longer buffers the entire file's packets in memory when
+  a hostile header section never completes (a Skeleton BOS whose EOS
+  page never arrives, or a declared header count never satisfied):
+  header collection is bounded by an 8192-page budget and continues
+  best-effort, with no packet lost on the subsequent drain
+
 ### Added
+
+- four structure-aware fuzz targets (`framing_layer`, `mux_roundtrip`,
+  `chain_graph`, `seek_hostile`) covering the buffer-level framing
+  round-trip, mux→demux self-consistency (byte-identical packets, zero
+  damage counters), chained+grouped stream graphs with serial-reuse
+  violations, and hostile-granule/lying-Skeleton-index seek storms
 
 - `framing` module: buffer-level packet ⇄ page layer for one logical
   bitstream (`PageWriter`, `PacketAssembler`, `parse_pages`,

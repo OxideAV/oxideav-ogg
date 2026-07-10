@@ -1369,9 +1369,10 @@ do not need the segment table decoded into packets.
 
 ### Fuzzing
 
-A cargo-fuzz harness under `fuzz/` (panic-freedom only, no
-cross-decoder oracle — the clean-room wall holds at the spec
-and our own source) hammers five surfaces with attacker bytes:
+A cargo-fuzz harness under `fuzz/` (no cross-decoder oracle — the
+clean-room wall holds at the spec and our own source; the oracles are
+panic-freedom plus this crate's own round-trip invariants) hammers
+nine surfaces with attacker bytes:
 
 - `page_parse` — `Page::parse` at every byte offset, plus the
   standalone `crc::validate_page_crc` / `read_page_checksum` /
@@ -1421,6 +1422,44 @@ and our own source) hammers five surfaces with attacker bytes:
   now clamped by `(packet.len() - 42) / 2` (the minimum two
   bytes per delta-encoded keypoint) so a tiny attacker packet
   cannot pre-allocate gigabytes.
+- `framing_layer` — the buffer-level `framing` module. Write mode
+  drives fuzz-shaped packet sequences (sizes straddling every lacing
+  edge, including page-spanning > 255×255-byte packets), flushes and
+  page-target changes through `PageWriter`, then asserts HARD
+  invariants on the emitted bytes: `parse_pages` accepts them, BOS on
+  the first page, EOS on the last, contiguous sequence numbers, the
+  `continued` flag agreeing with the previous page's open packet, and
+  `pages_to_packets` returning the pushed packets byte-for-byte (via
+  the incremental `PacketAssembler` too). Read mode feeds hostile
+  bytes to the strict layer and checks a
+  parse → `try_to_bytes` → parse fixpoint on every accepted page.
+- `mux_roundtrip` — the crate against itself: fuzz-shaped packet
+  sequences (1–2 streams, Vorbis/Opus extradata reconstruction,
+  spanning packets, optional soft page target, optional chained
+  second link via `begin_new_link`) go through the muxer and MUST
+  demux byte-identical, in order, on the right public stream, with
+  `hole_count` / `framing_error_count` / `resync_count` /
+  `duplicate_serial_count` all zero and `link_count` matching what
+  was written.
+- `chain_graph` — whole physical-stream graphs: up to three chained
+  links × two grouped streams whose serials come from a four-entry
+  pool (so RFC 3533 §4 unique-serial violations occur constantly),
+  an optional Skeleton control section, fuzz-driven per-page flags /
+  sequence deltas / granules, plus single-byte corruption and tail
+  truncation. Asserts the range contracts of the link / serial /
+  granuleshift accessors and the Skeleton "Track order" bijection
+  (`track_order_index(track_order_serial(t)) == t`) across both the
+  incremental drain and the `build_seek_index` full-file scan — the
+  assert that caught the Skeleton-serial phantom-stream bug.
+- `seek_hostile` — valid-CRC page graphs built to defeat seeking:
+  non-monotonic granules, `-1` sentinels, near-overflow magnitudes,
+  duplicate-serial restarts, truncated tails, and an optional
+  Skeleton whose fisbone (granuleshift up to 255, zero/negative
+  granule rates) and 4.0 `index\0` packet (keypoints pointing past
+  EOF, zero/negative timestamp denominators) actively lie about the
+  file. Storms `seek_to` / `seek_to_with_preroll` /
+  `seek_to_keyframe` with `build_seek_index` interleaved, checking
+  in-range packet delivery after every landing.
 
 Run from `fuzz/` with `cargo +nightly fuzz run <target>`; no target
 runs as part of the per-PR CI shim (the org reusable workflow does

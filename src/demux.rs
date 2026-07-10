@@ -12,6 +12,15 @@ use crate::codec_id;
 use crate::page::{self, Page};
 use crate::skeleton::{self, FisBone, FisHead, SkelIndex, Skeleton};
 
+/// Page budget for the `open()`-time header-collection wait
+/// ([`OggDemuxer::read_until_headers_collected`]). Guards against a
+/// hostile file whose header-completion condition never comes true — a
+/// Skeleton BOS with no Skeleton EOS page, or a declared header count
+/// the stream never delivers — which would otherwise buffer the whole
+/// file's packets in memory during `open()`. Far above any conforming
+/// header section (tens of pages), far below a whole-file walk.
+const HEADER_SECTION_MAX_PAGES: usize = 8192;
+
 /// Open an Ogg bitstream.
 pub fn open(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     let mut state = OggDemuxer::new(input);
@@ -2253,7 +2262,21 @@ impl OggDemuxer {
     /// until every logical stream has gathered all of its expected setup
     /// packets (3 for Vorbis, 2 for Opus, …). Audio/video packets read in the
     /// process are still queued; they'll be delivered by `next_packet` later.
+    ///
+    /// The wait is bounded by [`HEADER_SECTION_MAX_PAGES`]: a hostile file
+    /// that dangles the completion condition forever — a `fishead\0` BOS
+    /// whose Skeleton EOS page never arrives, or a stream whose declared
+    /// header count is never satisfied — would otherwise make `open()`
+    /// buffer every content packet of the entire file in `out_queue`
+    /// (memory proportional to the file size before the caller has read a
+    /// single packet). Past the budget the collection stops best-effort,
+    /// exactly like the EOF path: whatever headers arrived are used, the
+    /// input cursor stays where it is, and `next_packet` continues from
+    /// there. Conforming files are unaffected — a real header section is
+    /// tens of pages at most (the Skeleton EOS must precede any content
+    /// data page per `ogg-skeleton-{3,4}.0.md`).
     fn read_until_headers_collected(&mut self) -> Result<()> {
+        let mut pages_consumed = 0usize;
         loop {
             let any_pending = self
                 .state_by_serial
@@ -2271,6 +2294,12 @@ impl OggDemuxer {
             if !any_pending && !skeleton_pending {
                 return Ok(());
             }
+            if pages_consumed >= HEADER_SECTION_MAX_PAGES {
+                // Budget exhausted before the header section closed — a
+                // malformed (or hostile) file. Stop best-effort, same as
+                // the EOF path below.
+                return Ok(());
+            }
             // Drain queued pages from the BOS phase first; only then read more.
             let page = if let Some(p) = self.page_queue.pop_front() {
                 p
@@ -2280,6 +2309,7 @@ impl OggDemuxer {
                     None => return Ok(()), // EOF before all headers — best-effort.
                 }
             };
+            pages_consumed += 1;
             self.process_page(page)?;
         }
     }
