@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `theora` module: the Theora-in-Ogg container mapping's
+  identification-header parser/builder (`TheoraIdHeader`, spec §6.2
+  byte layout — dimensions, frame rate, aspect ratio, `KFGSHIFT`,
+  pixel format) and the granule-position codec (`TheoraGranule`, spec
+  §A.2.3): keyframe/offset split packing and unpacking with the
+  version-dependent counting origin (frame-count for 3.2.1+, frame-
+  index for VREV 0) folded into 0-based absolute frame indices. The
+  spec's inconsistent mid-stream worked example is resolved against
+  real reference bitstreams (consecutive keyframes carry 1|0, 2|0,
+  3|0, …)
+
 ### Fixed
 
 - a content BOS page reusing the Skeleton bitstream's serial no longer

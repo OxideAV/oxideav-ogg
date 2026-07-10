@@ -103,6 +103,7 @@ pub mod framing;
 pub mod mux;
 pub mod page;
 pub mod skeleton;
+pub mod theora;
 
 use oxideav_core::ContainerRegistry;
 
