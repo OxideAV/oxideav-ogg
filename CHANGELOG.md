@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (frame indices, keyframe flags, dimensions, frame rate, and
   duration all agree). Streams whose ID header does not parse keep
   the historical raw-granule + fisbone behaviour
+- Theora MUX support: the muxer now packs each data packet's
+  `(keyframe << KFGSHIFT) | frames-since-keyframe` granule position
+  from codec-level `(frame index, keyframe flag)` packets — the shift
+  and version origin recovered from the ID header in the stream's
+  extradata — with a per-stream frame counter for pts-less packets
+  (each Theora packet is exactly one frame) and an actionable error
+  when a keyframe interval overflows the `2^KFGSHIFT − 1` offset
+  capacity. Header pagination follows §A.2.1 (ID header alone on the
+  BOS page, comment beginning the second page, page break before the
+  first frame packet), and the multiplexed mapping's §A.3.2 BOS rule
+  is enforced: the Theora identification page is emitted first even
+  when the caller lists audio streams ahead of the video (output for
+  Theora-less files is unchanged byte-for-byte)
 
 ### Fixed
 

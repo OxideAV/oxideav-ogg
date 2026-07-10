@@ -14,6 +14,7 @@ use oxideav_core::{Muxer, WriteSeek};
 use crate::codec_id;
 use crate::page::{self, flags, lace, Page};
 use crate::skeleton::{KeyPoint, SkelIndex, Skeleton};
+use crate::theora::{TheoraGranule, TheoraIdHeader};
 
 pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
     open_inner(output, streams, None, None)
@@ -314,6 +315,22 @@ fn build_link_writers(
         used_serials.insert(serial);
         max_serial = max_serial.max(serial);
         let headers_remaining = codec_id::header_packet_count(&s.params.codec_id);
+        // Theora: recover the granule-position packer from the ID header
+        // (the first packet of the Xiph-laced extradata blob). A stream
+        // whose extradata is missing or unparseable muxes with the
+        // legacy pts-as-raw-granule behaviour instead.
+        let theora = if s.params.codec_id.as_str() == "theora" {
+            xiph_unlace(&s.params.extradata)
+                .and_then(|packets| packets.first().cloned())
+                .and_then(|id| TheoraIdHeader::parse(&id).ok())
+                .map(|id| TheoraMuxState {
+                    gran: id.granule(),
+                    next_frame: 0,
+                    last_kf: 0,
+                })
+        } else {
+            None
+        };
         per_stream.insert(
             s.index,
             StreamWriter {
@@ -323,6 +340,7 @@ fn build_link_writers(
                 headers_remaining,
                 bos_emitted: false,
                 pending_bytes: None,
+                theora,
             },
         );
     }
@@ -335,6 +353,23 @@ fn build_link_writers(
 /// remux output byte-stable when the input numbering is also dense from 0).
 fn derive_serial(s: &StreamInfo) -> u32 {
     s.index
+}
+
+/// Order streams for header-page emission. The Theora spec's multiplexed
+/// stream mapping (`docs/video/theora/Theora.pdf` §A.3.2) requires that
+/// among the grouped 'beginning of stream' pages "the first page to
+/// occur MUST be the Theora page. This facilitates identification of Ogg
+/// Theora files among other Ogg-encapsulated content." — so Theora
+/// streams are stably moved ahead of the audio (and any other) streams;
+/// with several Theora streams the caller's first-listed one leads (the
+/// spec's "primary stream" recommendation). Files without a Theora
+/// stream keep the caller's order byte-for-byte. When a Skeleton is
+/// attached its fishead BOS still precedes everything, per the
+/// Skeleton spec's own encapsulation order.
+fn header_emission_order(streams: &[StreamInfo]) -> Vec<StreamInfo> {
+    let mut ordered = streams.to_vec();
+    ordered.sort_by_key(|s| s.params.codec_id.as_str() != "theora");
+    ordered
 }
 
 /// Concrete Ogg muxer.
@@ -511,6 +546,29 @@ struct StreamWriter {
     /// runs (in which case it gets EOS set and its CRC patched). This makes
     /// the EOS marker sit on a real data page instead of an empty trailing one.
     pending_bytes: Option<PendingPage>,
+    /// Theora granule-position packer, present when the stream's
+    /// extradata carried a parseable identification header. Turns
+    /// per-packet `(frame index, keyframe flag)` into the split
+    /// `(keyframe << KFGSHIFT) | offset` on-wire granules the Theora
+    /// Ogg mapping requires (`docs/video/theora/Theora.pdf` §A.2.3).
+    /// `None` for non-Theora streams and for Theora streams without a
+    /// parseable ID header, which keep the historical
+    /// pts-as-raw-granule behaviour.
+    theora: Option<TheoraMuxState>,
+}
+
+/// Per-stream Theora granule bookkeeping (spec §A.2.3).
+struct TheoraMuxState {
+    gran: TheoraGranule,
+    /// Absolute 0-based frame index the next data packet will carry if
+    /// it brings no pts of its own (each Theora packet is exactly one
+    /// frame).
+    next_frame: i64,
+    /// Frame index of the most recent keyframe-flagged packet. Starts
+    /// at 0: the Theora mapping requires the stream to open on a
+    /// keyframe, so frame 0 is its own keyframe whether or not the
+    /// caller flagged it.
+    last_kf: i64,
 }
 
 #[derive(Default)]
@@ -920,7 +978,7 @@ impl Muxer for OggMuxer {
         // non-BOS page. We emit BOS pages directly here (bypassing the
         // per-stream pending-bytes mechanism used for EOS) so BOS pages for
         // all streams land at the very front of the output.
-        let stream_clone = self.streams.clone();
+        let stream_clone = header_emission_order(&self.streams);
         let mut header_queues: Vec<(u32, oxideav_core::TimeBase, Vec<Vec<u8>>)> =
             Vec::with_capacity(stream_clone.len());
         for s in &stream_clone {
@@ -1069,8 +1127,31 @@ impl Muxer for OggMuxer {
         // page is flushed when the source signaled a page boundary via
         // `unit_boundary`. This separates *pts-per-packet* (decoders care)
         // from *page boundaries* (Ogg cares).
-        if let Some(pts) = packet.pts {
+        //
+        // Theora is the exception to granule = pts: its mapping packs
+        // `(keyframe << KFGSHIFT) | frames-since-keyframe` into the
+        // granule (`docs/video/theora/Theora.pdf` §A.2.3), so the muxer
+        // tracks the frame counter (each packet is exactly one frame;
+        // a caller-supplied pts re-anchors it) and the last
+        // keyframe-flagged frame, and stamps the packed value on every
+        // packet — spec §A.2.2 requires a granule on every page where a
+        // packet finishes, whether or not the caller set pts.
+        let effective_pts = if let Some(th) = writer.theora.as_mut() {
+            let frame = packet.pts.unwrap_or(th.next_frame);
+            if packet.flags.keyframe {
+                th.last_kf = frame;
+            }
+            let granule = th.gran.pack(frame, th.last_kf)?;
+            th.next_frame = frame + 1;
+            writer.buffered.granule_position = granule;
+            Some(frame)
+        } else if let Some(pts) = packet.pts {
             writer.buffered.granule_position = pts;
+            Some(pts)
+        } else {
+            None
+        };
+        if let Some(pts) = effective_pts {
             // Auto-index bookkeeping: the packet starts on the page the
             // builder is currently filling, so a keyframe-flagged packet
             // makes this page a keypoint candidate once it reaches the
@@ -1082,7 +1163,7 @@ impl Muxer for OggMuxer {
         // Every content pts feeds the index packet's first/last-sample-
         // time fields (separate lookup — the per-stream writer borrow
         // must end before `auto_index` is touched).
-        if let Some(pts) = packet.pts {
+        if let Some(pts) = effective_pts {
             if let Some(state) = self
                 .auto_index
                 .iter_mut()
@@ -1242,7 +1323,7 @@ impl OggMuxer {
         // 3. Write the new link's BOS + remaining header packets, exactly
         //    as write_header does for the first link (minus Skeleton,
         //    which chaining excludes).
-        let stream_clone = self.streams.clone();
+        let stream_clone = header_emission_order(&self.streams);
         let mut header_queues: Vec<(u32, oxideav_core::TimeBase, Vec<Vec<u8>>)> =
             Vec::with_capacity(stream_clone.len());
         for s in &stream_clone {
