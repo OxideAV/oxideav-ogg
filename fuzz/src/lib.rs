@@ -84,6 +84,34 @@ pub fn theora_id_packet() -> Vec<u8> {
     p
 }
 
+/// Fully valid Theora identification packet (spec §6.2): version
+/// 3.2.1, 32×32 coded frame, 25 fps, the given `KFGSHIFT`. Parses
+/// under `oxideav_ogg::theora::TheoraIdHeader::parse`, so the muxer's
+/// granule-position packer engages for streams carrying it.
+pub fn theora_valid_id_packet(kfgshift: u8) -> Vec<u8> {
+    oxideav_ogg::theora::TheoraIdHeader {
+        vmaj: 3,
+        vmin: 2,
+        vrev: 1,
+        fmbw: 2,
+        fmbh: 2,
+        picw: 32,
+        pich: 32,
+        picx: 0,
+        picy: 0,
+        frn: 25,
+        frd: 1,
+        parn: 0,
+        pard: 0,
+        cs: 0,
+        nombr: 0,
+        qual: 40,
+        kfgshift,
+        pf: 0,
+    }
+    .to_bytes()
+}
+
 /// Theora-shaped comment packet: 0x81 + "theora" + empty
 /// vorbis-comment body.
 pub fn theora_comment_packet() -> Vec<u8> {

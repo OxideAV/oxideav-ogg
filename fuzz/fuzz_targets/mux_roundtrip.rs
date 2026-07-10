@@ -42,7 +42,8 @@ use oxideav_core::{
 use oxideav_ogg::{demux, mux};
 
 use oxideav_ogg_fuzz::{
-    opus_head_packet, vorbis_comment_packet, vorbis_id_packet, vorbis_setup_packet,
+    opus_head_packet, theora_comment_packet, theora_setup_packet, theora_valid_id_packet,
+    vorbis_comment_packet, vorbis_id_packet, vorbis_setup_packet,
 };
 
 const SIZE_CLASSES: [usize; 8] = [0, 1, 254, 255, 256, 510, 4096, 66_000];
@@ -69,7 +70,34 @@ impl std::io::Seek for SharedBuf {
     }
 }
 
-fn make_stream(index: u32, opus: bool) -> StreamInfo {
+#[derive(Clone, Copy, PartialEq)]
+enum Codec {
+    Vorbis,
+    Opus,
+    /// Theora (valid 3.2.1 ID header, KFGSHIFT 6, 25 fps): exercises
+    /// the muxer's split granule-position packer and the demuxer's
+    /// frame-index pts path.
+    Theora,
+}
+
+fn make_stream(index: u32, codec: Codec) -> StreamInfo {
+    if codec == Codec::Theora {
+        let mut params = CodecParameters::video(CodecId::new("theora"));
+        params.extradata = mux::xiph_lace(&[
+            &theora_valid_id_packet(6),
+            &theora_comment_packet(),
+            &theora_setup_packet(),
+        ])
+        .expect("three packets lace");
+        return StreamInfo {
+            index,
+            time_base: TimeBase::new(1, 25),
+            duration: None,
+            start_time: Some(0),
+            params,
+        };
+    }
+    let opus = codec == Codec::Opus;
     let mut params = CodecParameters::audio(CodecId::new(if opus { "opus" } else { "vorbis" }));
     params.channels = Some(2);
     params.sample_rate = Some(48_000);
@@ -92,6 +120,20 @@ fn make_stream(index: u32, opus: bool) -> StreamInfo {
     }
 }
 
+/// Presentation-time (seconds) of a first-link page granule, for the
+/// cross-stream ordering invariant. Serial == stream index for the
+/// first link (`derive_serial`).
+fn page_secs(codecs: &[Codec], serial: u32, granule: i64) -> Option<f64> {
+    let codec = *codecs.get(serial as usize)?;
+    if codec == Codec::Theora {
+        // KFGSHIFT 6, frame-count origin, 25 fps.
+        let count = (granule >> 6) + (granule & 63);
+        Some(count as f64 / 25.0)
+    } else {
+        Some(granule as f64 / 48_000.0)
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.len() < 2 {
         return;
@@ -100,10 +142,22 @@ fuzz_target!(|data: &[u8]| {
     let n_streams = 1 + (ctrl & 1) as u32; // 1 or 2 first-link streams
     let use_target = ctrl & 0x02 != 0;
     let want_chain = ctrl & 0x04 != 0;
+    let theora_first = ctrl & 0x08 != 0; // stream 0 becomes Theora
     let opus_bits = ctrl >> 4;
 
+    let codecs: Vec<Codec> = (0..n_streams)
+        .map(|i| {
+            if i == 0 && theora_first {
+                Codec::Theora
+            } else if opus_bits & (1 << i) != 0 {
+                Codec::Opus
+            } else {
+                Codec::Vorbis
+            }
+        })
+        .collect();
     let streams: Vec<StreamInfo> = (0..n_streams)
-        .map(|i| make_stream(i, opus_bits & (1 << i) != 0))
+        .map(|i| make_stream(i, codecs[i as usize]))
         .collect();
 
     let shared = SharedBuf::default();
@@ -125,6 +179,7 @@ fuzz_target!(|data: &[u8]| {
     let mut expected: Vec<Vec<Vec<u8>>> = vec![Vec::new(); total_slots];
 
     let mut pts: i64 = 1;
+    let mut theora_frame: i64 = 0;
     let mut huge_used = 0usize;
     let mut wrote_any = false;
     let mut in_second_link = false;
@@ -137,7 +192,14 @@ fuzz_target!(|data: &[u8]| {
         // Halfway through, optionally open the chained second link
         // (requires at least one content packet in the current link).
         if want_chain && !in_second_link && i == switch_at && wrote_any {
-            let link2 = vec![make_stream(0, desc[0] & 0x40 != 0)];
+            let link2 = vec![make_stream(
+                0,
+                if desc[0] & 0x40 != 0 {
+                    Codec::Opus
+                } else {
+                    Codec::Vorbis
+                },
+            )];
             if mx.begin_new_link(&link2).is_err() {
                 return;
             }
@@ -160,12 +222,27 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         let payload = vec![desc[1]; SIZE_CLASSES[class]];
-        pts += (desc[2] & 0x7F) as i64 * 31;
+        let is_theora = !in_second_link && codecs[local_index as usize] == Codec::Theora;
 
-        let mut pkt = Packet::new(local_index, TimeBase::new(1, 48_000), payload.clone());
-        pkt.pts = Some(pts);
+        let mut pkt = if is_theora {
+            // Theora packets are frames: pts is the 0-based frame
+            // index (one per packet), the keyframe flag is fuzz-chosen,
+            // and the muxer packs the split granule. An unflagged run
+            // longer than 2^KFGSHIFT-1 frames is a legitimate caller
+            // error the muxer rejects — bail like any other Err below.
+            let mut pkt = Packet::new(local_index, TimeBase::new(1, 25), payload.clone());
+            pkt.pts = Some(theora_frame);
+            pkt.flags.keyframe = desc[2] & 0x40 != 0 || theora_frame == 0;
+            theora_frame += 1;
+            pkt
+        } else {
+            pts += (desc[2] & 0x7F) as i64 * 31;
+            let mut pkt = Packet::new(local_index, TimeBase::new(1, 48_000), payload.clone());
+            pkt.pts = Some(pts);
+            pkt.flags.keyframe = true;
+            pkt
+        };
         pkt.flags.unit_boundary = desc[0] & 0x80 != 0;
-        pkt.flags.keyframe = true;
         if mx.write_packet(&pkt).is_err() {
             return;
         }
@@ -221,6 +298,36 @@ fuzz_target!(|data: &[u8]| {
             got[slot], expected[slot],
             "stream {slot} payload sequence must round-trip"
         );
+    }
+
+    // Cross-stream page-order invariant (Theora spec §A.3.2 / the
+    // RFC 3533 interleave design): a single-link multiplex's data
+    // pages appear in non-decreasing granule-time order. (Chained
+    // files restart the clock per link, so the walk is skipped there.)
+    if !in_second_link {
+        let bytes = {
+            let guard = shared.0.lock().unwrap();
+            guard.get_ref().clone()
+        };
+        let mut off = 0usize;
+        let mut last_t = 0.0f64;
+        while off < bytes.len() {
+            let (page, used) =
+                oxideav_ogg::page::Page::parse(&bytes[off..]).expect("muxer output pages parse");
+            off += used;
+            if page.granule_position <= 0 {
+                continue; // header pages and no-packet-finishes pages
+            }
+            if let Some(t) = page_secs(&codecs, page.serial, page.granule_position) {
+                assert!(
+                    t >= last_t,
+                    "page (serial {} granule {}) at {t}s written after {last_t}s",
+                    page.serial,
+                    page.granule_position
+                );
+                last_t = t;
+            }
+        }
     }
 
     // Damage counters on our own output must all be zero.
