@@ -327,6 +327,8 @@ fn build_link_writers(
                     gran: id.granule(),
                     next_frame: 0,
                     last_kf: 0,
+                    frn: id.frn,
+                    frd: id.frd,
                 })
         } else {
             None
@@ -339,7 +341,10 @@ fn build_link_writers(
                 buffered: PageBuilder::new(),
                 headers_remaining,
                 bos_emitted: false,
-                pending_bytes: None,
+                queue: std::collections::VecDeque::new(),
+                newest_time: 0.0,
+                last_granule: 0,
+                time_base: s.time_base,
                 theora,
             },
         );
@@ -507,13 +512,21 @@ impl AutoIndexState {
     }
 }
 
-/// A finalized page held back by the EOS-deferral mechanism, plus the
-/// metadata the auto-indexer needs once the page's wire offset is known.
+/// A finalized page not yet on the wire, plus the metadata the
+/// auto-indexer needs once the page's wire offset is known and the
+/// presentation time driving the cross-stream release order.
 struct PendingPage {
     bytes: Vec<u8>,
     /// pts of the first keyframe-flagged packet that *starts* on this
     /// page, if any — the keypoint timestamp source.
     first_keyframe_pts: Option<i64>,
+    /// Presentation time (seconds) equivalent of the page's granule
+    /// position, monotone per stream (a `-1` "no packet finishes"
+    /// granule inherits the previous page's time). Multiplexed data
+    /// pages are released to the wire "in increasing order by the time
+    /// equivalents of their granule position fields" (Theora spec
+    /// §A.3.2; the RFC 3533 §4 interleave design).
+    time_secs: f64,
 }
 
 struct SkeletonWriter {
@@ -541,11 +554,27 @@ struct StreamWriter {
     buffered: PageBuilder,
     headers_remaining: usize,
     bos_emitted: bool,
-    /// The most recently finalized page, held back until either
-    /// another page is flushed (in which case it's written) or the trailer
-    /// runs (in which case it gets EOS set and its CRC patched). This makes
-    /// the EOS marker sit on a real data page instead of an empty trailing one.
-    pending_bytes: Option<PendingPage>,
+    /// Finalized pages not yet on the wire, oldest first. The newest
+    /// entry is held back until a newer one exists — so the trailer can
+    /// stamp EOS onto a real final page — while older entries are
+    /// released in cross-stream time order (see
+    /// [`OggMuxer::release_ready_pages`]). Header-section pages are
+    /// fully drained at the end of `write_header` (RFC 3533 / Theora
+    /// spec §A.3.2: all header pages MUST precede any data page).
+    queue: std::collections::VecDeque<PendingPage>,
+    /// Presentation time (seconds) of the newest finalized page —
+    /// monotone, and a lower bound on every future page of this stream
+    /// (granule positions only increase). Drives the release watermark.
+    newest_time: f64,
+    /// Granule of the most recent finalized page that carried one
+    /// (`>= 0`); a stream that ends with no data pages closes with a
+    /// nil EOS page carrying this value (RFC 3533 §4: "Eos pages may be
+    /// 'nil' pages ... simply a page header with position information
+    /// and the eos flag set").
+    last_granule: i64,
+    /// The stream's declared time base — converts a granule into the
+    /// release-order presentation time for non-Theora streams.
+    time_base: oxideav_core::TimeBase,
     /// Theora granule-position packer, present when the stream's
     /// extradata carried a parseable identification header. Turns
     /// per-packet `(frame index, keyframe flag)` into the split
@@ -555,6 +584,34 @@ struct StreamWriter {
     /// parseable ID header, which keep the historical
     /// pts-as-raw-granule behaviour.
     theora: Option<TheoraMuxState>,
+}
+
+impl StreamWriter {
+    /// Presentation-time (seconds) equivalent of a page granule, for
+    /// the cross-stream release ordering.
+    ///
+    /// * Theora: unpack the split granule to a frame count and divide
+    ///   by the ID header's FRN/FRD rate (the packed value is not a
+    ///   tick count, so the stream time base cannot convert it); a
+    ///   granule below the counting origin (the header pages' 0) maps
+    ///   to time zero.
+    /// * Everything else: the granule is a tick count in the stream's
+    ///   own time base (audio mappings: samples).
+    /// * The `-1` "no packet finishes on this page" sentinel inherits
+    ///   the newest known time — such a page must stay glued behind
+    ///   its predecessor regardless.
+    fn page_time(&self, granule: i64) -> f64 {
+        if granule < 0 {
+            return self.newest_time;
+        }
+        if let Some(th) = &self.theora {
+            return match th.gran.frame_count(granule) {
+                Some(count) => count as f64 * th.frd as f64 / th.frn as f64,
+                None => 0.0,
+            };
+        }
+        self.time_base.seconds_of(granule)
+    }
 }
 
 /// Per-stream Theora granule bookkeeping (spec §A.2.3).
@@ -569,6 +626,11 @@ struct TheoraMuxState {
     /// keyframe, so frame 0 is its own keyframe whether or not the
     /// caller flagged it.
     last_kf: i64,
+    /// FRN/FRD from the ID header — the packed granule's time axis for
+    /// the cross-stream release ordering (a Theora granule is not a
+    /// tick count, so the stream time base cannot convert it directly).
+    frn: u32,
+    frd: u32,
 }
 
 #[derive(Default)]
@@ -813,9 +875,9 @@ impl OggMuxer {
         Ok(())
     }
 
-    /// Finalize the buffered page for `stream_index`. The newly built page
-    /// becomes the writer's *pending* page; whatever was previously pending
-    /// gets written out to the underlying sink.
+    /// Finalize the buffered page for `stream_index` onto the stream's
+    /// release queue, then let [`Self::release_ready_pages`] move every
+    /// page whose cross-stream ordering is settled onto the wire.
     fn flush_page(&mut self, stream_index: u32, force: bool) -> Result<()> {
         let writer = self
             .per_stream
@@ -844,19 +906,114 @@ impl OggMuxer {
         writer.buffered.starts_continued = page.lacing.last().copied() == Some(255);
         writer.buffered.granule_position = -1;
         let first_keyframe_pts = writer.buffered.first_keyframe_pts.take();
-        let new_bytes = page.to_bytes();
 
-        // Write whatever was pending before, then queue the new bytes.
-        let prev = writer.pending_bytes.take();
-        if let Some(prev) = prev {
-            self.write_pending_page(stream_index, prev)?;
+        // Presentation-time equivalent of the page's granule, clamped
+        // monotone: a `-1` "no packet finishes here" page inherits the
+        // previous page's time (it must stay glued behind it anyway).
+        let time_secs = writer.page_time(page.granule_position);
+        writer.newest_time = writer.newest_time.max(time_secs);
+        if page.granule_position >= 0 {
+            writer.last_granule = page.granule_position;
         }
-        let writer = self.writer_for(stream_index)?;
-        writer.pending_bytes = Some(PendingPage {
-            bytes: new_bytes,
+        let time_secs = writer.newest_time;
+        writer.queue.push_back(PendingPage {
+            bytes: page.to_bytes(),
             first_keyframe_pts,
+            time_secs,
         });
-        Ok(())
+        self.release_ready_pages()
+    }
+
+    /// Write every queued page whose position in the multiplex is
+    /// settled.
+    ///
+    /// Two invariants govern a release:
+    ///
+    /// 1. **EOS deferral** — a stream's newest queued page stays queued
+    ///    until a newer one exists, so `write_trailer` /
+    ///    [`Self::begin_new_link`] can stamp the EOS flag onto a real
+    ///    final page.
+    /// 2. **Time order** — the Theora spec's multiplexed mapping
+    ///    (§A.3.2, mirroring RFC 3533 §4's interleave design) wants
+    ///    data pages "placed in the stream in increasing order by the
+    ///    time equivalents of their granule position fields". A page at
+    ///    time `t` is released only once every other started stream has
+    ///    finalized a page at time `>= t`: granules increase per
+    ///    stream, so nothing earlier than `t` can still arrive.
+    ///
+    /// Iteration follows `stream_order`, so equal-time candidates
+    /// release in the caller's stream order — deterministic output.
+    /// With a single content stream both conditions collapse to the
+    /// historical "hold exactly one page back" behaviour and the wire
+    /// bytes are unchanged.
+    fn release_ready_pages(&mut self) -> Result<()> {
+        loop {
+            let mut best: Option<(u32, f64)> = None;
+            for &idx in &self.stream_order {
+                let w = &self.per_stream[&idx];
+                if w.queue.len() > 1 {
+                    let t = w.queue.front().expect("len > 1").time_secs;
+                    if !best.is_some_and(|(_, bt)| bt <= t) {
+                        best = Some((idx, t));
+                    }
+                }
+            }
+            let Some((idx, t)) = best else {
+                return Ok(());
+            };
+            let settled = self.stream_order.iter().all(|&o| {
+                if o == idx {
+                    return true;
+                }
+                let w = &self.per_stream[&o];
+                // A stream that has not begun (no BOS yet) cannot hold
+                // pages and is not consulted; a started stream vouches
+                // for `t` once its newest finalized page reaches it.
+                !w.bos_emitted || w.newest_time >= t
+            });
+            if !settled {
+                return Ok(());
+            }
+            let page = self
+                .per_stream
+                .get_mut(&idx)
+                .expect("stream present")
+                .queue
+                .pop_front()
+                .expect("candidate had a queued page");
+            self.write_pending_page(idx, page)?;
+        }
+    }
+
+    /// Write out every queued page across all streams in global time
+    /// order (stable stream-order tie-break), ignoring the EOS-deferral
+    /// holdback. Used when a section boundary makes the layout final:
+    /// the end of the header section (all header pages MUST precede any
+    /// data page) and the trailer / chain-link finalization (after EOS
+    /// stamping).
+    fn drain_all_queued(&mut self) -> Result<()> {
+        loop {
+            let mut best: Option<(u32, f64)> = None;
+            for &idx in &self.stream_order {
+                let w = &self.per_stream[&idx];
+                if let Some(front) = w.queue.front() {
+                    if !best.is_some_and(|(_, bt)| bt <= front.time_secs) {
+                        best = Some((idx, front.time_secs));
+                    }
+                }
+            }
+            let Some((idx, _)) = best else {
+                return Ok(());
+            };
+            let page = self
+                .per_stream
+                .get_mut(&idx)
+                .expect("stream present")
+                .queue
+                .pop_front()
+                .expect("candidate had a queued page");
+            self.write_pending_page(idx, page)?;
+        }
     }
 
     /// Write a previously held-back page to the sink, recording its wire
@@ -1025,6 +1182,20 @@ impl Muxer for OggMuxer {
                 self.write_packet(&pkt)?;
             }
         }
+        // Step 2.5: drain every content stream's queued header page so
+        // ALL header pages physically precede any data page. RFC 3533's
+        // interleave design and the Theora spec's multiplexed mapping
+        // (§A.3.2: "After the 'beginning of stream' pages, the header
+        // pages of each of the logical streams MUST be grouped together
+        // before any data pages occur") both make this a hard boundary;
+        // without the drain the EOS-deferral holdback would keep each
+        // stream's last header page (e.g. the Vorbis setup page) queued
+        // until that stream's first data flush — by which time another
+        // stream's data pages may already be on the wire. The Skeleton
+        // encapsulation order (`docs/container/ogg/ogg-skeleton-4.0.md`
+        // §"Further restrictions") needs the same drain so the content
+        // secondary headers precede the Skeleton EOS page.
+        self.drain_all_queued()?;
         // Step 3: Skeleton secondary headers (fisbone packets + any
         // 4.0 index packets) followed by the Skeleton EOS page. The
         // EOS must precede any content data page (the spec requires
@@ -1032,27 +1203,6 @@ impl Muxer for OggMuxer {
         // other logical bitstreams appear"). Subsequent write_packet
         // calls supply those content data pages.
         if self.skeleton.is_some() {
-            // Step 2.5: drain every content stream's held-back page so
-            // all content secondary-header pages physically precede the
-            // Skeleton EOS page. `docs/container/ogg/ogg-skeleton-4.0.md`
-            // §"Further restrictions" orders the segment as "the
-            // secondary header pages of all logical bitstreams come
-            // next, including Skeleton's secondary header packets" and
-            // then "the Skeleton EOS page ends the control section of
-            // the Ogg stream before any content pages of any of the
-            // other logical bitstreams appear". Without this drain the
-            // EOS-deferral mechanism (pending_bytes) would hold the last
-            // header page of each content stream (e.g. the Vorbis setup
-            // page) and flush it only when the first content data page
-            // arrives — after the Skeleton EOS, inside the content
-            // section.
-            let order = self.stream_order.clone();
-            for idx in order {
-                let pending = self.writer_for(idx)?.pending_bytes.take();
-                if let Some(pending) = pending {
-                    self.write_pending_page(idx, pending)?;
-                }
-            }
             self.write_skeleton_fisbones_and_eos()?;
             // Everything in the control section is now on the wire, so
             // the current position is the offset of the first non-header
@@ -1226,7 +1376,7 @@ impl OggMuxer {
     fn finalize_current_link(&mut self) -> Result<()> {
         let order = self.stream_order.clone();
         for idx in order {
-            // Drain any in-progress builder into pending_bytes.
+            // Drain any in-progress builder onto the release queue.
             let needs_flush = {
                 let writer = self.writer_for(idx)?;
                 !writer.buffered.is_empty()
@@ -1234,22 +1384,45 @@ impl OggMuxer {
             if needs_flush {
                 self.flush_page(idx, true)?;
             }
-            // Whatever's in pending_bytes is the truly last page — set EOS,
-            // recompute its CRC, write it.
-            let pending = self.writer_for(idx)?.pending_bytes.take();
-            if let Some(mut pending) = pending {
-                let bytes = &mut pending.bytes;
+            let writer = self.writer_for(idx)?;
+            if let Some(last) = writer.queue.back_mut() {
+                // The newest queued page is the truly last page — set
+                // EOS, recompute its CRC (RFC 3533 §6 field 7).
+                let bytes = &mut last.bytes;
                 if bytes.len() >= 27 {
                     bytes[5] |= flags::LAST_PAGE;
-                    // Zero out checksum field, recompute, patch back.
                     bytes[22..26].fill(0);
                     let crc = crate::crc::checksum(bytes);
                     bytes[22..26].copy_from_slice(&crc.to_le_bytes());
                 }
-                self.write_pending_page(idx, pending)?;
+            } else if writer.bos_emitted {
+                // Every page of this stream is already on the wire (a
+                // stream whose last page was released by the header-
+                // section drain and that saw no data packets). RFC 3533
+                // §4: "Eos pages may be 'nil' pages, that is, pages
+                // containing no content but simply a page header with
+                // position information and the eos flag set" — close
+                // the stream with one, carrying the final granule.
+                let page = Page {
+                    flags: flags::LAST_PAGE,
+                    granule_position: writer.last_granule,
+                    serial: writer.serial,
+                    seq_no: writer.seq_no,
+                    lacing: Vec::new(),
+                    data: Vec::new(),
+                };
+                writer.seq_no = writer.seq_no.wrapping_add(1);
+                let time_secs = writer.newest_time;
+                writer.queue.push_back(PendingPage {
+                    bytes: page.to_bytes(),
+                    first_keyframe_pts: None,
+                    time_secs,
+                });
             }
         }
-        Ok(())
+        // Everything is final now — put the tail pages on the wire in
+        // global time order.
+        self.drain_all_queued()
     }
 
     /// Begin a new chain link (RFC 3533 §4 sequential multiplexing).
@@ -1362,6 +1535,9 @@ impl OggMuxer {
                 self.write_packet(&pkt)?;
             }
         }
+        // Same hard boundary as write_header step 2.5: the new link's
+        // header pages all precede its data pages.
+        self.drain_all_queued()?;
         Ok(())
     }
 

@@ -46,8 +46,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is enforced: the Theora identification page is emitted first even
   when the caller lists audio streams ahead of the video (output for
   Theora-less files is unchanged byte-for-byte)
+- `remux` and `merge` examples: rewrite any Ogg file through the
+  demux→mux pair, and multiplex several files' streams into one
+  grouped physical stream with time-ordered packet interleave
 
 ### Fixed
+
+- multiplexed (grouped) MUX output now honours two layout rules the
+  single-page EOS-deferral used to violate (found by black-box
+  validation of Theora+Vorbis/Opus files against `oggz-validate` and
+  an independent reference demuxer): every stream's header pages are
+  drained onto the wire before any data page ("the header pages of
+  each of the logical streams MUST be grouped together before any
+  data pages occur" — previously the last header page, e.g. the
+  Vorbis setup page, could land after another stream's data pages),
+  and data pages are released in increasing granule-time order across
+  streams via per-stream release queues with a cross-stream
+  watermark. Single-stream output is byte-identical to before. A
+  stream that ends with all pages already on the wire now closes with
+  an RFC 3533 §4 nil EOS page instead of losing its EOS marker
 
 - a content BOS page reusing the Skeleton bitstream's serial no longer
   registers a phantom public stream (a `streams()` entry that could
