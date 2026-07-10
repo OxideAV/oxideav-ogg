@@ -4,8 +4,9 @@
 //! default must be unchanged, and the resulting file must round-trip
 //! through the demuxer.
 //!
-//! The policy matters beyond politeness: black-box ffmpeg testing on
-//! the staged Vorbis fixtures showed that a stream whose first
+//! The policy matters beyond politeness: black-box testing of the
+//! staged Vorbis fixtures with an independent reference decoder
+//! showed that a stream whose first
 //! audio-bearing page is also its EOS page decodes short by
 //! `blocksize0 / 2` samples, while any ≥2-audio-page split decodes to
 //! the full declared length. A page target guarantees the split for
@@ -123,7 +124,7 @@ fn page_target_paginates_data_written_without_unit_boundaries() {
     assert!(grans.windows(2).all(|w| w[0] <= w[1]));
     assert_eq!(*grans.last().unwrap(), 512 * 100);
     // The EOS page is NOT the first audio-bearing page (the layout the
-    // ffmpeg black-box run flagged as lossy).
+    // black-box reference-decoder run flagged as lossy).
     assert!(pages.last().unwrap().is_last());
     assert!(
         data_pages.len() >= 2,

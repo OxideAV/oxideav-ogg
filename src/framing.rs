@@ -238,7 +238,8 @@ impl PageWriter {
     /// split). `4096` is a good general-purpose value.
     ///
     /// Beyond politeness, small pages measurably improve player
-    /// interop: black-box testing against ffmpeg showed that an
+    /// interop: black-box testing against an independent reference
+    /// decoder showed that an
     /// Ogg/Vorbis stream whose audio packets all sit on a *single*
     /// page (so the first audio-bearing page is also the EOS page)
     /// decodes short by `blocksize0 / 2` samples (128 samples across

@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `framing::PageWriter::with_page_target` / `set_page_target`
   flush a page once a packet completes at/past the target (RFC 3533
   "usually 4-8 kB" band); defaults unchanged. Motivated by black-box
-  ffmpeg testing: a stream whose first audio-bearing page is also
+  testing with an independent reference decoder: a stream whose
+  first audio-bearing page is also
   its EOS page decodes short by blocksize0/2 samples, while any
   ≥2-audio-page split recovers the full declared length
 

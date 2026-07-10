@@ -327,7 +327,8 @@ target (a `unit_boundary` flag still forces an immediate boundary; a
 packet that overshoots the target still lands whole).
 
 The policy is more than politeness. Black-box decoding of the staged
-Vorbis fixtures with ffmpeg showed that a stream whose audio packets
+Vorbis fixtures with an independent reference decoder showed that a
+stream whose audio packets
 all sit on a **single page** — the first audio-bearing page is also
 the EOS page — comes back short by `blocksize0 / 2` samples (128
 samples on twelve of fifteen single-stream fixtures), while the same

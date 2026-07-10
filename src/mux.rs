@@ -1312,7 +1312,8 @@ impl OggMuxer {
     /// which for a short stream can put *every* audio packet on a
     /// single page. Beyond RFC politeness, avoiding that layout
     /// measurably improves player interop: black-box testing against
-    /// ffmpeg showed an Ogg/Vorbis stream whose first audio-bearing
+    /// an independent reference decoder showed an Ogg/Vorbis stream
+    /// whose first audio-bearing
     /// page is also its EOS page decodes short by `blocksize0 / 2`
     /// samples (128 samples across twelve staged fixtures), while the
     /// same packets split over two or more audio pages decode to the
