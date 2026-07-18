@@ -5,8 +5,10 @@
 Pure-Rust **Ogg** container (RFC 3533) — page framing, CRC32
 checksumming, packet reassembly across page boundaries (including
 multi-page packets and 'nil' pages), the full §4 grouping + chaining
-topology, codec sniffing, metadata, and a muxer that emits compliant
-Ogg for Vorbis, Opus, Theora, FLAC and Speex. Zero C dependencies.
+topology, codec sniffing, metadata, a muxer that emits compliant Ogg
+for Vorbis, Opus, Theora, FLAC and Speex, and a whole-file
+conformance validator with a typed per-rule report. Zero C
+dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -1415,12 +1417,136 @@ already uses internally for its mandatory CRC check; the standalone
 helpers are convenient for stream-scanner tools that walk pages but
 do not need the segment table decoded into packets.
 
+### Whole-file conformance validation (`validate` module)
+
+`validate::validate(&[u8])` walks a complete physical bitstream and
+checks every normative RFC 3533 page-structure rule, returning a typed
+`ConformanceReport` instead of failing at the first problem:
+
+```rust,no_run
+use oxideav_ogg::validate::{validate, Rule};
+
+let bytes = std::fs::read("file.ogg")?;
+let report = validate(&bytes);
+if !report.is_clean() {
+    eprintln!("{report}"); // pages/streams/links summary + per-issue lines
+    for issue in report.of_rule(Rule::CrcMismatch) {
+        eprintln!("damaged page at byte {}", issue.byte_offset);
+    }
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The rule set (each `Issue` carries its `Rule`, `Severity`, byte
+offset, page ordinal, serial, and a detail string):
+
+- **§6 field checks** — `OggS` capture pattern with junk-span
+  coalescing (`CapturePattern`), `stream_structure_version` 0
+  (`Version`), page extent vs segment table (`Truncated`), CRC over
+  the zero-field header (`CrcMismatch`), granule-position semantics
+  (`SpuriousGranule` — a packetless page must carry `-1`;
+  `MissingGranule` — the converse, a warning; `GranuleRegression` —
+  per-stream monotonicity), and sequence-number continuity
+  (`SequenceGap` / `SequenceRegression` / the nonzero-start warning
+  `SequenceStart`).
+- **§4 structure checks** — `MissingBos`, `DuplicateBos`,
+  `SerialReuse` (serials are unique across grouping *and* chaining),
+  `BosNotContiguous` (grouped BOS pages must precede any data page),
+  `PageAfterEos`, `MissingEos`; chain links are recognised (all
+  bitstreams closed → the next BOS opens a new link) and counted in
+  `report.links`.
+- **§5 / §6 field 3** — `ContinuedBos`, `ContinuedWithoutPartial`,
+  `PartialNotContinued`, `EosMidPacket` (an EOS page ending on a 255
+  lacing leaves a packet open forever).
+
+The walk is damage-tolerant in the demuxer's spirit: junk and
+CRC-failed spans produce one precise issue each and the walk rescans
+to the next checksum-valid page, re-baselining the damaged bitstream
+for exactly one page so a single flipped bit never cascades into
+sequence/continuity noise. Memory is bounded on hostile input
+(`MAX_ISSUES` retention cap with a `suppressed_issues` tally; no page
+body is copied), and the function never panics on arbitrary bytes
+(fuzz target 10 below holds it to that).
+
+The validator is also the muxer's CI gate: `tests/conformance_validator.rs`
+runs it over every muxer configuration — all five codec mappings, nil
+and oversize packets, the soft page-size target, grouped
+Theora+Vorbis, three-link chains, mixed grouping+chaining, Skeleton
+3.0/4.0 with and without muxer-built keyframe indexes — and requires
+zero issues, while surgically damaged copies must trip the exact rule
+the damage violates.
+
+### Damage-event ledger
+
+The aggregate counters above say *how much* damage a file had;
+`OggDemuxer::damage_events()` says *what happened, where*. It returns
+the first `MAX_DAMAGE_EVENTS` (64) events observed on the linear
+demux path, each a `DamageEvent` carrying its `DamageKind` plus
+whatever position information the observing site had:
+
+- `Hole` / `FramingError` / `DuplicateSerial` — serial and page
+  sequence number of the page the damage was observed on (no byte
+  offset: these are page-model events, seen after the page left the
+  byte stream);
+- `Resync` — the byte offset, serial, and sequence number of the page
+  the reader *landed on* after skipping unusable bytes;
+- `TruncatedTail` — the byte offset of the incomplete final page.
+
+Retention is capped so hostile inputs cannot grow memory;
+`damage_event_total()` keeps counting past the cap. The
+`build_seek_index` full-file scan never appends (it re-walks pages
+the linear path also visits and would double-report).
+
+Two tolerance behaviours land with the ledger:
+
+- **Truncated tail** — a file that ends *inside* a page (a partial
+  transfer) delivers every complete page and then ends as a normal
+  EOF with a `TruncatedTail` entry, instead of surfacing an
+  I/O-shaped error from `next_packet`.
+- **Version flip** — a page whose `stream_structure_version` is not 0
+  (§6 field 2 specifies only version 0) is skipped through the §3
+  recapture path like any other unusable page, counting one resync,
+  instead of aborting the whole demux.
+
+### Deterministic hostile-input sweeps
+
+`tests/hostile_sweep.rs` is the reproducible CI-side complement to
+the fuzz harness: seeded and exhaustive-where-cheap mutation
+batteries that run on every build. Over a corpus of real muxer output
+plus hand-framed grouped and chained files it drives exhaustive
+truncation at every byte length, exhaustive single-byte corruption at
+every offset, surgical CRC-field damage on every page, a 7500-round
+seeded multi-mutation battery (byte flips, junk insertion with fake
+capture bytes, span deletion, span duplication; fixed xorshift64*
+seed) and a 6000-round header-section battery. Every mutated buffer
+must demux without panicking, terminate under an iteration cap, never
+deliver more payload bytes than the input holds, and keep the damage
+ledger within its cap — and must validate without panicking within
+`MAX_ISSUES`.
+
+### Black-box validator cross-checks
+
+`tests/blackbox_validators.rs` writes muxer outputs to temp files and
+hands them to two independent validator binaries as opaque CLIs (exit
+status and printed attributes only): `oggz-validate` must accept six
+layouts (single Vorbis and Opus, chained and Skeleton-4.0 variants of
+both), and `ffprobe` must identify the Opus stream's codec, sample
+rate and channel count with an empty error stream on the
+single-stream, chained, and Skeleton files. Opus is the mapping whose
+identification header alone suffices for a full probe; the Vorbis
+stand-in headers cannot serve there because a probe aborts the whole
+open when the synthetic setup packet fails codec init — a codec-layer
+matter, and the same files pass `oggz-validate` at the container
+level. Both tools are optional at runtime: absent binaries skip the
+check with a stderr note, so the in-tree `validate` module remains
+the always-on gate.
+
 ### Fuzzing
 
 A cargo-fuzz harness under `fuzz/` (no cross-decoder oracle — the
 clean-room wall holds at the spec and our own source; the oracles are
 panic-freedom plus this crate's own round-trip invariants) hammers
-nine surfaces with attacker bytes:
+ten surfaces with attacker bytes:
 
 - `page_parse` — `Page::parse` at every byte offset, plus the
   standalone `crc::validate_page_crc` / `read_page_checksum` /
@@ -1487,8 +1613,10 @@ nine surfaces with attacker bytes:
   second link via `begin_new_link`) go through the muxer and MUST
   demux byte-identical, in order, on the right public stream, with
   `hole_count` / `framing_error_count` / `resync_count` /
-  `duplicate_serial_count` all zero and `link_count` matching what
-  was written.
+  `duplicate_serial_count` all zero, an empty damage ledger, and
+  `link_count` matching what was written. Every fuzz-shaped muxer
+  output must additionally pass the whole-file `validate` module
+  with zero conformance issues.
 - `chain_graph` — whole physical-stream graphs: up to three chained
   links × two grouped streams whose serials come from a four-entry
   pool (so RFC 3533 §4 unique-serial violations occur constantly),
@@ -1508,6 +1636,12 @@ nine surfaces with attacker bytes:
   file. Storms `seek_to` / `seek_to_with_preroll` /
   `seek_to_keyframe` with `build_seek_index` interleaved, checking
   in-range packet delivery after every landing.
+- `validate` — the whole-file conformance validator on arbitrary
+  attacker bytes: the walk must return for any input, keep its issue
+  list within the `MAX_ISSUES` retention cap, never tally more junk
+  bytes than the input holds, produce identical counts on a second
+  walk of the same bytes (determinism), and render its report via
+  `Display` without panicking.
 
 Run from `fuzz/` with `cargo +nightly fuzz run <target>`; no target
 runs as part of the per-PR CI shim (the org reusable workflow does
