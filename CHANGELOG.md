@@ -59,6 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cap, never deliver more payload bytes than the input holds, keep
   the damage ledger within its cap — and validate without panicking
   within `MAX_ISSUES`
+- black-box validator cross-checks (`tests/blackbox_validators.rs`):
+  muxer outputs are written to temp files and fed to `oggz-validate`
+  and `ffprobe` as opaque CLIs. `oggz-validate` must accept six
+  layouts (single Vorbis and Opus, chained and Skeleton-4.0 variants
+  of both); `ffprobe` must identify the Opus stream's codec, rate and
+  channel count with an empty error stream on the single, chained,
+  and Skeleton files. Both tools are optional at runtime — absent
+  binaries skip the check with a stderr note so minimal CI images
+  still pass (the in-tree `validate` module is the always-on gate)
 
 ### Changed
 
