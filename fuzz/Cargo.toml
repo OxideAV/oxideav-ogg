@@ -163,3 +163,15 @@ name = "seek_hostile"
 path = "fuzz_targets/seek_hostile.rs"
 test = false
 doc = false
+
+# Target 10: whole-file conformance validator
+# (`oxideav_ogg::validate::validate`). The validator promises to never
+# panic on arbitrary bytes and to keep its memory bounded (MAX_ISSUES
+# retention cap); this target holds it to that, plus determinism (a
+# second walk over the same bytes must produce identical counts) and a
+# panic-free Display rendering of the report.
+[[bin]]
+name = "validate"
+path = "fuzz_targets/validate.rs"
+test = false
+doc = false

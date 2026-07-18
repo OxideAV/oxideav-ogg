@@ -68,6 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Skeleton files. Both tools are optional at runtime — absent
   binaries skip the check with a stderr note so minimal CI images
   still pass (the in-tree `validate` module is the always-on gate)
+- fuzz: new `validate` target (panic-freedom, `MAX_ISSUES` bound,
+  junk-tally sanity, determinism, and `Display` rendering of the
+  conformance report on arbitrary bytes — 8.3M executions clean on
+  the landing slice), and the `mux_roundtrip` target now gates every
+  fuzz-shaped muxer output through the whole-file validator and
+  requires an empty damage ledger on the demux side (1.2M executions
+  clean)
 
 ### Changed
 

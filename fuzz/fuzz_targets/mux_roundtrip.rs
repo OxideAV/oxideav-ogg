@@ -262,6 +262,16 @@ fuzz_target!(|data: &[u8]| {
         guard.get_ref().clone()
     };
 
+    // Whole-file conformance gate: every fuzz-shaped muxer output must
+    // pass the in-tree RFC 3533 validator with zero issues (the same
+    // gate `tests/conformance_validator.rs` applies to the fixed
+    // battery, here applied to the fuzz-explored configuration space).
+    let report = oxideav_ogg::validate::validate(&bytes);
+    assert!(
+        report.is_clean(),
+        "muxer output failed RFC 3533 conformance validation:\n{report}"
+    );
+
     // ---- demux side ----
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let mut dmx =
@@ -347,6 +357,11 @@ fuzz_target!(|data: &[u8]| {
         dmx.link_count(),
         expected_links,
         "link count must match what was written"
+    );
+    assert!(
+        dmx.damage_events().is_empty(),
+        "muxer output must leave the damage ledger empty: {:?}",
+        dmx.damage_events()
     );
     let _ = dmx.duration_micros();
 });
