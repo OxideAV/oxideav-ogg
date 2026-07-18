@@ -48,6 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sequence attribution for page-model events. Retention is capped so
   hostile inputs cannot grow memory; `damage_event_total()` keeps
   counting past the cap
+- deterministic hostile-input sweeps (`tests/hostile_sweep.rs`):
+  exhaustive truncation at every byte length, exhaustive single-byte
+  corruption at every offset, per-page CRC-field damage, a seeded
+  multi-mutation battery (7500 rounds of flips / junk insertion /
+  span deletion / span duplication from a fixed xorshift64* seed) and
+  a 6000-round header-section battery, over a corpus of real muxer
+  output plus hand-framed grouped and chained files. Every mutated
+  buffer must demux without panicking, terminate under an iteration
+  cap, never deliver more payload bytes than the input holds, keep
+  the damage ledger within its cap — and validate without panicking
+  within `MAX_ISSUES`
 
 ### Changed
 
