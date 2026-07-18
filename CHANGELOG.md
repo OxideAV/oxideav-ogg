@@ -7,24 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.8](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.7...v0.1.8) - 2026-07-10
-
-### Other
-
-- Theora mapping section + Skeleton-free seek and interleave notes
-- Theora streams + cross-stream page-order invariant in mux_roundtrip
-- cross-stream time-ordered page release + header-section drain
-- Theora granule-position packing + spec-conformant page layout
-- Theora streams driven by their own identification header
-- identification-header + granule-position container mapping module
-- bound the open()-time header-collection walk (8192-page budget)
-- refuse phantom stream registration on Skeleton-serial BOS collisions
-- four structure-aware targets — framing layer, mux round-trip, chain graphs, hostile seeks
-- neutralize interop-note wording to an unnamed independent reference decoder
-- opt-in soft page-size target (RFC 4-8 kB band) + ffmpeg interop note
-- compile-tested whole-file mux->demux round-trip example
-- buffer-level PageWriter/PacketAssembler layer + Page::try_to_bytes + xiph_lace helpers
-
 ### Added
 
 - `validate` module: whole-file RFC 3533 conformance validation.
@@ -46,6 +28,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flipped bit never cascades into sequence/continuity noise. Never
   panics on arbitrary bytes; memory is bounded (`MAX_ISSUES` cap
   with a suppressed-issue tally, no page-body copies)
+- muxer CI gate (`tests/conformance_validator.rs`): every muxer
+  configuration — all five codec mappings, nil and oversize packets,
+  the soft page-size target, grouped Theora+Vorbis, three-link
+  chains, mixed grouping+chaining, Skeleton 3.0/4.0 with and without
+  muxer-built keyframe indexes — must validate with zero conformance
+  issues, and surgically damaged copies must trip the exact rule the
+  damage violates (CRC, truncation plus missing-EOS, dropped-page
+  sequence gap)
+
+## [0.1.8](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.7...v0.1.8) - 2026-07-10
+
+### Other
+
+- Theora mapping section + Skeleton-free seek and interleave notes
+- Theora streams + cross-stream page-order invariant in mux_roundtrip
+- cross-stream time-ordered page release + header-section drain
+- Theora granule-position packing + spec-conformant page layout
+- Theora streams driven by their own identification header
+- identification-header + granule-position container mapping module
+- bound the open()-time header-collection walk (8192-page budget)
+- refuse phantom stream registration on Skeleton-serial BOS collisions
+- four structure-aware targets — framing layer, mux round-trip, chain graphs, hostile seeks
+- neutralize interop-note wording to an unnamed independent reference decoder
+- opt-in soft page-size target (RFC 4-8 kB band) + ffmpeg interop note
+- compile-tested whole-file mux->demux round-trip example
+- buffer-level PageWriter/PacketAssembler layer + Page::try_to_bytes + xiph_lace helpers
+
+### Added
+
 - `theora` module: the Theora-in-Ogg container mapping's
   identification-header parser/builder (`TheoraIdHeader`, spec §6.2
   byte layout — dimensions, frame rate, aspect ratio, `KFGSHIFT`,
