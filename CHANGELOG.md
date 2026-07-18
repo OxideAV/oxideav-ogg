@@ -36,6 +36,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   issues, and surgically damaged copies must trip the exact rule the
   damage violates (CRC, truncation plus missing-EOS, dropped-page
   sequence gap)
+- demuxer damage-event ledger: `OggDemuxer::damage_events()` returns
+  the first `MAX_DAMAGE_EVENTS` (64) damage events observed on the
+  linear demux path — the per-event companion of the aggregate
+  `hole_count` / `framing_error_count` / `resync_count` /
+  `duplicate_serial_count` counters. Each `DamageEvent` carries its
+  `DamageKind` (hole, framing-error, resync, duplicate-serial,
+  truncated-tail) plus whatever position information the observing
+  code path had: the landing-page byte offset for resyncs, the
+  incomplete page's offset for truncated tails, and serial/page-
+  sequence attribution for page-model events. Retention is capped so
+  hostile inputs cannot grow memory; `damage_event_total()` keeps
+  counting past the cap
+
+### Changed
+
+- a file that ends inside a page (partial transfer) now demuxes to a
+  clean EOF after delivering every complete page, with a
+  `TruncatedTail` ledger entry — previously the partial tail surfaced
+  as an error from `next_packet` (and a sub-27-byte trailing fragment
+  did so even when it was plain junk)
+- a page whose `stream_structure_version` is not 0 (RFC 3533 §6
+  field 2 specifies only version 0) is now skipped through the §3
+  recapture path like any other unusable page, counting one resync —
+  previously a single flipped version bit on a CRC-resealed page
+  aborted the whole demux
 
 ## [0.1.8](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.7...v0.1.8) - 2026-07-10
 

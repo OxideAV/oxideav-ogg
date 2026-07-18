@@ -22,6 +22,97 @@ use crate::theora::{TheoraGranule, TheoraIdHeader};
 /// header section (tens of pages), far below a whole-file walk.
 const HEADER_SECTION_MAX_PAGES: usize = 8192;
 
+/// Cap on the number of [`DamageEvent`]s the demuxer retains. A hostile
+/// or badly mangled file can manufacture damage indefinitely; past the
+/// cap the ledger keeps *counting* ([`OggDemuxer::damage_event_total`])
+/// without allocating, so memory stays bounded while the aggregate
+/// counters (`hole_count`, `framing_error_count`, `resync_count`,
+/// `duplicate_serial_count`) remain exact.
+pub const MAX_DAMAGE_EVENTS: usize = 64;
+
+/// The kind of damage a [`DamageEvent`] records.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DamageKind {
+    /// Page-loss hole: a non-BOS page whose `page_sequence_number` is
+    /// not exactly the previous page's plus one (RFC 3533 §6 field 6).
+    /// Any partial packet buffered from before the gap was dropped, not
+    /// spliced.
+    Hole,
+    /// `continued`-flag framing inconsistency (RFC 3533 §6 field 3,
+    /// header_type bit 0x01): an orphaned continuation tail, or an
+    /// abandoned partial head, within an otherwise sequence-consistent
+    /// page run. The orphaned bytes were dropped.
+    FramingError,
+    /// Recapture after a parsing error (RFC 3533 §3 / §6 field 1): the
+    /// reader skipped bytes that were not a checksum-valid page —
+    /// spliced junk, a CRC-damaged page, or a page with an unspecified
+    /// `stream_structure_version` — and resumed at the next page whose
+    /// checksum verifies.
+    Resync,
+    /// `bitstream_serial_number` collision (RFC 3533 §4: "Each grouped
+    /// logical bitstream MUST have a unique serial number within the
+    /// scope of the physical bitstream", stated identically for
+    /// chaining). The demuxer restarted the serial in place.
+    DuplicateSerial,
+    /// The input ends inside a page: a partially transferred file. The
+    /// complete pages before the cut were all delivered; the fragment
+    /// was dropped and demux ended as a normal EOF.
+    TruncatedTail,
+}
+
+impl std::fmt::Display for DamageKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DamageKind::Hole => "hole",
+            DamageKind::FramingError => "framing-error",
+            DamageKind::Resync => "resync",
+            DamageKind::DuplicateSerial => "duplicate-serial",
+            DamageKind::TruncatedTail => "truncated-tail",
+        })
+    }
+}
+
+/// One damage event observed while demuxing — the per-event companion
+/// of the aggregate `hole_count` / `framing_error_count` /
+/// `resync_count` / `duplicate_serial_count` counters. Retrieved via
+/// [`OggDemuxer::damage_events`].
+#[derive(Clone, Debug)]
+pub struct DamageEvent {
+    /// What happened.
+    pub kind: DamageKind,
+    /// Input byte offset associated with the event, when the observing
+    /// code path knows it: the offset of the page the reader *resumed*
+    /// at for [`DamageKind::Resync`], and the offset of the incomplete
+    /// page for [`DamageKind::TruncatedTail`]. `None` for events
+    /// detected at the page-model layer (holes, framing errors, serial
+    /// collisions), which the demuxer observes after the page left the
+    /// byte stream.
+    pub byte_offset: Option<u64>,
+    /// `bitstream_serial_number` of the logical bitstream concerned,
+    /// when the event is attributable to one.
+    pub serial: Option<u32>,
+    /// `page_sequence_number` of the page on which the damage was
+    /// observed (for [`DamageKind::Resync`], of the page resumed at).
+    pub page_seq: Option<u32>,
+}
+
+impl std::fmt::Display for DamageEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind)?;
+        if let Some(off) = self.byte_offset {
+            write!(f, " @ byte {off}")?;
+        }
+        if let Some(s) = self.serial {
+            write!(f, " (serial {s:#010x})")?;
+        }
+        if let Some(seq) = self.page_seq {
+            write!(f, " (page seq {seq})")?;
+        }
+        Ok(())
+    }
+}
+
 /// Open an Ogg bitstream.
 pub fn open(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     let mut state = OggDemuxer::new(input);
@@ -463,6 +554,18 @@ pub struct OggDemuxer {
     /// it now belongs to. Surfaced via
     /// [`OggDemuxer::duplicate_serial_count`].
     duplicate_serials: u64,
+    /// Per-event damage ledger: the first [`MAX_DAMAGE_EVENTS`] damage
+    /// events observed on the linear demux path (open + `next_packet`),
+    /// each with its kind and whatever position information the
+    /// observing code path had. The `build_seek_index` full-file scan
+    /// does NOT append here (it re-walks pages the linear path may also
+    /// visit and would double-report). Surfaced via
+    /// [`OggDemuxer::damage_events`].
+    damage_events: Vec<DamageEvent>,
+    /// Total damage events observed, including those past the
+    /// [`MAX_DAMAGE_EVENTS`] retention cap. Surfaced via
+    /// [`OggDemuxer::damage_event_total`].
+    damage_events_total: u64,
     /// Per-serial Opus **pre-skip** (`docs/audio/opus/rfc7845-ogg-opus.txt`
     /// §5.1 field 4: "the number of samples (at 48 kHz) to discard from the
     /// decoder output when starting playback, and also the number to
@@ -513,6 +616,8 @@ impl OggDemuxer {
             skeleton_segment_length_ok: None,
             preroll_seeks: 0,
             duplicate_serials: 0,
+            damage_events: Vec::new(),
+            damage_events_total: 0,
             opus_pre_skip: HashMap::new(),
             theora_granule: HashMap::new(),
         }
@@ -916,6 +1021,57 @@ impl OggDemuxer {
     /// which the Ogg spec forbids" without losing the demux.
     pub fn duplicate_serial_count(&self) -> u64 {
         self.duplicate_serials
+    }
+
+    /// Per-event damage ledger: the first [`MAX_DAMAGE_EVENTS`] damage
+    /// events observed on the linear demux path, in observation order.
+    ///
+    /// Where the aggregate counters ([`hole_count`](Self::hole_count),
+    /// [`framing_error_count`](Self::framing_error_count),
+    /// [`resync_count`](Self::resync_count),
+    /// [`duplicate_serial_count`](Self::duplicate_serial_count)) answer
+    /// "how much damage", the ledger answers "what happened, where":
+    /// each entry carries its [`DamageKind`] plus the byte offset,
+    /// serial, and page sequence number the observing code path had
+    /// available. Two event kinds have no aggregate counter at all and
+    /// are only visible here: [`DamageKind::TruncatedTail`] (the input
+    /// ended inside a page and the fragment was dropped) — and the
+    /// resync ledger entry records the *landing* page for every
+    /// [`DamageKind::Resync`], which the bare counter cannot express.
+    ///
+    /// Retention is capped at [`MAX_DAMAGE_EVENTS`] so hostile inputs
+    /// cannot grow memory; [`damage_event_total`](Self::damage_event_total)
+    /// keeps counting past the cap. The `build_seek_index` full-file
+    /// scan does not append events (it re-walks pages the linear path
+    /// also visits and would double-report); its findings surface
+    /// through the aggregate counters it already owns.
+    pub fn damage_events(&self) -> &[DamageEvent] {
+        &self.damage_events
+    }
+
+    /// Total damage events observed on the linear demux path, including
+    /// events past the [`MAX_DAMAGE_EVENTS`] retention cap. Equal to
+    /// `damage_events().len() as u64` until the cap is hit.
+    pub fn damage_event_total(&self) -> u64 {
+        self.damage_events_total
+    }
+
+    /// Append one event to the damage ledger (bounded retention).
+    fn push_damage(
+        &mut self,
+        kind: DamageKind,
+        byte_offset: Option<u64>,
+        serial: Option<u32>,
+        page_seq: Option<u32>,
+    ) {
+        record_damage(
+            &mut self.damage_events,
+            &mut self.damage_events_total,
+            kind,
+            byte_offset,
+            serial,
+            page_seq,
+        );
     }
 
     /// Number of distinct chained links the demuxer has observed so far
@@ -2033,6 +2189,12 @@ impl OggDemuxer {
         // which walker observed the duplicate.
         if !self.seek_index_built {
             self.duplicate_serials += 1;
+            self.push_damage(
+                DamageKind::DuplicateSerial,
+                None,
+                Some(serial),
+                Some(bos_page.seq_no),
+            );
         }
         let state = self
             .state_by_serial
@@ -2242,10 +2404,27 @@ impl OggDemuxer {
     fn read_page(&mut self) -> Result<Option<Page>> {
         // Read a page header (27 bytes), then enough to read the segment table
         // and data. We detect EOF by getting 0 bytes back from the very first
-        // read; partial-page data is treated as truncation.
+        // read. An input that ends *inside* the page — a partially
+        // transferred file — is a truncated tail, not an error: every
+        // complete page before the cut was already delivered, so the
+        // fragment is dropped, the event is recorded on the damage
+        // ledger ([`DamageKind::TruncatedTail`]), and demux ends as a
+        // normal EOF.
         let page_off = self.input.stream_position().unwrap_or(0);
         let mut hdr = [0u8; 27];
-        if !read_exact_or_eof(&mut self.input, &mut hdr)? {
+        let got = read_all(&mut self.input, &mut hdr)?;
+        if got == 0 {
+            return Ok(None);
+        }
+        if got < hdr.len() {
+            // Fewer than a header's worth of bytes remain. When they
+            // start like a page, the file was cut mid-header; otherwise
+            // it is trailing junk (same silent outcome as a failed
+            // resync scan over a longer junk tail).
+            let looks_like_page = hdr[..got.min(4)] == page::CAPTURE_PATTERN[..got.min(4)];
+            if looks_like_page {
+                self.push_damage(DamageKind::TruncatedTail, Some(page_off), None, None);
+            }
             return Ok(None);
         }
         if hdr[0..4] != page::CAPTURE_PATTERN {
@@ -2258,12 +2437,34 @@ impl OggDemuxer {
             self.input.seek(SeekFrom::Start(page_off))?;
             return self.resync_to_next_page();
         }
+        let claimed_serial = u32::from_le_bytes(hdr[14..18].try_into().expect("4 bytes"));
+        let claimed_seq = u32::from_le_bytes(hdr[18..22].try_into().expect("4 bytes"));
         let n_segs = hdr[26] as usize;
         let mut lacing = vec![0u8; n_segs];
-        self.input.read_exact(&mut lacing)?;
+        let got = read_all(&mut self.input, &mut lacing)?;
+        if got < n_segs {
+            // Input ends inside the segment table: truncated tail.
+            self.push_damage(
+                DamageKind::TruncatedTail,
+                Some(page_off),
+                Some(claimed_serial),
+                Some(claimed_seq),
+            );
+            return Ok(None);
+        }
         let data_len: usize = lacing.iter().map(|&v| v as usize).sum();
         let mut data = vec![0u8; data_len];
-        self.input.read_exact(&mut data)?;
+        let got = read_all(&mut self.input, &mut data)?;
+        if got < data_len {
+            // Input ends inside the page body: truncated tail.
+            self.push_damage(
+                DamageKind::TruncatedTail,
+                Some(page_off),
+                Some(claimed_serial),
+                Some(claimed_seq),
+            );
+            return Ok(None);
+        }
 
         // Re-parse from the assembled bytes so CRC validation logic is shared.
         let mut full = Vec::with_capacity(27 + n_segs + data_len);
@@ -2280,20 +2481,32 @@ impl OggDemuxer {
                 self.index_record(page.serial, page.granule_position, page_off);
                 Ok(Some(page))
             }
-            Err(Error::InvalidData(_)) => {
-                // The `OggS` magic matched but the checksum did not — the page
-                // header or body is corrupt (RFC 3533 §6 field 1: "the decoder
-                // verifies page sync and integrity by computing and comparing
-                // the checksum"). A false-positive capture pattern inside an
-                // earlier page's payload reaches here too. Recapture: rewind
-                // PAST this `OggS` (one byte forward, so the scanner doesn't
-                // re-lock onto the same bad capture) and search for the next
-                // page whose checksum validates.
+            Err(Error::InvalidData(_)) | Err(Error::Unsupported(_)) => {
+                // The `OggS` magic matched but the page is unusable:
+                //
+                //  * `InvalidData` — the checksum did not match; the page
+                //    header or body is corrupt (RFC 3533 §6 field 1: "the
+                //    decoder verifies page sync and integrity by computing
+                //    and comparing the checksum"). A false-positive capture
+                //    pattern inside an earlier page's payload reaches here
+                //    too.
+                //  * `Unsupported` — the `stream_structure_version` byte is
+                //    not 0, the only version RFC 3533 §6 field 2 specifies.
+                //    A single flipped version bit would otherwise abort the
+                //    whole demux even though every other page is intact, so
+                //    it is treated exactly like the corruption it almost
+                //    certainly is.
+                //
+                // Recapture either way: rewind PAST this `OggS` (one byte
+                // forward, so the scanner doesn't re-lock onto the same bad
+                // capture) and search for the next page whose checksum
+                // validates. The recovery lands on the resync counter and
+                // the damage ledger.
                 self.input.seek(SeekFrom::Start(page_off + 1))?;
                 self.resync_to_next_page()
             }
-            // A version or other structural error from a capture-pattern-bearing
-            // header is genuine corruption we don't try to paper over here;
+            // Any other error from a capture-pattern-bearing header is
+            // genuine corruption we don't try to paper over here;
             // propagate it.
             Err(e) => Err(e),
         }
@@ -2340,6 +2553,12 @@ impl OggDemuxer {
                         // `try_parse_page_at` left the input positioned just
                         // past the page. Count the recovery and return it.
                         self.resyncs += 1;
+                        self.push_damage(
+                            DamageKind::Resync,
+                            Some(candidate_off),
+                            Some(page.serial),
+                            Some(page.seq_no),
+                        );
                         self.index_record(page.serial, page.granule_position, candidate_off);
                         return Ok(Some(page));
                     }
@@ -2705,6 +2924,14 @@ impl OggDemuxer {
             );
         if hole {
             self.holes += 1;
+            record_damage(
+                &mut self.damage_events,
+                &mut self.damage_events_total,
+                DamageKind::Hole,
+                None,
+                Some(page.serial),
+                Some(page.seq_no),
+            );
             self.skeleton_pending.clear();
         }
         let was_continued = page.is_continued();
@@ -2845,6 +3072,12 @@ impl OggDemuxer {
                 // Same walker convention as `restart_serial_on_duplicate_bos`:
                 // the `build_seek_index` scan owns the tally once it has run.
                 self.duplicate_serials += 1;
+                self.push_damage(
+                    DamageKind::DuplicateSerial,
+                    None,
+                    Some(page.serial),
+                    Some(page.seq_no),
+                );
             }
         } else if !page.is_first() {
             self.seen_nonbos_in_current_link = true;
@@ -2906,6 +3139,14 @@ impl OggDemuxer {
             };
         if hole {
             self.holes += 1;
+            record_damage(
+                &mut self.damage_events,
+                &mut self.damage_events_total,
+                DamageKind::Hole,
+                None,
+                Some(page.serial),
+                Some(page.seq_no),
+            );
             // Any packet bytes buffered from before the gap can never be
             // completed: the page(s) that carried the rest are gone. Drop
             // them so we don't splice unrelated halves into one packet.
@@ -2938,12 +3179,28 @@ impl OggDemuxer {
                 // reassembly loop below discards it via `pending_valid`;
                 // record the inconsistency here so it is visible.
                 self.framing_errors += 1;
+                record_damage(
+                    &mut self.damage_events,
+                    &mut self.damage_events_total,
+                    DamageKind::FramingError,
+                    None,
+                    Some(page.serial),
+                    Some(page.seq_no),
+                );
             } else if !was_continued && have_pending {
                 // Previous page ended on a 255-lacing segment (promising a
                 // continuation) but this page declares a fresh packet,
                 // abandoning the partial. The reassembly loop's fresh-packet
                 // branch drops the orphaned head defensively; count it.
                 self.framing_errors += 1;
+                record_damage(
+                    &mut self.damage_events,
+                    &mut self.damage_events_total,
+                    DamageKind::FramingError,
+                    None,
+                    Some(page.serial),
+                    Some(page.seq_no),
+                );
             }
         }
 
@@ -3888,6 +4145,47 @@ fn xiph_lace_size(mut n: usize) -> Vec<u8> {
     }
     v.push(n as u8);
     v
+}
+
+/// Append one event to a damage ledger with bounded retention — the
+/// free-function form of [`OggDemuxer::push_damage`], callable while a
+/// disjoint field of the demuxer (e.g. a `state_by_serial` entry) is
+/// mutably borrowed.
+fn record_damage(
+    events: &mut Vec<DamageEvent>,
+    total: &mut u64,
+    kind: DamageKind,
+    byte_offset: Option<u64>,
+    serial: Option<u32>,
+    page_seq: Option<u32>,
+) {
+    *total += 1;
+    if events.len() < MAX_DAMAGE_EVENTS {
+        events.push(DamageEvent {
+            kind,
+            byte_offset,
+            serial,
+            page_seq,
+        });
+    }
+}
+
+/// Read until `buf` is full or EOF, returning how many bytes landed.
+/// Unlike [`read_exact_or_eof`], a short count is not an error — the
+/// caller decides how to classify a partial page (truncated-tail
+/// tolerance in [`OggDemuxer::read_page`]). Interrupts are retried
+/// transparently.
+fn read_all(r: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(got)
 }
 
 fn read_exact_or_eof(r: &mut dyn Read, buf: &mut [u8]) -> Result<bool> {
