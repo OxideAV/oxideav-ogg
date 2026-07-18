@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.8...v0.1.9) - 2026-07-18
+
+### Other
+
+- shell-scriptable RFC 3533 conformance checker
+- conformance validator, damage ledger, hostile sweeps, black-box checks
+- validate target + conformance/ledger gates in mux_roundtrip
+- black-box cross-checks against oggz-validate and ffprobe CLIs
+- deterministic hostile-input sweeps over demuxer + validator
+- per-event damage ledger + truncated-tail and version-flip tolerance
+- muxer conformance CI gate over the whole configuration space
+- whole-file RFC 3533 conformance validator with typed report
+
 ### Added
 
 - `validate` module: whole-file RFC 3533 conformance validation.
