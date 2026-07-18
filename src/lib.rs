@@ -104,6 +104,7 @@ pub mod mux;
 pub mod page;
 pub mod skeleton;
 pub mod theora;
+pub mod validate;
 
 use oxideav_core::ContainerRegistry;
 

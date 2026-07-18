@@ -27,6 +27,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `validate` module: whole-file RFC 3533 conformance validation.
+  `validate::validate(&[u8])` walks a complete physical bitstream and
+  returns a typed `ConformanceReport` — pages/streams/links/junk-byte
+  totals plus a capped per-issue list (`Rule`, `Severity`, byte
+  offset, page ordinal, serial, detail) covering the §6 field rules
+  (capture pattern, version 0, page extent vs segment table, CRC,
+  granule-position semantics including the -1 reservation and
+  per-stream monotonicity, sequence-number continuity) and the §4
+  bitstream-structure rules (BOS/EOS placement, grouped-BOS
+  contiguity, chain-link boundaries, serial uniqueness across
+  grouping and chaining, page-after-EOS, missing EOS), plus the
+  §5/§6-field-3 continued-flag/lacing agreement checks (continued
+  BOS, orphaned or abandoned continuations, EOS ending mid-packet).
+  Damage-tolerant: junk and CRC-failed spans produce one precise
+  issue each, the walk rescans to the next checksum-valid page, and
+  a damaged stream is re-baselined for exactly one page so a single
+  flipped bit never cascades into sequence/continuity noise. Never
+  panics on arbitrary bytes; memory is bounded (`MAX_ISSUES` cap
+  with a suppressed-issue tally, no page-body copies)
 - `theora` module: the Theora-in-Ogg container mapping's
   identification-header parser/builder (`TheoraIdHeader`, spec §6.2
   byte layout — dimensions, frame rate, aspect ratio, `KFGSHIFT`,
