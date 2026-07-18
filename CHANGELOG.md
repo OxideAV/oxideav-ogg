@@ -75,6 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fuzz-shaped muxer output through the whole-file validator and
   requires an empty damage ledger on the demux side (1.2M executions
   clean)
+- `validate` example: `cargo run --example validate -- file.ogg
+  [more.ogg ...]` prints each file's conformance report and exits
+  non-zero when any file carries an error-severity issue — a
+  shell-scriptable RFC 3533 checker on top of the `validate` module
 
 ### Changed
 
