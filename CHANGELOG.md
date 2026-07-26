@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- registry-first codec identification (core 0.1.33 payload-magic
+  resolution): the demuxer now routes every logical stream's BOS
+  packet through `CodecResolver::resolve_payload_magic` — codecs
+  declare their BOS-packet magic prefixes at registration
+  (`CodecInfo::payload_magic`) and the longest declared prefix wins,
+  taking precedence over the crate-local table even for magics both
+  know. `codec_id::detect` is demoted to the documented fallback for
+  magics no registered codec claims (unregistered codec crates,
+  registrations predating payload-magic declarations, resolver-free
+  callers). Canonical registry answers (`vorbis`, `opus`, …) engage
+  exactly the same downstream mapping intelligence (header-packet
+  budgets, granule time bases, Opus pre-skip, Theora granule packing)
+  as before
+- `demux::open_shared` / `demux::open_concrete_shared`: open with an
+  owned `Arc<dyn CodecResolver + Send + Sync>` the demuxer keeps for
+  its whole lifetime. The container-registry factory signature only
+  *lends* its resolver to `open`, so chained links discovered
+  mid-file (and `build_seek_index`'s pre-registration of every
+  link's BOS) would otherwise fall back to the built-in table; the
+  shared-resolver entry points keep those identifications
+  registry-first too
 - `validate` module: whole-file RFC 3533 conformance validation.
   `validate::validate(&[u8])` walks a complete physical bitstream and
   returns a typed `ConformanceReport` — pages/streams/links/junk-byte

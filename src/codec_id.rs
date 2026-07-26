@@ -4,10 +4,30 @@
 //! codec-specific identification header that begins with a recognisable
 //! signature. We use that to set [`CodecId`] in the demuxer's
 //! [`StreamInfo`] without depending on any per-codec crate.
+//!
+//! **This table is the demuxer's fallback, not its primary path.** The
+//! codec registry is the single source of truth for codec
+//! identification: codec crates declare their BOS-packet magic prefixes
+//! at registration
+//! ([`CodecInfo::payload_magic`](oxideav_core::CodecInfo::payload_magic)),
+//! and the demuxer resolves each logical stream's first packet through
+//! [`CodecResolver::resolve_payload_magic`](oxideav_core::CodecResolver::resolve_payload_magic)
+//! first (longest declared prefix wins). [`detect`] answers only when
+//! no supplied resolver claims the magic — covering streams whose codec
+//! crate isn't registered, registrations that predate payload-magic
+//! declarations, and resolver-free callers. See
+//! [`demux::open`](crate::demux::open) /
+//! [`demux::open_shared`](crate::demux::open_shared) for the full
+//! resolution order.
 
 use oxideav_core::CodecId;
 
 /// Identify the codec of a logical Ogg bitstream from its first packet.
+///
+/// Built-in fallback table for the Ogg family mappings; the registry
+/// path ([`CodecResolver::resolve_payload_magic`](oxideav_core::CodecResolver::resolve_payload_magic))
+/// takes precedence when the demuxer is given a resolver (see the
+/// module docs).
 pub fn detect(first_packet: &[u8]) -> CodecId {
     // Vorbis I, RFC 5215 §2.1: packet type 0x01, then "vorbis".
     if first_packet.len() >= 7 && first_packet[0] == 0x01 && &first_packet[1..7] == b"vorbis" {

@@ -3,8 +3,14 @@
 //! Implements the page layer (capture pattern, segment table, CRC32) and a
 //! packet-reassembly demuxer / packet-splitting muxer. Codec-specific parsing
 //! lives in dedicated crates (`oxideav-vorbis`, future `oxideav-opus`, …);
-//! this crate only sniffs the first packet of each logical bitstream to set
-//! `CodecParameters::codec_id` correctly so the registry can dispatch.
+//! this crate only identifies the codec of each logical bitstream from its
+//! first packet to set `CodecParameters::codec_id` so the registry can
+//! dispatch. Identification is registry-first: the [`demux`] entry points
+//! hand the BOS packet's leading bytes to
+//! [`CodecResolver::resolve_payload_magic`](oxideav_core::CodecResolver::resolve_payload_magic)
+//! (codecs declare their magic prefixes at registration; longest prefix
+//! wins), falling back to the built-in [`codec_id`] table for magics no
+//! registered codec claims.
 //!
 //! # Example: write an `.ogg` file, then read it back
 //!

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, SeekFrom};
+use std::sync::Arc;
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, Result, StreamInfo, TimeBase,
@@ -114,15 +115,17 @@ impl std::fmt::Display for DamageEvent {
 }
 
 /// Open an Ogg bitstream.
-pub fn open(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
-    let mut state = OggDemuxer::new(input);
-    state.read_bos_section()?;
-    state.read_until_headers_collected()?;
-    state.populate_extradata();
-    state.populate_metadata();
-    state.anchor_start_times_from_skeleton();
-    state.populate_duration();
-    Ok(Box::new(state))
+///
+/// `codecs` drives per-logical-stream codec identification: each BOS
+/// packet's leading bytes are handed to
+/// [`CodecResolver::resolve_payload_magic`], so codecs that declared
+/// their BOS-packet magic prefixes at registration are identified by
+/// the registry (longest matching prefix wins); the built-in
+/// [`codec_id::detect`] table remains as the fallback for magics no
+/// registered codec claims. See [`open_shared`] for the resolver
+/// lifetime caveat around chained links.
+pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(open_concrete(input, codecs)?))
 }
 
 /// Open an Ogg bitstream and pre-build the page-level seek index by
@@ -146,14 +149,49 @@ pub fn open_indexed(
 /// (rather than a boxed trait object). Useful for callers that want to
 /// invoke [`OggDemuxer::build_seek_index`] / [`OggDemuxer::seek_index_len`]
 /// on demand without going through trait downcasts.
-pub fn open_concrete(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<OggDemuxer> {
+pub fn open_concrete(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<OggDemuxer> {
     let mut state = OggDemuxer::new(input);
-    state.read_bos_section()?;
-    state.read_until_headers_collected()?;
-    state.populate_extradata();
-    state.populate_metadata();
-    state.anchor_start_times_from_skeleton();
-    state.populate_duration();
+    state.init(Some(codecs))?;
+    Ok(state)
+}
+
+/// Open an Ogg bitstream with a **shared** codec resolver the demuxer
+/// keeps for its whole lifetime.
+///
+/// The plain [`open`] entry point matches the
+/// [`ContainerRegistry`](oxideav_core::ContainerRegistry) factory
+/// signature (`fn(input, &dyn CodecResolver)`), whose resolver is only
+/// *borrowed* for the duration of the call — long enough to identify
+/// every logical stream in the file's initial (grouped) BOS section,
+/// but gone by the time a chained link's BOS page shows up mid-file
+/// during `next_packet`. Streams registered after `open` returns
+/// therefore fall back to the built-in [`codec_id::detect`] table on
+/// that path.
+///
+/// This variant stores the resolver handle inside the demuxer instead,
+/// so *every* identification — grouped streams at open, chained links
+/// discovered later, and BOS pages met by
+/// [`OggDemuxer::build_seek_index`]'s full-file scan — resolves through
+/// the registry first. Prefer it when you hold an owned registry handle
+/// and the input may be a chained physical bitstream.
+pub fn open_shared(
+    input: Box<dyn ReadSeek>,
+    codecs: Arc<dyn CodecResolver + Send + Sync>,
+) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(open_concrete_shared(input, codecs)?))
+}
+
+/// [`open_shared`], returning the concrete [`OggDemuxer`] type — the
+/// shared-resolver companion to [`open_concrete`].
+pub fn open_concrete_shared(
+    input: Box<dyn ReadSeek>,
+    codecs: Arc<dyn CodecResolver + Send + Sync>,
+) -> Result<OggDemuxer> {
+    let mut state = OggDemuxer::new(input);
+    state.resolver = Some(codecs);
+    // The held resolver covers every identification from here on; no
+    // additional open-time borrow to thread through.
+    state.init(None)?;
     Ok(state)
 }
 
@@ -586,6 +624,19 @@ pub struct OggDemuxer {
     /// per-packet frame-index pts, keyframe flags, duration, and
     /// Skeleton-free seeking for Theora streams.
     theora_granule: HashMap<u32, TheoraGranule>,
+    /// Shared codec resolver held for the demuxer's whole lifetime, set
+    /// by [`open_shared`] / [`open_concrete_shared`]. When present,
+    /// every logical-stream identification (including chained links
+    /// discovered mid-file and the synthetic BOS registrations of
+    /// [`OggDemuxer::build_seek_index`]) consults it via
+    /// [`CodecResolver::resolve_payload_magic`] before the built-in
+    /// [`codec_id::detect`] table. `None` when the demuxer was opened
+    /// through the borrowed-resolver entry points ([`open`] /
+    /// [`open_concrete`] / [`open_indexed`]) — those use the borrow for
+    /// open-time identification only (the registry factory signature
+    /// does not let the demuxer outlive the loan), so post-open
+    /// registrations fall back to the built-in table.
+    resolver: Option<Arc<dyn CodecResolver + Send + Sync>>,
 }
 
 impl OggDemuxer {
@@ -620,7 +671,66 @@ impl OggDemuxer {
             damage_events_total: 0,
             opus_pre_skip: HashMap::new(),
             theora_granule: HashMap::new(),
+            resolver: None,
         }
+    }
+
+    /// Shared `open` body: read the BOS section and the header pages,
+    /// then derive the container-level metadata. `codecs` is the
+    /// open-time borrowed resolver ([`open`] / [`open_concrete`]);
+    /// the shared-resolver entry points pass `None` and rely on the
+    /// [`OggDemuxer::resolver`] field instead (see
+    /// [`OggDemuxer::identify_codec`] for the resolution order).
+    fn init(&mut self, codecs: Option<&dyn CodecResolver>) -> Result<()> {
+        self.read_bos_section(codecs)?;
+        self.read_until_headers_collected(codecs)?;
+        self.populate_extradata();
+        self.populate_metadata();
+        self.anchor_start_times_from_skeleton();
+        self.populate_duration();
+        Ok(())
+    }
+
+    /// Identify the codec of a logical bitstream from its BOS packet's
+    /// leading bytes.
+    ///
+    /// Resolution order (the codec registry is the single source of
+    /// truth for codec identification whenever one is supplied; the
+    /// crate-local table is a fallback, not a peer):
+    ///
+    /// 1. the resolver borrowed for the duration of `open()`, via
+    ///    [`CodecResolver::resolve_payload_magic`] — codecs declare
+    ///    their BOS-packet magic prefixes at registration
+    ///    ([`CodecInfo::payload_magic`](oxideav_core::CodecInfo::payload_magic))
+    ///    and the longest matching prefix wins;
+    /// 2. the demuxer-held shared resolver, when the demuxer was opened
+    ///    through [`open_shared`] / [`open_concrete_shared`];
+    /// 3. the built-in [`codec_id::detect`] table — local knowledge of
+    ///    the Ogg family mappings (Vorbis / Opus / Theora / Speex /
+    ///    FLAC), kept for streams whose codec crate isn't registered or
+    ///    whose registration predates payload-magic declarations.
+    ///
+    /// Note the codec-mapping intelligence keyed off the *canonical* id
+    /// strings (header-packet budgets, granule time bases, Opus
+    /// pre-skip, Theora granule packing) applies equally to
+    /// registry-resolved ids: a registry that resolves `\x01vorbis` to
+    /// `vorbis` gets identical downstream treatment to the built-in
+    /// table. A registry claim that maps a magic to a *non*-canonical
+    /// id opts that stream out of the mapping specifics (header packets
+    /// are then delivered as data, the time base stays at the 1 µs
+    /// placeholder) — the registry's answer is honoured either way.
+    fn identify_codec(&self, open_resolver: Option<&dyn CodecResolver>, first: &[u8]) -> CodecId {
+        if let Some(r) = open_resolver {
+            if let Some(id) = r.resolve_payload_magic(first) {
+                return id;
+            }
+        }
+        if let Some(r) = self.resolver.as_deref() {
+            if let Some(id) = r.resolve_payload_magic(first) {
+                return id;
+            }
+        }
+        codec_id::detect(first)
     }
 
     /// Parsed Ogg Skeleton metadata bitstream, if the file's first BOS
@@ -846,8 +956,10 @@ impl OggDemuxer {
                             self.seen_nonbos_in_current_link = false;
                         }
                         // Best-effort: ignore registration failure (a malformed
-                        // BOS shouldn't abort the seek-index build).
-                        let _ = self.register_stream(&synth);
+                        // BOS shouldn't abort the seek-index build). The scan
+                        // runs after open, so identification goes through the
+                        // shared resolver (if any) and then the built-in table.
+                        let _ = self.register_stream(&synth, None);
                     }
                 } else {
                     self.seen_nonbos_in_current_link = true;
@@ -2158,7 +2270,12 @@ impl OggDemuxer {
     /// bitstreams' bytes together. The Skeleton bitstream's serial never
     /// collides through this path (it is recorded separately), so a `fishead`
     /// re-declaration is not treated here.
-    fn restart_serial_on_duplicate_bos(&mut self, bos_page: &Page, new_link_index: u32) -> bool {
+    fn restart_serial_on_duplicate_bos(
+        &mut self,
+        bos_page: &Page,
+        new_link_index: u32,
+        codecs: Option<&dyn CodecResolver>,
+    ) -> bool {
         let serial = bos_page.serial;
         if Some(serial) == self.skeleton_serial {
             return false;
@@ -2177,7 +2294,7 @@ impl OggDemuxer {
             .first()
             .map(|seg| {
                 let first = &bos_page.data[seg.data.clone()];
-                codec_id::header_packet_count_from_first(&codec_id::detect(first), first)
+                codec_id::header_packet_count_from_first(&self.identify_codec(codecs, first), first)
             })
             .unwrap_or(0);
         // The `build_seek_index` header scan, when it has run, is the
@@ -2215,7 +2332,7 @@ impl OggDemuxer {
     /// Read pages until we leave the Beginning-Of-Stream section, registering
     /// every logical bitstream we discover. The pages we read are queued so
     /// `next_packet` can drain them in order.
-    fn read_bos_section(&mut self) -> Result<()> {
+    fn read_bos_section(&mut self, codecs: Option<&dyn CodecResolver>) -> Result<()> {
         loop {
             let page = match self.read_page()? {
                 Some(p) => p,
@@ -2233,7 +2350,7 @@ impl OggDemuxer {
                 // `process_page` (the single drain authority) recognises the
                 // duplicate when it sees this serial's BOS for the second
                 // time and counts / restarts it there.
-                self.register_stream(&page)?;
+                self.register_stream(&page, codecs)?;
             }
             self.page_queue.push_back(page);
             if !is_bos {
@@ -2247,7 +2364,11 @@ impl OggDemuxer {
         Ok(())
     }
 
-    fn register_stream(&mut self, bos_page: &Page) -> Result<()> {
+    fn register_stream(
+        &mut self,
+        bos_page: &Page,
+        codecs: Option<&dyn CodecResolver>,
+    ) -> Result<()> {
         // The BOS page's first packet is the identification packet for the
         // codec. Identification packets must fit in a single BOS page (RFC
         // 5334 / codec mapping conventions).
@@ -2316,7 +2437,7 @@ impl OggDemuxer {
             self.skeleton_last_seq = Some(bos_page.seq_no);
             return Ok(());
         }
-        let codec_id = codec_id::detect(first);
+        let codec_id = self.identify_codec(codecs, first);
         let public_index = self.streams.len();
         let mut params = guess_params(&codec_id, first)?;
         params.extradata = first.to_vec();
@@ -2631,7 +2752,7 @@ impl OggDemuxer {
     /// there. Conforming files are unaffected — a real header section is
     /// tens of pages at most (the Skeleton EOS must precede any content
     /// data page per `ogg-skeleton-{3,4}.0.md`).
-    fn read_until_headers_collected(&mut self) -> Result<()> {
+    fn read_until_headers_collected(&mut self, codecs: Option<&dyn CodecResolver>) -> Result<()> {
         let mut pages_consumed = 0usize;
         loop {
             let any_pending = self
@@ -2666,7 +2787,7 @@ impl OggDemuxer {
                 }
             };
             pages_consumed += 1;
-            self.process_page(page)?;
+            self.process_page(page, codecs)?;
         }
     }
 
@@ -2898,7 +3019,11 @@ impl OggDemuxer {
                     }
                 },
             };
-            self.process_page(page)?;
+            // Post-open path: the open-time borrowed resolver is gone;
+            // `identify_codec` still consults the demuxer-held shared
+            // resolver (when opened via `open_shared`) before the
+            // built-in table.
+            self.process_page(page, None)?;
         }
     }
 
@@ -2988,7 +3113,7 @@ impl OggDemuxer {
         }
     }
 
-    fn process_page(&mut self, page: Page) -> Result<()> {
+    fn process_page(&mut self, page: Page, codecs: Option<&dyn CodecResolver>) -> Result<()> {
         // RFC 3533 §4 + Vorbis I §A.2: chained Ogg streams concatenate
         // independent logical bitstreams back-to-back, each with its own
         // BOS page. A BOS page that arrives AFTER any non-BOS page in the
@@ -3034,9 +3159,9 @@ impl OggDemuxer {
                 self.seen_nonbos_in_current_link = false;
             }
             if !known {
-                self.register_stream(&page)?;
+                self.register_stream(&page, codecs)?;
             } else if is_duplicate {
-                self.restart_serial_on_duplicate_bos(&page, self.next_link_index);
+                self.restart_serial_on_duplicate_bos(&page, self.next_link_index, codecs);
             }
             // Mark this serial's BOS as processed so a later BOS for the same
             // serial is recognised as the duplicate it is. (After a restart,
@@ -3066,7 +3191,7 @@ impl OggDemuxer {
                 .unwrap_or(false);
             if first_is_fishead {
                 if !self.state_by_serial.contains_key(&page.serial) {
-                    self.register_stream(&page)?;
+                    self.register_stream(&page, codecs)?;
                 }
             } else if !self.seek_index_built {
                 // Same walker convention as `restart_serial_on_duplicate_bos`:

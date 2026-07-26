@@ -5,9 +5,9 @@
 Pure-Rust **Ogg** container (RFC 3533) — page framing, CRC32
 checksumming, packet reassembly across page boundaries (including
 multi-page packets and 'nil' pages), the full §4 grouping + chaining
-topology, codec sniffing, metadata, a muxer that emits compliant Ogg
-for Vorbis, Opus, Theora, FLAC and Speex, and a whole-file
-conformance validator with a typed per-rule report. Zero C
+topology, registry-first codec identification, metadata, a muxer that
+emits compliant Ogg for Vorbis, Opus, Theora, FLAC and Speex, and a
+whole-file conformance validator with a typed per-rule report. Zero C
 dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
@@ -63,11 +63,19 @@ loop {
 
 ### Codec detection
 
-On BOS (beginning-of-stream) the demuxer inspects the first packet of
-each logical bitstream and assigns a `CodecId`:
+On BOS (beginning-of-stream) the demuxer identifies the codec of each
+logical bitstream from its first packet, **registry-first**: the
+`&dyn CodecResolver` handed to `demux::open` is consulted through
+`CodecResolver::resolve_payload_magic`, so codecs that declared their
+BOS-packet magic prefixes at registration (`CodecInfo::payload_magic`)
+are resolved by the registry — the longest declared prefix wins, and
+the registry's answer is honoured even when the built-in table also
+knows the magic. The built-in table remains as the fallback for magics
+no registered codec claims (streams whose codec crate isn't loaded, or
+registrations that predate payload-magic declarations):
 
-| first-packet signature                | `CodecId`  |
-|---------------------------------------|------------|
+| first-packet signature                | fallback `CodecId` |
+|---------------------------------------|--------------------|
 | `0x01` + `"vorbis"`                   | `vorbis`   |
 | `"OpusHead"`                          | `opus`     |
 | `0x7F` + `"FLAC"`                     | `flac`     |
@@ -76,6 +84,15 @@ each logical bitstream and assigns a `CodecId`:
 
 All other streams are reported as `CodecId::new("unknown")` so the
 registry can still walk them; decode will fail for unregistered codecs.
+
+One caveat comes from the container-registry factory signature, which
+only *lends* the resolver to `open`: a **chained** link whose BOS page
+is discovered mid-file (after `open` returned) can no longer reach the
+borrowed resolver and is identified by the fallback table on that
+path. `demux::open_shared` / `demux::open_concrete_shared` accept an
+owned `Arc<dyn CodecResolver + Send + Sync>` instead and keep it for
+the demuxer's whole lifetime, so late chained links and the
+`build_seek_index` full-file scan resolve registry-first too.
 
 For Vorbis, Opus, **Speex** and **FLAC** the demuxer parses the
 identification header during `open` to populate the stream's
