@@ -12,8 +12,16 @@
 //!
 //! Surfaces exercised:
 //!
-//! * `open_concrete` — same BOS-section walk + codec sniffing
+//! * `open_concrete` — same BOS-section walk + codec identification
 //!   as `open`, but yielding the concrete type.
+//! * `open_concrete_shared` — the shared-resolver entry point: on
+//!   odd-first-byte inputs the demuxer holds a `CodecRegistry`
+//!   carrying the Ogg family payload-magic claims *plus* hostile
+//!   overlapping / lookalike claims (`OggS`, `fishead\0`, a
+//!   single-byte prefix), so every BOS identification — including
+//!   the chained-link registrations inside `build_seek_index` —
+//!   routes attacker bytes through
+//!   `CodecResolver::resolve_payload_magic` longest-prefix matching.
 //! * `build_seek_index` — full-file `OggS` byte scanner +
 //!   header-only page parsing with payload-skipping seeks, plus
 //!   chained-link discovery (RFC 3533 §4) on mid-file BOS pages.
@@ -32,25 +40,69 @@
 //! does not treat partial state as a failure.
 
 use std::io::Cursor;
+use std::sync::{Arc, OnceLock};
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_core::{Demuxer as _, NullCodecResolver, ReadSeek};
+use oxideav_core::{
+    CodecId, CodecInfo, CodecRegistry, CodecResolver, Demuxer as _, NullCodecResolver, ReadSeek,
+};
 use oxideav_ogg::demux;
 
 /// Cap per-input seek attempts so a pathological bisection that
 /// loops the byte scanner stays inside the fuzz iteration budget.
 const MAX_SEEKS_PER_STREAM: usize = 8;
 
+/// Shared registry of payload-magic claims: the Ogg family's canonical
+/// magics plus deliberately hostile ones — a claim on the page capture
+/// pattern itself (`OggS`, which can only match if a BOS packet
+/// *starts* with it), a claim on the Skeleton `fishead\0` ident (which
+/// must never shadow the container-level Skeleton path), and a
+/// single-byte prefix overlapping `OpusHead` (longest-prefix
+/// tie-breaking under fire).
+fn claiming_registry() -> Arc<dyn CodecResolver + Send + Sync> {
+    static REG: OnceLock<Arc<CodecRegistry>> = OnceLock::new();
+    REG.get_or_init(|| {
+        let mut reg = CodecRegistry::new();
+        let claims: [(&[u8], &str); 8] = [
+            (b"\x01vorbis", "vorbis"),
+            (b"OpusHead", "opus"),
+            (b"\x80theora", "theora"),
+            (b"Speex   ", "speex"),
+            (b"\x7FFLAC", "flac"),
+            (b"OggS", "oggs-lookalike"),
+            (b"fishead\x00", "skeleton-imposter"),
+            (b"O", "single-byte"),
+        ];
+        for (magic, id) in claims {
+            reg.register(CodecInfo::new(CodecId::new(id)).payload_magic(magic));
+        }
+        Arc::new(reg)
+    })
+    .clone()
+}
+
 fuzz_target!(|data: &[u8]| {
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(data.to_vec()));
-    let resolver = NullCodecResolver;
-    let mut dmx = match demux::open_concrete(reader, &resolver) {
-        Ok(d) => d,
-        Err(_) => return,
+    // Odd first byte → registry-first identification through the
+    // shared resolver; even / empty → the historical built-in-table
+    // path via NullCodecResolver. Both must be panic-free.
+    let use_registry = data.first().is_some_and(|b| b & 1 == 1);
+    let mut dmx = if use_registry {
+        match demux::open_concrete_shared(reader, claiming_registry()) {
+            Ok(d) => d,
+            Err(_) => return,
+        }
+    } else {
+        match demux::open_concrete(reader, &NullCodecResolver) {
+            Ok(d) => d,
+            Err(_) => return,
+        }
     };
 
     // build_seek_index must return Ok or Err but not panic. A partial
-    // index (per the API's own contract on IO errors) is fine.
+    // index (per the API's own contract on IO errors) is fine. On the
+    // shared-resolver path its chained-link BOS registrations resolve
+    // through the registry.
     let _ = dmx.build_seek_index();
 
     // Snapshot the stream metadata before mutating the demuxer. The
