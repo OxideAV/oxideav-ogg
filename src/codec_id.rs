@@ -3,7 +3,8 @@
 //! Ogg is codec-agnostic: the first packet of every logical stream is a
 //! codec-specific identification header that begins with a recognisable
 //! signature. We use that to set [`CodecId`] in the demuxer's
-//! [`StreamInfo`] without depending on any per-codec crate.
+//! [`StreamInfo`](oxideav_core::StreamInfo) without depending on any
+//! per-codec crate.
 //!
 //! **This table is the demuxer's fallback, not its primary path.** The
 //! codec registry is the single source of truth for codec

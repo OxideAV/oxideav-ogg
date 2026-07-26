@@ -131,7 +131,7 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// uniform `register(&mut RuntimeContext)` entry point every sibling
 /// crate exposes.
 ///
-/// Also wired into [`oxideav_meta::register_all`] via the
+/// Also wired into `oxideav_meta::register_all` via the
 /// [`oxideav_core::register!`] macro below.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_containers(&mut ctx.containers);

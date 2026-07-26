@@ -435,8 +435,10 @@ struct LogicalStream {
 
 /// Concrete Ogg demuxer state. Most callers should use the boxed
 /// [`Demuxer`] returned by [`open`] / [`open_indexed`]; this type is
-/// public so consumers who want the inherent [`build_seek_index`] /
-/// [`seek_index_len`] API can hold it directly.
+/// public so consumers who want the inherent
+/// [`build_seek_index`](OggDemuxer::build_seek_index) /
+/// [`seek_index_len`](OggDemuxer::seek_index_len) API can hold it
+/// directly.
 pub struct OggDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
@@ -809,7 +811,8 @@ impl OggDemuxer {
     /// skipped over with a single relative seek per page, so cost is
     /// O(pages) seeks, not O(bytes).
     ///
-    /// After this returns, [`seek_to`] becomes O(log n) lookup + one
+    /// After this returns, [`seek_to`](oxideav_core::Demuxer::seek_to)
+    /// becomes O(log n) lookup + one
     /// seek for any covered timestamp on any logical stream. Pages
     /// whose granule is `-1` (no packet boundary, RFC 3533 §6) are
     /// skipped because they carry no seek-target information.
@@ -1384,7 +1387,7 @@ impl OggDemuxer {
     /// (`docs/container/ogg/ogg-skeleton-4.0.md`) carries an optional
     /// per-stream `index\0` packet whose keypoints are
     /// `(byte_offset, timestamp)` pairs in sorted order; when present,
-    /// [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to) finds the
+    /// [`Demuxer::seek_to`] finds the
     /// floor keypoint for the target timestamp in O(log n) and jumps
     /// straight to its byte offset.
     ///
@@ -1471,16 +1474,16 @@ impl OggDemuxer {
 
     /// Current byte position of the underlying input.
     ///
-    /// After a [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to) or
+    /// After a [`Demuxer::seek_to`] or
     /// [`OggDemuxer::seek_to_with_preroll`] call this is the page boundary
-    /// the next [`Demuxer::next_packet`](oxideav_core::Demuxer::next_packet)
+    /// the next [`Demuxer::next_packet`]
     /// read resumes from, so callers (and a preroll-aware caller comparing
     /// the two seek variants) can observe where the resume offset landed.
     pub fn input_position(&mut self) -> Result<u64> {
         Ok(self.input.stream_position()?)
     }
 
-    /// Seek as [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to) does,
+    /// Seek as [`Demuxer::seek_to`] does,
     /// then move the resume byte offset earlier so that a decoder reading
     /// forward from it sees at least `preroll` content packets of the
     /// requested stream **before** the page `seek_to` would have landed on.
@@ -2088,7 +2091,7 @@ impl OggDemuxer {
     /// Resolve `(byte_offset, returned_granule)` from the Skeleton 4.0
     /// keyframe-index packets when seeking on `serial`. `target_pts` is
     /// the seek target in the stream's own time-base units (same as the
-    /// public [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to)
+    /// public [`Demuxer::seek_to`]
     /// contract). `time_base` is the requested stream's time base, used
     /// to convert `target_pts` into each index's `timestamp_denominator`
     /// units.

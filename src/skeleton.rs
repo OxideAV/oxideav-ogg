@@ -1078,8 +1078,8 @@ impl core::fmt::Display for DisplayHint {
 }
 
 impl DisplayCoord {
-    /// Render a single coordinate token, the inverse of
-    /// [`DisplayCoord::parse`]: a raw integer for [`DisplayCoord::Pixels`]
+    /// Render a single coordinate token, the inverse of the private
+    /// `DisplayCoord::parse`: a raw integer for [`DisplayCoord::Pixels`]
     /// and a `%`-suffixed value for [`DisplayCoord::Percent`]. A
     /// whole-number percent renders without a trailing `.0` (so
     /// `Percent(20.0)` → `"20%"`, matching the wiki's `pip(20%,20%)`
@@ -2638,7 +2638,8 @@ impl Skeleton {
     /// to [`crate::mux::open_with_skeleton`].
     ///
     /// This is the write-side companion to the demuxer's
-    /// [`crate::demux::open_concrete`]→[`OggDemuxer::skeleton`] read path: it
+    /// [`crate::demux::open_concrete`]→[`OggDemuxer::skeleton`](crate::demux::OggDemuxer::skeleton)
+    /// read path: it
     /// derives, from each [`oxideav_core::StreamInfo`], the per-track fields
     /// the Skeleton spec requires
     /// (`docs/container/ogg/ogg-skeleton-4.0.md` §"How to describe the logical
@@ -2918,7 +2919,8 @@ impl Skeleton {
     /// (`audio/ogg;codecs=opus`) are not consulted — matching is purely on the
     /// `type` kind and the `subtype` string. Both halves compare
     /// case-insensitively per RFC 2045 §5.1 ("the type, subtype, and parameter
-    /// names are not case sensitive"), reusing [`ContentTypeKind::from_token`]
+    /// names are not case sensitive"), reusing the private
+    /// `ContentTypeKind::from_token`
     /// for the kind half and [`ContentType::subtype_eq`] for the subtype half,
     /// so a `mime` of `AUDIO/Vorbis` matches an on-wire `audio/vorbis`.
     ///
