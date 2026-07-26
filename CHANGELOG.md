@@ -29,7 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-file (and `build_seek_index`'s pre-registration of every
   link's BOS) would otherwise fall back to the built-in table; the
   shared-resolver entry points keep those identifications
-  registry-first too
+  registry-first too. `demux::open_indexed` threads its borrowed
+  resolver into the full-file scan it runs at open time, so it
+  pre-registers every chained link registry-first without needing an
+  owned handle
 - `validate` module: whole-file RFC 3533 conformance validation.
   `validate::validate(&[u8])` walks a complete physical bitstream and
   returns a typed `ConformanceReport` — pages/streams/links/junk-byte

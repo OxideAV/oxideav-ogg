@@ -93,6 +93,9 @@ path. `demux::open_shared` / `demux::open_concrete_shared` accept an
 owned `Arc<dyn CodecResolver + Send + Sync>` instead and keep it for
 the demuxer's whole lifetime, so late chained links and the
 `build_seek_index` full-file scan resolve registry-first too.
+`demux::open_indexed` is also caveat-free with just the borrow: its
+open-time full-file scan pre-registers every link's BOS while the
+borrowed resolver is still in scope.
 
 For Vorbis, Opus, **Speex** and **FLAC** the demuxer parses the
 identification header during `open` to populate the stream's

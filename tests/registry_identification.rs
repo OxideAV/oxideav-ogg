@@ -544,6 +544,25 @@ fn build_seek_index_registers_chained_links_via_shared_resolver() {
 }
 
 #[test]
+fn open_indexed_identifies_chained_links_registry_first() {
+    // `open_indexed` runs the full-file scan while the borrowed
+    // resolver is still in scope, so every chained link's BOS is
+    // pre-registered registry-first — no shared handle needed.
+    let mut bytes = build_vorbis_link(0xAAAA_0031, 0xAA, 2);
+    bytes.extend(build_speex_link(0xBBBB_0032, 0xBB, 2));
+
+    let reg = registry(&[(b"\x01vorbis", "vorbis"), (b"Speex   ", "speex-r430")]);
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let demux = oxideav_ogg::demux::open_indexed(input, &reg).expect("open_indexed");
+    let ids: Vec<&str> = demux
+        .streams()
+        .iter()
+        .map(|s| s.params.codec_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["vorbis", "speex-r430"]);
+}
+
+#[test]
 fn skeleton_fast_path_unaffected_by_registry_claims() {
     // The Skeleton bitstream is container-level metadata, identified
     // before codec resolution runs. A hostile registry claim on the

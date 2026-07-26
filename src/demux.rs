@@ -136,12 +136,18 @@ pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<
 ///
 /// Returns the same boxed [`Demuxer`] as [`open`]; the index lives
 /// inside the concrete type and accelerates seek_to transparently.
+///
+/// Because the full-file scan runs while the borrowed `codecs`
+/// resolver is still in scope, every chained link's BOS discovered by
+/// the scan is identified registry-first here too — `open_indexed` is
+/// the borrowed-resolver entry point without the chained-link fallback
+/// caveat documented on [`open`] / [`open_shared`].
 pub fn open_indexed(
     input: Box<dyn ReadSeek>,
     codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
     let mut state = open_concrete(input, codecs)?;
-    state.build_seek_index()?;
+    state.build_seek_index_with(Some(codecs))?;
     Ok(Box::new(state))
 }
 
@@ -820,7 +826,22 @@ impl OggDemuxer {
     /// On error the index is left partially populated — subsequent
     /// `seek_to` calls remain correct (they fall back to bisection for
     /// uncovered targets); only the speedup is incomplete.
+    ///
+    /// Chained links met for the first time by this scan are
+    /// pre-registered; their codec identification goes through the
+    /// demuxer-held shared resolver when one exists ([`open_shared`] /
+    /// [`open_concrete_shared`]), else the built-in [`codec_id`]
+    /// table. [`open_indexed`] additionally threads its borrowed
+    /// resolver into the scan it runs at open time.
     pub fn build_seek_index(&mut self) -> Result<()> {
+        self.build_seek_index_with(None)
+    }
+
+    /// [`Self::build_seek_index`] with an open-time borrowed resolver
+    /// for the chained-link BOS registrations the scan performs — see
+    /// [`Self::identify_codec`] for the resolution order. Private:
+    /// only [`open_indexed`] can supply a borrow that is still alive.
+    fn build_seek_index_with(&mut self, codecs: Option<&dyn CodecResolver>) -> Result<()> {
         let saved_pos = self.input.stream_position()?;
         let end = self.input.seek(SeekFrom::End(0))?;
         if end == 0 {
@@ -959,10 +980,11 @@ impl OggDemuxer {
                             self.seen_nonbos_in_current_link = false;
                         }
                         // Best-effort: ignore registration failure (a malformed
-                        // BOS shouldn't abort the seek-index build). The scan
-                        // runs after open, so identification goes through the
-                        // shared resolver (if any) and then the built-in table.
-                        let _ = self.register_stream(&synth, None);
+                        // BOS shouldn't abort the seek-index build).
+                        // Identification order: the `open_indexed` borrowed
+                        // resolver (when this scan runs at open time), the
+                        // shared resolver (if any), then the built-in table.
+                        let _ = self.register_stream(&synth, codecs);
                     }
                 } else {
                     self.seen_nonbos_in_current_link = true;
