@@ -18,8 +18,6 @@ framework but usable standalone.
 ```toml
 [dependencies]
 oxideav-core = "0.1"
-oxideav-codec = "0.1"
-oxideav-container = "0.1"
 oxideav-ogg = "0.0"
 ```
 
@@ -30,28 +28,27 @@ a codec crate (`oxideav-vorbis`, `oxideav-opus`, `oxideav-theora`,
 `oxideav-flac`, ...) to decode the payloads.
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
-use oxideav_core::Frame;
+use oxideav_core::{Frame, ReadSeek, RuntimeContext};
 
-let mut codecs = CodecRegistry::new();
-let mut containers = ContainerRegistry::new();
-oxideav_vorbis::register(&mut codecs);
-oxideav_ogg::register(&mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_vorbis::register(&mut ctx); // codec crate (here: oxideav-vorbis)
+oxideav_ogg::register(&mut ctx);    // the Ogg container
 
-let input: Box<dyn oxideav_container::ReadSeek> = Box::new(
+let input: Box<dyn ReadSeek> = Box::new(
     std::io::Cursor::new(std::fs::read("song.ogg")?),
 );
-let mut dmx = containers.open("ogg", input)?;
-let stream = &dmx.streams()[0];
-let mut dec = codecs.make_decoder(&stream.params)?;
+let mut dmx = ctx.containers.open_demuxer("ogg", input, &ctx.codecs)?;
+let params = dmx.streams()[0].params.clone();
+let mut dec = ctx.codecs.first_decoder(&params)?;
 
 loop {
     match dmx.next_packet() {
         Ok(pkt) => {
             dec.send_packet(&pkt)?;
             while let Ok(Frame::Audio(af)) = dec.receive_frame() {
-                // af.samples carries decoded PCM in the codec's native layout.
+                // af.data carries decoded PCM in the codec's native layout
+                // (sample format / channels come from the stream params).
+                let _ = af;
             }
         }
         Err(oxideav_core::Error::Eof) => break,
@@ -338,11 +335,10 @@ each `unit_boundary` packet, and an EOS flag on the last page of
 each stream:
 
 ```rust
-use oxideav_container::{ContainerRegistry, WriteSeek};
-use oxideav_core::{CodecParameters, CodecId, Packet, StreamInfo, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, RuntimeContext, StreamInfo, TimeBase, WriteSeek};
 
-let mut containers = ContainerRegistry::new();
-oxideav_ogg::register(&mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_ogg::register(&mut ctx);
 
 let mut params = CodecParameters::audio(CodecId::new("vorbis"));
 params.channels = Some(2);
@@ -357,7 +353,7 @@ let streams = vec![StreamInfo {
 }];
 
 let out: Box<dyn WriteSeek> = Box::new(std::fs::File::create("out.ogg")?);
-let mut mux = containers.make_muxer("ogg", out, &streams)?;
+let mut mux = ctx.containers.open_muxer("ogg", out, &streams)?;
 mux.write_header()?;
 // ... mux.write_packet(&pkt)? ...
 mux.write_trailer()?;
