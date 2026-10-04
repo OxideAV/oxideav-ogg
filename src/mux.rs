@@ -228,6 +228,7 @@ fn open_concrete_inner(
     skeleton: Option<Skeleton>,
     auto_index: Option<AutoIndexConfig>,
 ) -> Result<OggMuxer> {
+    check_streams_mappable(streams)?;
     let mut used_serials: HashSet<u32> = HashSet::new();
     let (per_stream, stream_order, max_serial) = build_link_writers(streams, &mut used_serials);
     let skeleton_writer = skeleton.map(|sk| {
@@ -294,6 +295,34 @@ fn open_concrete_inner(
     })
 }
 
+/// The codecs with an Ogg encapsulation this muxer implements: Vorbis
+/// I (RFC 5215 / Vorbis I spec §A), Opus (RFC 7845), FLAC (the FLAC
+/// Ogg mapping), Speex (Speex manual, Ogg mapping) and Theora (Theora
+/// spec §A). Each mapping fixes how the codec's header packets and
+/// granule positions are carried; any other codec has no defined
+/// Ogg carriage and a reader could not identify its logical stream.
+pub const MAPPED_CODECS: &[&str] = &["vorbis", "opus", "flac", "speex", "theora"];
+
+/// Refuse streams whose codec has no Ogg mapping (see
+/// [`MAPPED_CODECS`]) at open time, so callers that probe the muxer
+/// to learn which streams fit (stream selection, per-container codec
+/// defaults) see the refusal before any byte is written, instead of
+/// an Ogg file a reader cannot identify.
+fn check_streams_mappable(streams: &[StreamInfo]) -> Result<()> {
+    for s in streams {
+        let id = s.params.codec_id.as_str();
+        if !MAPPED_CODECS.contains(&id) {
+            return Err(Error::unsupported(format!(
+                "Ogg muxer: no Ogg mapping for codec '{id}' (stream #{}); \
+                 Ogg carries {}",
+                s.index,
+                MAPPED_CODECS.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build the per-stream writers for one chain link, assigning each a
 /// globally-unique serial (RFC 3533 §4: "Each chained logical bitstream
 /// MUST have a unique serial number within the scope of the physical
@@ -314,7 +343,14 @@ fn build_link_writers(
         }
         used_serials.insert(serial);
         max_serial = max_serial.max(serial);
-        let headers_remaining = codec_id::header_packet_count(&s.params.codec_id);
+        let headers_remaining = match s.params.codec_id.as_str() {
+            // FLAC: the mapping packet plus one packet per metadata
+            // block, as many as `extract_codec_headers` lays out.
+            "flac" => extract_codec_headers(&s.params.codec_id, &s.params.extradata)
+                .len()
+                .max(1),
+            _ => codec_id::header_packet_count(&s.params.codec_id),
+        };
         // Theora: recover the granule-position packer from the ID header
         // (the first packet of the Xiph-laced extradata blob). A stream
         // whose extradata is missing or unparseable muxes with the
@@ -1478,6 +1514,7 @@ impl OggMuxer {
         if streams.is_empty() {
             return Err(Error::invalid("Ogg muxer: begin_new_link with no streams"));
         }
+        check_streams_mappable(streams)?;
 
         // 1. EOS-terminate every current-link stream. Its last data page
         //    is the non-BOS page the demuxer sees immediately before the
@@ -1605,6 +1642,7 @@ fn extract_codec_headers(codec_id: &CodecId, extradata: &[u8]) -> Vec<Vec<u8>> {
         // the wire as a distinct Ogg packet; a Theora header blob muxed as one
         // packet would be unparseable by a Theora decoder.
         "vorbis" | "theora" => xiph_unlace(extradata).unwrap_or_default(),
+        "flac" => flac_header_packets(extradata).unwrap_or_else(|| vec![extradata.to_vec()]),
         "opus" => {
             // OpusHead followed by a synthetic minimal OpusTags. (Original
             // tags are dropped during demux — they're not load-bearing.)
@@ -1617,6 +1655,93 @@ fn extract_codec_headers(codec_id: &CodecId, extradata: &[u8]) -> Vec<Vec<u8>> {
         }
         _ => vec![extradata.to_vec()],
     }
+}
+
+/// The FLAC-in-Ogg header packets (RFC 9639 §10.1) for a FLAC stream
+/// whose `extradata` holds its metadata blocks — bare (as the FLAC
+/// encoder and the MP4 `dfLa` box carry them), behind the `fLaC`
+/// signature (Matroska `CodecPrivate`), or already behind an Ogg
+/// mapping header (the Ogg demuxer's concatenated header packets):
+///
+/// 1. the mapping packet: `0x7F "FLAC"`, mapping version 1.0, the
+///    big-endian count of header packets that follow, `fLaC`, and the
+///    STREAMINFO block;
+/// 2. one packet per further metadata block, the Vorbis comment block
+///    first ("SHOULD", for historic reasons — a minimal one is
+///    synthesized when the source has none); PADDING and SEEKTABLE are
+///    dropped (padding is meaningless here and seek-table offsets point
+///    into a native FLAC stream). The last packet's block header has
+///    the last-metadata-block flag set.
+///
+/// `None` when no STREAMINFO block can be found.
+fn flac_header_packets(extradata: &[u8]) -> Option<Vec<Vec<u8>>> {
+    const STREAMINFO: u8 = 0;
+    const PADDING: u8 = 1;
+    const SEEKTABLE: u8 = 3;
+    const VORBIS_COMMENT: u8 = 4;
+    let mut rest = extradata;
+    if rest.len() >= 9 && rest[0] == 0x7F && &rest[1..5] == b"FLAC" {
+        rest = &rest[9..];
+    }
+    if rest.starts_with(b"fLaC") {
+        rest = &rest[4..];
+    }
+    // (block type, body) in stream order.
+    let mut blocks: Vec<(u8, &[u8])> = Vec::new();
+    while rest.len() >= 4 {
+        let kind = rest[0] & 0x7F;
+        let len = u32::from_be_bytes([0, rest[1], rest[2], rest[3]]) as usize;
+        let body = rest.get(4..4 + len)?;
+        blocks.push((kind, body));
+        let last = rest[0] & 0x80 != 0;
+        rest = &rest[4 + len..];
+        if last {
+            break;
+        }
+    }
+    let (first_kind, streaminfo) = *blocks.first()?;
+    if first_kind != STREAMINFO || streaminfo.len() != 34 {
+        return None;
+    }
+    let mut others: Vec<(u8, Vec<u8>)> = Vec::new();
+    match blocks.iter().find(|(k, _)| *k == VORBIS_COMMENT) {
+        Some((_, body)) => others.push((VORBIS_COMMENT, body.to_vec())),
+        None => {
+            // vendor_length + vendor + user_comment_list_length (LE).
+            let vendor = b"oxideav";
+            let mut body = (vendor.len() as u32).to_le_bytes().to_vec();
+            body.extend_from_slice(vendor);
+            body.extend_from_slice(&0u32.to_le_bytes());
+            others.push((VORBIS_COMMENT, body));
+        }
+    }
+    others.extend(
+        blocks
+            .iter()
+            .skip(1)
+            .filter(|(k, _)| !matches!(*k, STREAMINFO | PADDING | SEEKTABLE | VORBIS_COMMENT))
+            .map(|(k, b)| (*k, b.to_vec())),
+    );
+    let count = u16::try_from(others.len()).ok()?;
+    let block = |kind: u8, last: bool, body: &[u8]| -> Option<Vec<u8>> {
+        let len = u32::try_from(body.len()).ok().filter(|&l| l < 1 << 24)?;
+        let mut out = vec![kind | if last { 0x80 } else { 0 }];
+        out.extend_from_slice(&len.to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+        Some(out)
+    };
+    let mut first = vec![0x7F];
+    first.extend_from_slice(b"FLAC");
+    first.extend_from_slice(&[1, 0]);
+    first.extend_from_slice(&count.to_be_bytes());
+    first.extend_from_slice(b"fLaC");
+    first.extend(block(STREAMINFO, false, streaminfo)?);
+    let mut packets = vec![first];
+    let n = others.len();
+    for (i, (kind, body)) in others.iter().enumerate() {
+        packets.push(block(*kind, i + 1 == n, body)?);
+    }
+    Some(packets)
 }
 
 /// Xiph-lace codec header packets into the single-blob `extradata`
@@ -1734,6 +1859,97 @@ mod tests {
         let solo = xiph_lace(&[&[1u8, 2, 3][..]]).unwrap();
         assert_eq!(solo, vec![0x00, 1, 2, 3]);
         assert_eq!(xiph_unlace(&solo).unwrap(), vec![vec![1u8, 2, 3]]);
+    }
+
+    fn stream(index: u32, codec: &str) -> StreamInfo {
+        let mut params = oxideav_core::CodecParameters::audio(CodecId::new(codec));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        StreamInfo {
+            index,
+            time_base: oxideav_core::TimeBase::new(1, 48_000),
+            duration: None,
+            start_time: Some(0),
+            params,
+        }
+    }
+
+    fn sink() -> Box<dyn WriteSeek> {
+        Box::new(std::io::Cursor::new(Vec::new()))
+    }
+
+    fn streaminfo_block(last: bool) -> Vec<u8> {
+        let mut b = vec![if last { 0x80 } else { 0 }, 0, 0, 34];
+        b.extend((0..34u8).map(|i| i + 1));
+        b
+    }
+
+    #[test]
+    fn flac_headers_follow_the_ogg_mapping() {
+        // Bare blocks (encoder / dfLa form), STREAMINFO + PADDING.
+        let mut bare = streaminfo_block(false);
+        bare.extend_from_slice(&[0x81, 0, 0, 4, 0, 0, 0, 0]);
+        // `fLaC`-prefixed (Matroska form) with a Vorbis comment.
+        let mut comment = vec![4u8, 0, 0, 12];
+        comment.extend_from_slice(&[1, 0, 0, 0, b'x', 0, 0, 0, 0, 0, 0, 0]);
+        let mut mkv = b"fLaC".to_vec();
+        mkv.extend(streaminfo_block(false));
+        mkv.extend_from_slice(&[0x80 | 4, 0, 0, 12]);
+        mkv.extend_from_slice(&comment[4..]);
+        for (name, extradata, comment_len) in [("bare", bare, 15usize), ("mkv", mkv, 12)] {
+            let packets = extract_codec_headers(&CodecId::new("flac"), &extradata);
+            assert_eq!(packets.len(), 2, "{name}");
+            let first = &packets[0];
+            assert_eq!(first.len(), 51, "{name}: 79-byte first page = 27 + 1 + 51");
+            assert_eq!(&first[..9], &[0x7F, b'F', b'L', b'A', b'C', 1, 0, 0, 1]);
+            assert_eq!(&first[9..13], b"fLaC");
+            assert_eq!(
+                &first[13..17],
+                &[0, 0, 0, 34],
+                "{name}: STREAMINFO not last"
+            );
+            assert_eq!(packets[1][0], 0x80 | 4, "{name}: last block = comment");
+            assert_eq!(packets[1].len(), 4 + comment_len, "{name}");
+        }
+        // The Ogg demuxer's own form round-trips to the same layout.
+        let own: Vec<u8> = extract_codec_headers(&CodecId::new("flac"), &{
+            let mut v = vec![0x7F];
+            v.extend_from_slice(b"FLAC");
+            v.extend_from_slice(&[1, 0, 0, 0]);
+            v.extend_from_slice(b"fLaC");
+            v.extend(streaminfo_block(true));
+            v
+        })
+        .concat();
+        assert_eq!(&own[13..17], &[0, 0, 0, 34]);
+        // No STREAMINFO: passed through untouched.
+        assert_eq!(
+            extract_codec_headers(&CodecId::new("flac"), &[1, 2, 3]),
+            vec![vec![1, 2, 3]]
+        );
+    }
+
+    #[test]
+    fn open_accepts_every_mapped_codec() {
+        for codec in MAPPED_CODECS {
+            assert!(open(sink(), &[stream(0, codec)]).is_ok(), "{codec}");
+        }
+    }
+
+    #[test]
+    fn open_refuses_codecs_without_an_ogg_mapping() {
+        for codec in ["h264", "aac", "pcm_s16le", "mp3", "rawvideo", "vp9"] {
+            let err = match open(sink(), &[stream(0, codec)]) {
+                Err(e) => e,
+                Ok(_) => panic!("{codec}: accepted"),
+            };
+            assert!(matches!(err, Error::Unsupported(_)), "{codec}: {err:?}");
+            assert!(err.to_string().contains(codec), "{err}");
+        }
+        // One unmappable stream refuses the whole set: a Vorbis +
+        // H.264 pair is not silently written as an audio-only file.
+        assert!(open(sink(), &[stream(0, "vorbis"), stream(1, "h264")]).is_err());
+        assert!(open_concrete(sink(), &[stream(0, "aac")]).is_err());
     }
 
     #[test]
