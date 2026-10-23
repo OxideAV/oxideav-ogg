@@ -15,7 +15,7 @@ use std::io::Cursor;
 
 use oxideav_core::{Demuxer, Error, ReadSeek};
 use oxideav_ogg::demux;
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 use oxideav_ogg::skeleton::{FisBone, FisHead, Rational, Version};
 
 const SKELETON_SERIAL: u32 = 0x0051_3E1E;

@@ -20,7 +20,7 @@ use std::io::Cursor;
 
 use oxideav_core::{Demuxer, Error, ReadSeek};
 use oxideav_ogg::demux::{DamageKind, MAX_DAMAGE_EVENTS};
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 
 // ─────────────────────────── stream builders ───────────────────────────
 
@@ -263,8 +263,8 @@ fn orphaned_continuation_records_a_framing_error_event() {
 fn truncated_tail_is_a_clean_eof_with_a_ledger_entry() {
     let clean = clean_file(4);
     let last_page = nth_oggs_offset(&clean, 6) as u64; // final data page
-                                                       // Cut points inside the final page: mid-header, mid-segment-table,
-                                                       // and mid-body.
+    // Cut points inside the final page: mid-header, mid-segment-table,
+    // and mid-body.
     for cut in [last_page + 12, last_page + 27, clean.len() as u64 - 1] {
         let bytes = clean[..cut as usize].to_vec();
         let mut dmx = open(bytes);

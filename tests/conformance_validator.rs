@@ -18,7 +18,7 @@ use std::io::Cursor;
 use oxideav_core::{CodecId, CodecParameters, Muxer, Packet, StreamInfo, TimeBase, WriteSeek};
 use oxideav_ogg::mux::{self, AutoIndexConfig};
 use oxideav_ogg::skeleton::{FisBone, FisHead, Rational, Skeleton, Version};
-use oxideav_ogg::validate::{validate, Rule};
+use oxideav_ogg::validate::{Rule, validate};
 
 // ---------------------------------------------------------------------
 // Shared output buffer (the muxer takes ownership of its WriteSeek).

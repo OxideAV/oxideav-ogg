@@ -303,11 +303,7 @@ impl SeekKey {
             }
             SeekKeyFlavor::TheoraFrame { shift, bias } => {
                 let no = theora_frame_no(granule, shift);
-                if no < 0 {
-                    no
-                } else {
-                    no - bias
-                }
+                if no < 0 { no } else { no - bias }
             }
         }
     }
@@ -728,15 +724,15 @@ impl OggDemuxer {
     /// are then delivered as data, the time base stays at the 1 µs
     /// placeholder) — the registry's answer is honoured either way.
     fn identify_codec(&self, open_resolver: Option<&dyn CodecResolver>, first: &[u8]) -> CodecId {
-        if let Some(r) = open_resolver {
-            if let Some(id) = r.resolve_payload_magic(first) {
-                return id;
-            }
+        if let Some(r) = open_resolver
+            && let Some(id) = r.resolve_payload_magic(first)
+        {
+            return id;
         }
-        if let Some(r) = self.resolver.as_deref() {
-            if let Some(id) = r.resolve_payload_magic(first) {
-                return id;
-            }
+        if let Some(r) = self.resolver.as_deref()
+            && let Some(id) = r.resolve_payload_magic(first)
+        {
+            return id;
         }
         codec_id::detect(first)
     }
@@ -2257,11 +2253,11 @@ impl OggDemuxer {
             }
             let other_tb = TimeBase::new(1, other.timestamp_denominator);
             let other_target_ts = time_base.rescale(target_pts, other_tb);
-            if let Some((cand_off, _)) = Self::keypoint_floor(other, other_target_ts) {
-                if cand_off < min_off {
-                    min_off = cand_off;
-                    winning_serial = other.serial;
-                }
+            if let Some((cand_off, _)) = Self::keypoint_floor(other, other_target_ts)
+                && cand_off < min_off
+            {
+                min_off = cand_off;
+                winning_serial = other.serial;
             }
             // A stream whose index has no keypoint at or before the
             // target time is silently skipped — the spec says "every
@@ -2471,10 +2467,10 @@ impl OggDemuxer {
         // LE u16, RFC 7845 §5.1 field 4). Record it per-serial so the
         // granule→time mapping can subtract it (RFC 7845 §4.3:
         // `PCM sample position = granule position − pre-skip`).
-        if codec_id.as_str() == "opus" {
-            if let Some(ps) = opus_pre_skip(first) {
-                self.opus_pre_skip.insert(bos_page.serial, ps);
-            }
+        if codec_id.as_str() == "opus"
+            && let Some(ps) = opus_pre_skip(first)
+        {
+            self.opus_pre_skip.insert(bos_page.serial, ps);
         }
 
         // Theora carries the container mapping's granule-position codec
@@ -3421,23 +3417,23 @@ impl OggDemuxer {
         let data_count = (completed.len() - header_take) as i64;
         let mut theora_frame: Option<i64> = None;
         let mut theora_page_kf: Option<i64> = None;
-        if let Some(g) = theora_gran {
-            if data_count > 0 {
-                let anchor = if page.granule_position >= 0 {
-                    g.frame_index(page.granule_position)
-                } else {
-                    None
-                };
-                theora_frame = anchor
-                    .map(|last| last - (data_count - 1))
-                    .or(stream.theora_next_frame);
-                theora_page_kf = if page.granule_position >= 0 {
-                    g.keyframe_index(page.granule_position)
-                } else {
-                    None
-                };
-                stream.theora_next_frame = theora_frame.map(|f| f + data_count);
-            }
+        if let Some(g) = theora_gran
+            && data_count > 0
+        {
+            let anchor = if page.granule_position >= 0 {
+                g.frame_index(page.granule_position)
+            } else {
+                None
+            };
+            theora_frame = anchor
+                .map(|last| last - (data_count - 1))
+                .or(stream.theora_next_frame);
+            theora_page_kf = if page.granule_position >= 0 {
+                g.keyframe_index(page.granule_position)
+            } else {
+                None
+            };
+            stream.theora_next_frame = theora_frame.map(|f| f + data_count);
         }
         for (i, data) in completed.into_iter().enumerate() {
             if stream.headers_remaining > 0 {

@@ -12,7 +12,7 @@
 //! one `Severity::Error` issue (warnings alone keep the exit clean),
 //! so the example doubles as a shell-scriptable conformance checker.
 
-use oxideav_ogg::validate::{validate, Severity};
+use oxideav_ogg::validate::{Severity, validate};
 
 fn main() {
     let files: Vec<String> = std::env::args().skip(1).collect();

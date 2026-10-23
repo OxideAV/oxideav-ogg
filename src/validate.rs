@@ -900,17 +900,17 @@ fn finish_page_checks(
         }
     }
     if completed > 0 && page.granule != -1 {
-        if let Some(prev) = model.last_granule {
-            if page.granule < prev {
-                issue(
-                    report,
-                    Rule::GranuleRegression,
-                    format!(
-                        "granule_position {} below the bitstream's previous {}",
-                        page.granule, prev
-                    ),
-                );
-            }
+        if let Some(prev) = model.last_granule
+            && page.granule < prev
+        {
+            issue(
+                report,
+                Rule::GranuleRegression,
+                format!(
+                    "granule_position {} below the bitstream's previous {}",
+                    page.granule, prev
+                ),
+            );
         }
         model.last_granule = Some(page.granule);
     }

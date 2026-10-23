@@ -15,7 +15,7 @@
 use std::io::Cursor;
 
 use oxideav_core::{Demuxer, NullCodecResolver, ReadSeek};
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 
 // ─────────────────────── synthetic Opus header packets ───────────────────
 

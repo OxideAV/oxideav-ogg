@@ -28,8 +28,8 @@ use oxideav_core::{
     CodecId, CodecParameters, Demuxer, Error, Packet, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
 use oxideav_ogg::demux::MAX_DAMAGE_EVENTS;
-use oxideav_ogg::page::{flags, lace, Page};
-use oxideav_ogg::validate::{validate, MAX_ISSUES};
+use oxideav_ogg::page::{Page, flags, lace};
+use oxideav_ogg::validate::{MAX_ISSUES, validate};
 
 // ─────────────────────────── deterministic PRNG ───────────────────────────
 

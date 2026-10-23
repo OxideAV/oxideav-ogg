@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use oxideav_core::{Demuxer, ReadSeek};
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 
 /// Minimal valid Vorbis identification packet (30 bytes).
 fn vorbis_id_packet(channels: u8, sample_rate: u32) -> Vec<u8> {

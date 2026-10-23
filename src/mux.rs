@@ -12,7 +12,7 @@ use oxideav_core::{CodecId, Error, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
-use crate::page::{self, flags, lace, Page};
+use crate::page::{self, Page, flags, lace};
 use crate::skeleton::{KeyPoint, SkelIndex, Skeleton};
 use crate::theora::{TheoraGranule, TheoraIdHeader};
 
@@ -180,12 +180,12 @@ pub fn open_with_skeleton_indexed(
             config.max_keypoints
         )));
     }
-    if let Some(head) = skeleton.head.as_ref() {
-        if !head.version.at_least(crate::skeleton::Version::V4_0) {
-            return Err(Error::invalid(
-                "Ogg muxer: Skeleton keyframe index packets require a 4.0 fishead",
-            ));
-        }
+    if let Some(head) = skeleton.head.as_ref()
+        && !head.version.at_least(crate::skeleton::Version::V4_0)
+    {
+        return Err(Error::invalid(
+            "Ogg muxer: Skeleton keyframe index packets require a 4.0 fishead",
+        ));
     }
     for s in streams {
         if s.time_base.0.num <= 0 || s.time_base.0.den <= 0 {
@@ -1032,10 +1032,10 @@ impl OggMuxer {
             let mut best: Option<(u32, f64)> = None;
             for &idx in &self.stream_order {
                 let w = &self.per_stream[&idx];
-                if let Some(front) = w.queue.front() {
-                    if !best.is_some_and(|(_, bt)| bt <= front.time_secs) {
-                        best = Some((idx, front.time_secs));
-                    }
+                if let Some(front) = w.queue.front()
+                    && !best.is_some_and(|(_, bt)| bt <= front.time_secs)
+                {
+                    best = Some((idx, front.time_secs));
                 }
             }
             let Some((idx, _)) = best else {
@@ -1058,20 +1058,19 @@ impl OggMuxer {
     fn write_pending_page(&mut self, stream_index: u32, pending: PendingPage) -> Result<()> {
         let offset = self.output.stream_position()?;
         self.output.write_all(&pending.bytes)?;
-        if let Some(pts) = pending.first_keyframe_pts {
-            if let Some(state) = self
+        if let Some(pts) = pending.first_keyframe_pts
+            && let Some(state) = self
                 .auto_index
                 .iter_mut()
                 .find(|s| s.stream_index == stream_index)
-            {
-                // Presentation-time numerator over the stream's
-                // time-base denominator: pts × tb.num (saturating —
-                // tb.num is 1 for every sample-rate-style base, so
-                // the multiply is exact in practice).
-                let ts = (pts as i128 * state.tb_num as i128)
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-                state.offer_keypoint(offset, ts);
-            }
+        {
+            // Presentation-time numerator over the stream's
+            // time-base denominator: pts × tb.num (saturating —
+            // tb.num is 1 for every sample-rate-style base, so
+            // the multiply is exact in practice).
+            let ts = (pts as i128 * state.tb_num as i128).clamp(i64::MIN as i128, i64::MAX as i128)
+                as i64;
+            state.offer_keypoint(offset, ts);
         }
         Ok(())
     }
@@ -1125,11 +1124,11 @@ impl OggMuxer {
             head.segment_length = Some(end_pos);
             changed = true;
         }
-        if head.content_byte_offset.unwrap_or(0) == 0 {
-            if let Some(off) = measured_offset {
-                head.content_byte_offset = Some(off);
-                changed = true;
-            }
+        if head.content_byte_offset.unwrap_or(0) == 0
+            && let Some(off) = measured_offset
+        {
+            head.content_byte_offset = Some(off);
+            changed = true;
         }
         if !changed {
             return Ok(());
@@ -1349,16 +1348,15 @@ impl Muxer for OggMuxer {
         // Every content pts feeds the index packet's first/last-sample-
         // time fields (separate lookup — the per-stream writer borrow
         // must end before `auto_index` is touched).
-        if let Some(pts) = effective_pts {
-            if let Some(state) = self
+        if let Some(pts) = effective_pts
+            && let Some(state) = self
                 .auto_index
                 .iter_mut()
                 .find(|s| s.stream_index == stream_index)
-            {
-                let ts = (pts as i128 * state.tb_num as i128)
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-                state.note_pts(ts);
-            }
+        {
+            let ts = (pts as i128 * state.tb_num as i128).clamp(i64::MIN as i128, i64::MAX as i128)
+                as i64;
+            state.note_pts(ts);
         }
         // A content data page for this link now exists (even if still
         // buffered) — record it so `begin_new_link` knows the link has

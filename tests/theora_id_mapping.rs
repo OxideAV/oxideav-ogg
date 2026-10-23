@@ -24,7 +24,7 @@ use std::io::Cursor;
 
 use oxideav_core::{Demuxer, NullCodecResolver, PixelFormat, ReadSeek, TimeBase};
 
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 use oxideav_ogg::theora::{TheoraGranule, TheoraIdHeader};
 
 const THEORA_SERIAL: u32 = 0x71EB1A11;

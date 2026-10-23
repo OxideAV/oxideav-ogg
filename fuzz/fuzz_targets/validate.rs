@@ -17,7 +17,7 @@
 //!   messages) must itself not panic.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_ogg::validate::{validate, MAX_ISSUES};
+use oxideav_ogg::validate::{MAX_ISSUES, validate};
 
 fuzz_target!(|data: &[u8]| {
     let report = validate(data);

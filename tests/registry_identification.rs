@@ -23,7 +23,7 @@ use std::sync::Arc;
 use oxideav_core::{
     CodecId, CodecInfo, CodecRegistry, Demuxer, MediaType, NullCodecResolver, ReadSeek,
 };
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 use oxideav_ogg::skeleton::{FisBone, FisHead, Rational, Version};
 
 // ───────────────────────── fixtures ─────────────────────────

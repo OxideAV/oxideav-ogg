@@ -104,24 +104,20 @@ pub fn continue_checksum(state: u32, bytes: &[u8]) -> u32 {
     // virtual stream where the three "future" bytes are zero; XOR-ing
     // the four-byte word into the running state at the start substitutes
     // the real bytes back in.
-    let mut chunks = bytes.chunks_exact(4);
-    for chunk in &mut chunks {
+    let (chunks, tail) = bytes.as_chunks::<4>();
+    for chunk in chunks {
         // The state's top 32 bits get XORed against the 4 input bytes
         // big-endian (the textbook MSB-first loop pulls bytes out of the
         // CRC's high byte first, so input rank 0 lines up with the high
         // byte of the state).
-        let w = crc
-            ^ ((chunk[0] as u32) << 24)
-            ^ ((chunk[1] as u32) << 16)
-            ^ ((chunk[2] as u32) << 8)
-            ^ (chunk[3] as u32);
+        let w = crc ^ u32::from_be_bytes(*chunk);
         crc = T3[((w >> 24) & 0xFF) as usize]
             ^ T2[((w >> 16) & 0xFF) as usize]
             ^ T1[((w >> 8) & 0xFF) as usize]
             ^ T0[(w & 0xFF) as usize];
     }
     // Scalar tail.
-    for &b in chunks.remainder() {
+    for &b in tail {
         crc = (crc << 8) ^ T0[((crc >> 24) as u8 ^ b) as usize];
     }
     crc
@@ -241,8 +237,8 @@ mod tests {
         page[0..4].copy_from_slice(b"OggS");
         page[4] = 0; // version
         page[5] = 0x02; // BOS flag
-                        // granule (bytes 6..14) left zero.
-                        // serial (bytes 14..18) — pick something non-zero.
+        // granule (bytes 6..14) left zero.
+        // serial (bytes 14..18) — pick something non-zero.
         page[14..18].copy_from_slice(&0x1234_5678u32.to_le_bytes());
         // seq_no (bytes 18..22) left zero.
         // CRC field (bytes 22..26) left zero for the initial compute.

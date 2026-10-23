@@ -28,7 +28,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_ogg::crc;
-use oxideav_ogg::page::{lace, Page};
+use oxideav_ogg::page::{Page, lace};
 
 fuzz_target!(|data: &[u8]| {
     // 1. Parse at every byte offset. The parser must never panic,

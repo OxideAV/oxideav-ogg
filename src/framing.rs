@@ -40,7 +40,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::page::{flags, Page};
+use crate::page::{Page, flags};
 
 /// Maximum number of lacing segments per page (RFC 3533 §6: the
 /// segment count is one byte).
@@ -306,10 +306,10 @@ impl PageWriter {
                     self.page_granule = Some(granulepos);
                     // Soft page-size policy: emit once a completed
                     // packet leaves the page at/past the target.
-                    if let Some(target) = self.page_target {
-                        if self.body.len() >= target {
-                            self.emit_page(false, false);
-                        }
+                    if let Some(target) = self.page_target
+                        && self.body.len() >= target
+                    {
+                        self.emit_page(false, false);
                     }
                     return;
                 }

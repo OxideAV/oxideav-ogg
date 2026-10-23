@@ -903,34 +903,40 @@ fn auto_index_rejects_invalid_configurations() {
     let mut skel = Skeleton::new();
     skel.set_head(FisHead::new(Version::V3_0));
     let writer: Box<dyn WriteSeek> = Box::new(SharedBuf::default());
-    assert!(oxideav_ogg::mux::open_with_skeleton_indexed(
-        writer,
-        std::slice::from_ref(&stream),
-        skel,
-        permissive_cfg(8),
-    )
-    .is_err());
+    assert!(
+        oxideav_ogg::mux::open_with_skeleton_indexed(
+            writer,
+            std::slice::from_ref(&stream),
+            skel,
+            permissive_cfg(8),
+        )
+        .is_err()
+    );
 
     // max_keypoints = 0 reserves nothing to backfill.
     let writer: Box<dyn WriteSeek> = Box::new(SharedBuf::default());
-    assert!(oxideav_ogg::mux::open_with_skeleton_indexed(
-        writer,
-        std::slice::from_ref(&stream),
-        skel_with_bone(),
-        permissive_cfg(0),
-    )
-    .is_err());
+    assert!(
+        oxideav_ogg::mux::open_with_skeleton_indexed(
+            writer,
+            std::slice::from_ref(&stream),
+            skel_with_bone(),
+            permissive_cfg(0),
+        )
+        .is_err()
+    );
 
     // A reservation past the single-page body limit (255×255 bytes)
     // cannot ride on one Skeleton page.
     let writer: Box<dyn WriteSeek> = Box::new(SharedBuf::default());
-    assert!(oxideav_ogg::mux::open_with_skeleton_indexed(
-        writer,
-        std::slice::from_ref(&stream),
-        skel_with_bone(),
-        permissive_cfg(4_000),
-    )
-    .is_err());
+    assert!(
+        oxideav_ogg::mux::open_with_skeleton_indexed(
+            writer,
+            std::slice::from_ref(&stream),
+            skel_with_bone(),
+            permissive_cfg(4_000),
+        )
+        .is_err()
+    );
 }
 
 #[test]

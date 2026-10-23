@@ -31,7 +31,7 @@
 //! 66 KB packet) is limited to two per iteration.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_ogg::framing::{pages_to_packets, parse_pages, PacketAssembler, PageWriter};
+use oxideav_ogg::framing::{PacketAssembler, PageWriter, pages_to_packets, parse_pages};
 use oxideav_ogg::page::Page;
 
 /// Packet-size classes. Chosen to straddle every lacing edge: empty

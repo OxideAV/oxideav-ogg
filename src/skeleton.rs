@@ -2742,15 +2742,15 @@ impl Skeleton {
         let key = name.trim();
         let mut found: Option<&FisBone> = None;
         for bone in &self.bones {
-            if let Some(n) = bone.name() {
-                if n.raw() == key {
-                    if found.is_some() {
-                        // Ambiguous: §Name says the result is undefined, so
-                        // refuse rather than pick one.
-                        return None;
-                    }
-                    found = Some(bone);
+            if let Some(n) = bone.name()
+                && n.raw() == key
+            {
+                if found.is_some() {
+                    // Ambiguous: §Name says the result is undefined, so
+                    // refuse rather than pick one.
+                    return None;
                 }
+                found = Some(bone);
             }
         }
         found
@@ -3195,11 +3195,7 @@ impl Skeleton {
                         r.kind.as_wire().eq_ignore_ascii_case("audio/main")
                             || r.kind.as_wire().eq_ignore_ascii_case("video/main")
                     });
-                    if is_main {
-                        (0, 0)
-                    } else {
-                        (1, 0)
-                    }
+                    if is_main { (0, 0) } else { (1, 0) }
                 }
             }
         }
@@ -3285,10 +3281,10 @@ impl Skeleton {
     pub fn seek_offset_for_time(&self, target_seconds: f64) -> Option<u64> {
         let mut best: Option<u64> = None;
         for idx in &self.indexes {
-            if let Some(kp_index) = idx.keypoint_for_time(target_seconds) {
-                if let Some(kp) = idx.keypoints.get(kp_index) {
-                    best = Some(best.map_or(kp.offset, |b: u64| b.min(kp.offset)));
-                }
+            if let Some(kp_index) = idx.keypoint_for_time(target_seconds)
+                && let Some(kp) = idx.keypoints.get(kp_index)
+            {
+                best = Some(best.map_or(kp.offset, |b: u64| b.min(kp.offset)));
             }
         }
         best

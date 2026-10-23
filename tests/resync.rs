@@ -16,7 +16,7 @@
 use std::io::Cursor;
 
 use oxideav_core::{Demuxer, ReadSeek};
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 
 // ─────────────────────────── packet builders ───────────────────────────
 // Mirror the minimal Vorbis identification scaffolding used by other
@@ -159,7 +159,7 @@ fn garbage_spliced_between_pages_recovers() {
     let target = nth_oggs_offset(&out, 6);
     let mut corrupted = Vec::with_capacity(out.len() + 200);
     corrupted.extend_from_slice(&out[..target]);
-    corrupted.extend(std::iter::repeat(0xAB).take(150));
+    corrupted.extend(std::iter::repeat_n(0xAB, 150));
     corrupted.extend_from_slice(&out[target..]);
 
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(corrupted));
@@ -295,7 +295,7 @@ fn trailing_garbage_after_last_page_terminates_cleanly() {
             &[0xF0, i as u8],
         ));
     }
-    out.extend(std::iter::repeat(0x5A).take(300));
+    out.extend(std::iter::repeat_n(0x5A, 300));
 
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(out));
     let mut dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver)

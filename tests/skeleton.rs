@@ -15,7 +15,7 @@ use std::io::Cursor;
 
 use oxideav_core::{NullCodecResolver, ReadSeek};
 
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 use oxideav_ogg::skeleton::{
     self, ContentTypeKind, FisBone, FisHead, Rational, SkelIndex, Version,
 };
@@ -1893,9 +1893,10 @@ fn bones_with_content_kind_buckets_tracks_by_top_level_mime() {
     assert_eq!(text, vec![0x4000]);
 
     // No image/* track present → empty.
-    assert!(sk
-        .bones_with_content_kind(&ContentTypeKind::Image)
-        .is_empty());
+    assert!(
+        sk.bones_with_content_kind(&ContentTypeKind::Image)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1926,9 +1927,10 @@ fn bones_with_content_kind_other_compares_case_insensitively() {
     assert_eq!(hits, vec![0x10]);
 
     // A well-known bucket query never matches the Other track.
-    assert!(sk
-        .bones_with_content_kind(&ContentTypeKind::Audio)
-        .is_empty());
+    assert!(
+        sk.bones_with_content_kind(&ContentTypeKind::Audio)
+            .is_empty()
+    );
 }
 
 #[test]

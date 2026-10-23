@@ -14,7 +14,7 @@
 use std::io::Cursor;
 
 use oxideav_core::{NullCodecResolver, ReadSeek};
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 
 fn build_page(flags_byte: u8, granule: i64, serial: u32, seq: u32, packet: &[u8]) -> Vec<u8> {
     Page {
@@ -37,8 +37,8 @@ fn flac_mapping_packet(header_packets: u16) -> Vec<u8> {
     p.extend_from_slice(&[0x01, 0x00]); // mapping version 1.0
     p.extend_from_slice(&header_packets.to_be_bytes()); // BE count
     p.extend_from_slice(b"fLaC"); // signature
-                                  // STREAMINFO metadata block header: type 0, last-block bit 0 (more
-                                  // follow), 24-bit BE length = 34.
+    // STREAMINFO metadata block header: type 0, last-block bit 0 (more
+    // follow), 24-bit BE length = 34.
     p.extend_from_slice(&[0x00, 0x00, 0x00, 34]);
     // 34-byte STREAMINFO body (contents irrelevant to the container).
     p.extend_from_slice(&[0u8; 34]);

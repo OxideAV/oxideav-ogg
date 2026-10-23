@@ -71,9 +71,9 @@ use std::io::Cursor;
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{NullCodecResolver, ReadSeek};
 use oxideav_ogg::demux;
-use oxideav_ogg::page::{flags, Page};
+use oxideav_ogg::page::{Page, flags};
 use oxideav_ogg::skeleton::{
-    is_fisbone, is_fishead, is_index, read_vbi_u64, write_vbi_u64, FisBone, FisHead, SkelIndex,
+    FisBone, FisHead, SkelIndex, is_fisbone, is_fishead, is_index, read_vbi_u64, write_vbi_u64,
 };
 
 /// Cap fuzz buffer length passed to `SkelIndex::parse` to keep

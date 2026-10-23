@@ -16,7 +16,7 @@
 use std::io::Cursor;
 
 use oxideav_core::{NullCodecResolver, ReadSeek};
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 
 fn build_page(flags_byte: u8, granule: i64, serial: u32, seq: u32, packet: &[u8]) -> Vec<u8> {
     Page {

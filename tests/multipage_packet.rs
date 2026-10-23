@@ -24,7 +24,7 @@
 use std::io::Cursor;
 
 use oxideav_core::ReadSeek;
-use oxideav_ogg::page::{flags, Page};
+use oxideav_ogg::page::{Page, flags};
 
 fn vorbis_id_packet() -> Vec<u8> {
     let mut p = Vec::with_capacity(30);
@@ -110,7 +110,7 @@ fn emit_spanning_packet(
     eos: bool,
 ) -> u32 {
     assert!(
-        chunk % 255 == 0 && chunk > 0,
+        chunk.is_multiple_of(255) && chunk > 0,
         "non-final chunk must be k*255"
     );
     let mut seq = first_seq;

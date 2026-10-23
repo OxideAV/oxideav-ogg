@@ -39,7 +39,7 @@ use std::io::Cursor;
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{Demuxer as _, NullCodecResolver, ReadSeek};
 use oxideav_ogg::demux;
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 use oxideav_ogg::skeleton::{FisBone, FisHead, KeyPoint, Rational, SkelIndex, Version};
 
 use oxideav_ogg_fuzz::{

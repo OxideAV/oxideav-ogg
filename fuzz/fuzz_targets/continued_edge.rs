@@ -55,7 +55,7 @@ use std::io::Cursor;
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{Demuxer as _, Error, NullCodecResolver, ReadSeek};
 use oxideav_ogg::demux;
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 
 /// Stream serial used for the constructed Vorbis logical bitstream.
 /// A constant is fine — the demuxer just keys on it; the fuzzer can

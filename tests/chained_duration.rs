@@ -11,7 +11,7 @@ use std::io::Cursor;
 
 use oxideav_core::Demuxer;
 use oxideav_core::ReadSeek;
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 
 // ─────────────────────── synthetic header packets ───────────────────────
 

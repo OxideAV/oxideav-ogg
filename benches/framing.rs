@@ -51,11 +51,11 @@
 use std::io::{Cursor, Seek, Write};
 use std::sync::{Arc, Mutex};
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_core::{CodecId, CodecParameters, Packet, ReadSeek, StreamInfo, TimeBase, WriteSeek};
 use oxideav_ogg::crc::{self, validate_page_crc};
-use oxideav_ogg::page::{self, flags, Page};
+use oxideav_ogg::page::{self, Page, flags};
 
 /// Cheap deterministic xorshift32 — fills test buffers with non-zero
 /// non-DC bytes so the CRC loop has to do real table lookups (a pure-

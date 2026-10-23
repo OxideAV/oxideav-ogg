@@ -28,7 +28,7 @@ use oxideav_core::{
     CodecId, CodecParameters, Muxer, NullCodecResolver, Packet, ReadSeek, StreamInfo, TimeBase,
     WriteSeek,
 };
-use oxideav_ogg::page::{flags, Page};
+use oxideav_ogg::page::{Page, flags};
 use oxideav_ogg::theora::TheoraIdHeader;
 
 fn theora_id() -> TheoraIdHeader {
@@ -168,8 +168,8 @@ fn mux_av() -> Vec<u8> {
     audio(&mut mux, 96_000);
     mux.write_trailer().unwrap();
     drop(mux);
-    let bytes = shared.0.lock().unwrap().get_ref().clone();
-    bytes
+
+    shared.0.lock().unwrap().get_ref().clone()
 }
 
 #[test]

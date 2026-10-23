@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ## [0.1.9](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.8...v0.1.9) - 2026-10-04
 
 ### Other
@@ -1896,7 +1900,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered stream tracks which chained link it belongs to (the
   initial BOS section is link 0; each subsequent BOS-after-non-BOS
   increments the counter).
-
 
 ## [0.1.3](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.2...v0.1.3) - 2026-05-06
 

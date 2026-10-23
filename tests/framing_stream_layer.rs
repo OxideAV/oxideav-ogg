@@ -8,7 +8,7 @@ use std::io::Cursor;
 
 use oxideav_core::{CodecId, CodecParameters, Packet, StreamInfo, TimeBase};
 use oxideav_core::{NullCodecResolver, ReadSeek, WriteSeek};
-use oxideav_ogg::framing::{pages_to_packets, parse_pages, PacketAssembler, PageWriter};
+use oxideav_ogg::framing::{PacketAssembler, PageWriter, pages_to_packets, parse_pages};
 
 /// Minimal valid Vorbis identification packet (30 bytes).
 fn vorbis_id_packet(channels: u8, sample_rate: u32) -> Vec<u8> {

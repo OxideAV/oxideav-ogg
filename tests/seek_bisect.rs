@@ -8,7 +8,7 @@
 use std::io::Cursor;
 
 use oxideav_core::ReadSeek;
-use oxideav_ogg::page::{self, flags, lace, Page};
+use oxideav_ogg::page::{self, Page, flags, lace};
 
 /// Minimal valid Vorbis identification packet (30 bytes).
 fn vorbis_id_packet() -> Vec<u8> {
@@ -141,11 +141,11 @@ fn seek_to_bisects_to_page_with_granule_le_target() {
     for _ in 0..5 {
         match demux.next_packet() {
             Ok(p) => {
-                if let Some(pts) = p.pts {
-                    if pts > landed {
-                        saw_higher = true;
-                        break;
-                    }
+                if let Some(pts) = p.pts
+                    && pts > landed
+                {
+                    saw_higher = true;
+                    break;
                 }
             }
             Err(_) => break,

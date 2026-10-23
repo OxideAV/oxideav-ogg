@@ -21,7 +21,7 @@
 use std::io::Cursor;
 
 use oxideav_core::{Demuxer, ReadSeek};
-use oxideav_ogg::page::{flags, lace, Page};
+use oxideav_ogg::page::{Page, flags, lace};
 
 fn vorbis_id_packet() -> Vec<u8> {
     let mut p = Vec::with_capacity(30);
