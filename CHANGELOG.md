@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.9...v0.2.0) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive Skeleton records, mux config, reports
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - `with_*` setters on `AutoIndexConfig`, `FisHead`, `FisBone`, `SkelIndex` and `Skeleton`.
