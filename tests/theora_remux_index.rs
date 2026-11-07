@@ -194,11 +194,10 @@ fn theora_demux_remux_index_records_only_true_keyframes() {
     out_bone.set_header("Content-Type", "video/theora");
     skel.push_bone(out_bone);
 
-    let cfg = oxideav_ogg::mux::AutoIndexConfig {
-        max_keypoints: 16,
-        min_keypoint_byte_gap: 0,
-        min_keypoint_time_gap_ms: 0,
-    };
+    let cfg = oxideav_ogg::mux::AutoIndexConfig::default()
+        .with_max_keypoints(16)
+        .with_min_keypoint_byte_gap(0)
+        .with_min_keypoint_time_gap_ms(0);
 
     let shared = SharedBuf::default();
     let writer: Box<dyn WriteSeek> = Box::new(shared.clone());

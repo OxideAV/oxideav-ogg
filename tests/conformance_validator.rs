@@ -391,11 +391,10 @@ fn skeleton_mux(version: Version, indexed: bool) -> Vec<u8> {
             out,
             std::slice::from_ref(&stream),
             skel,
-            AutoIndexConfig {
-                max_keypoints: 16,
-                min_keypoint_byte_gap: 1,
-                min_keypoint_time_gap_ms: 1,
-            },
+            AutoIndexConfig::default()
+                .with_max_keypoints(16)
+                .with_min_keypoint_byte_gap(1)
+                .with_min_keypoint_time_gap_ms(1),
         )
         .unwrap()
     } else {

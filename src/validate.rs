@@ -61,6 +61,7 @@ pub const MAX_ISSUES: usize = 1024;
 
 /// How serious a rule violation is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum Severity {
     /// The file deviates from RFC 3533 in a way a strict reader may
     /// reject (violates a MUST-level structure rule).
@@ -191,6 +192,7 @@ impl std::fmt::Display for Rule {
 
 /// One rule violation found by [`validate`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Issue {
     /// The rule violated.
     pub rule: Rule,
@@ -231,6 +233,7 @@ impl std::fmt::Display for Issue {
 /// The typed result of [`validate`]: whole-file statistics plus every
 /// rule violation found (capped at [`MAX_ISSUES`]).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ConformanceReport {
     /// Structurally accepted pages (capture pattern + intact extent +
     /// matching CRC; version-0 layout).

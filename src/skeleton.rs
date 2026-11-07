@@ -121,6 +121,7 @@ impl Rational {
 
 /// `fishead` ident header packet (Skeleton 3.0 + 4.0 layout).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FisHead {
     /// Skeleton version. 3.0 omits the segment-length / content-byte-offset
     /// fields; 4.0 carries them.
@@ -145,6 +146,50 @@ pub struct FisHead {
     /// Content byte offset (4.0 only). Offset of the first non-header
     /// page in the Ogg segment. `None` for 3.0 headers.
     pub content_byte_offset: Option<u64>,
+}
+
+impl FisHead {
+    /// Builder: set [`version`](Self::version).
+    #[must_use]
+    pub fn with_version(mut self, v: Version) -> Self {
+        self.version = v;
+        self
+    }
+
+    /// Builder: set [`presentation_time`](Self::presentation_time).
+    #[must_use]
+    pub fn with_presentation_time(mut self, v: Rational) -> Self {
+        self.presentation_time = v;
+        self
+    }
+
+    /// Builder: set [`basetime`](Self::basetime).
+    #[must_use]
+    pub fn with_basetime(mut self, v: Rational) -> Self {
+        self.basetime = v;
+        self
+    }
+
+    /// Builder: set [`utc`](Self::utc).
+    #[must_use]
+    pub fn with_utc(mut self, v: [u8; 20]) -> Self {
+        self.utc = v;
+        self
+    }
+
+    /// Builder: set [`segment_length`](Self::segment_length).
+    #[must_use]
+    pub fn with_segment_length(mut self, v: Option<u64>) -> Self {
+        self.segment_length = v;
+        self
+    }
+
+    /// Builder: set [`content_byte_offset`](Self::content_byte_offset).
+    #[must_use]
+    pub fn with_content_byte_offset(mut self, v: Option<u64>) -> Self {
+        self.content_byte_offset = v;
+        self
+    }
 }
 
 impl FisHead {
@@ -497,6 +542,7 @@ impl Utc {
 /// Many others are defined in
 /// `docs/container/ogg/ogg-skeleton-message-headers.wiki`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageHeader {
     /// Field name, e.g. `Content-Type`. Stored as-written; lookup is
     /// case-insensitive per HTTP convention.
@@ -523,6 +569,7 @@ impl MessageHeader {
 /// roles are possible, too", so callers will see [`RoleKind::Other`]
 /// for forward-compatible / vendor-defined values.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RoleKind {
     /// `text/caption` — transcription of all sounds, including speech,
     /// for the hard-of-hearing.
@@ -676,6 +723,7 @@ impl RoleKind {
 /// helpers are case-insensitive on the key per the HTTP-style framing
 /// the rest of the Skeleton message-header block uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Role {
     /// Semantic role kind (one of the enumerated wiki values, or
     /// [`RoleKind::Other`]).
@@ -848,6 +896,7 @@ impl DisplayCoord {
 /// [`DisplayHint::Other`] with the original tag plus the raw
 /// comma-separated argument list, instead of failing to parse.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum DisplayHint {
     /// `pip(x,y[,w,h])` picture-in-picture hint. `width` / `height` are
     /// `None` when the wiki's 2-arg shorthand (`pip(20%,20%)`) is used.
@@ -1123,6 +1172,7 @@ impl core::fmt::Display for DisplayCoord {
 /// `image/*` for cover-art tracks, etc. The original token is preserved
 /// inside `Other` so callers can route on a string match.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentTypeKind {
     /// `audio/*` — Vorbis, Opus, Speex, FLAC, …
     Audio,
@@ -1225,6 +1275,7 @@ impl ContentTypeKind {
 /// token is trimmed — the same HTTP-style framing tolerance the other
 /// typed accessors apply.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentType {
     /// Top-level MIME type bucketed by [`ContentTypeKind`]. The original
     /// token survives inside [`ContentTypeKind::Other`] for forward-
@@ -1551,6 +1602,7 @@ fn is_xml_name_char(c: char) -> bool {
 
 /// `fisbone` secondary header packet describing one logical bitstream.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FisBone {
     /// `bitstream_serial_number` of the content track this fisbone
     /// describes (RFC 3533 §6 field 5). Matches the BOS page of the
@@ -1577,6 +1629,57 @@ pub struct FisBone {
     /// HTTP-style message header fields. Compulsory ones in 4.0 are
     /// `Content-Type`, `Role`, `Name`.
     pub headers: Vec<MessageHeader>,
+}
+
+impl FisBone {
+    /// Builder: set [`serial`](Self::serial).
+    #[must_use]
+    pub fn with_serial(mut self, v: u32) -> Self {
+        self.serial = v;
+        self
+    }
+
+    /// Builder: set [`num_headers`](Self::num_headers).
+    #[must_use]
+    pub fn with_num_headers(mut self, v: u32) -> Self {
+        self.num_headers = v;
+        self
+    }
+
+    /// Builder: set [`granule_rate`](Self::granule_rate).
+    #[must_use]
+    pub fn with_granule_rate(mut self, v: Rational) -> Self {
+        self.granule_rate = v;
+        self
+    }
+
+    /// Builder: set [`basegranule`](Self::basegranule).
+    #[must_use]
+    pub fn with_basegranule(mut self, v: i64) -> Self {
+        self.basegranule = v;
+        self
+    }
+
+    /// Builder: set [`preroll`](Self::preroll).
+    #[must_use]
+    pub fn with_preroll(mut self, v: u32) -> Self {
+        self.preroll = v;
+        self
+    }
+
+    /// Builder: set [`granuleshift`](Self::granuleshift).
+    #[must_use]
+    pub fn with_granuleshift(mut self, v: u8) -> Self {
+        self.granuleshift = v;
+        self
+    }
+
+    /// Builder: set [`headers`](Self::headers).
+    #[must_use]
+    pub fn with_headers(mut self, v: Vec<MessageHeader>) -> Self {
+        self.headers = v;
+        self
+    }
 }
 
 impl FisBone {
@@ -2200,6 +2303,7 @@ pub struct KeyPoint {
 
 /// Skeleton 4.0 keyframe index packet (`index\0`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SkelIndex {
     /// `bitstream_serial_number` of the content stream this index applies to.
     pub serial: u32,
@@ -2217,6 +2321,43 @@ pub struct SkelIndex {
     /// increasing order by offset (and thus by presentation time as
     /// well).").
     pub keypoints: Vec<KeyPoint>,
+}
+
+impl SkelIndex {
+    /// Builder: set [`serial`](Self::serial).
+    #[must_use]
+    pub fn with_serial(mut self, v: u32) -> Self {
+        self.serial = v;
+        self
+    }
+
+    /// Builder: set [`timestamp_denominator`](Self::timestamp_denominator).
+    #[must_use]
+    pub fn with_timestamp_denominator(mut self, v: i64) -> Self {
+        self.timestamp_denominator = v;
+        self
+    }
+
+    /// Builder: set [`first_sample_time`](Self::first_sample_time).
+    #[must_use]
+    pub fn with_first_sample_time(mut self, v: i64) -> Self {
+        self.first_sample_time = v;
+        self
+    }
+
+    /// Builder: set [`last_sample_time`](Self::last_sample_time).
+    #[must_use]
+    pub fn with_last_sample_time(mut self, v: i64) -> Self {
+        self.last_sample_time = v;
+        self
+    }
+
+    /// Builder: set [`keypoints`](Self::keypoints).
+    #[must_use]
+    pub fn with_keypoints(mut self, v: Vec<KeyPoint>) -> Self {
+        self.keypoints = v;
+        self
+    }
 }
 
 impl SkelIndex {
@@ -2581,6 +2722,7 @@ pub fn read_vbi_u64(buf: &[u8]) -> Option<(u64, usize)> {
 /// arrive. The same struct is what an encoder hands to the muxer when
 /// it wants Skeleton emitted alongside the content streams.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct Skeleton {
     /// The Skeleton BOS ident packet. `None` until parsed.
     pub head: Option<FisHead>,
@@ -2594,6 +2736,36 @@ pub struct Skeleton {
     /// Skeleton was constructed for encoding without a chosen serial
     /// yet — pass a serial at mux time in that case.
     pub serial: Option<u32>,
+}
+
+impl Skeleton {
+    /// Builder: set [`head`](Self::head).
+    #[must_use]
+    pub fn with_head(mut self, v: Option<FisHead>) -> Self {
+        self.head = v;
+        self
+    }
+
+    /// Builder: set [`bones`](Self::bones).
+    #[must_use]
+    pub fn with_bones(mut self, v: Vec<FisBone>) -> Self {
+        self.bones = v;
+        self
+    }
+
+    /// Builder: set [`indexes`](Self::indexes).
+    #[must_use]
+    pub fn with_indexes(mut self, v: Vec<SkelIndex>) -> Self {
+        self.indexes = v;
+        self
+    }
+
+    /// Builder: set [`serial`](Self::serial).
+    #[must_use]
+    pub fn with_serial(mut self, v: Option<u32>) -> Self {
+        self.serial = v;
+        self
+    }
 }
 
 impl Skeleton {

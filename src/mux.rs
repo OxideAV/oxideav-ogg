@@ -70,6 +70,7 @@ pub fn open_with_skeleton(
 /// that recommendation; tests and high-keypoint-density use cases can
 /// relax both gaps.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct AutoIndexConfig {
     /// Maximum number of keypoints recorded per content stream. The
     /// placeholder `index\0` packet written in the header section
@@ -91,6 +92,29 @@ pub struct AutoIndexConfig {
     /// two consecutive keypoints of the same stream. Spec-recommended
     /// default: 1000 ms.
     pub min_keypoint_time_gap_ms: u64,
+}
+
+impl AutoIndexConfig {
+    /// Builder: set [`max_keypoints`](Self::max_keypoints).
+    #[must_use]
+    pub fn with_max_keypoints(mut self, v: usize) -> Self {
+        self.max_keypoints = v;
+        self
+    }
+
+    /// Builder: set [`min_keypoint_byte_gap`](Self::min_keypoint_byte_gap).
+    #[must_use]
+    pub fn with_min_keypoint_byte_gap(mut self, v: u64) -> Self {
+        self.min_keypoint_byte_gap = v;
+        self
+    }
+
+    /// Builder: set [`min_keypoint_time_gap_ms`](Self::min_keypoint_time_gap_ms).
+    #[must_use]
+    pub fn with_min_keypoint_time_gap_ms(mut self, v: u64) -> Self {
+        self.min_keypoint_time_gap_ms = v;
+        self
+    }
 }
 
 impl Default for AutoIndexConfig {

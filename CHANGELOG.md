@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `with_*` setters on `AutoIndexConfig`, `FisHead`, `FisBone`, `SkelIndex` and `Skeleton`.
+
 ### Changed
 
+- API hygiene: the enums `skeleton::{RoleKind, DisplayHint,
+  ContentTypeKind}` and `validate::Severity`, and the records
+  `mux::AutoIndexConfig`, `skeleton::{FisHead, FisBone, SkelIndex,
+  Skeleton, MessageHeader, Role, ContentType}`, `demux::DamageEvent`,
+  `page::PacketSegment`, `validate::{Issue, ConformanceReport}` are now
+  `#[non_exhaustive]`; build them through their existing constructors,
+  `Default` and the new `with_*` setters. `page::Page` and
+  `theora::TheoraIdHeader` (frozen on-wire layouts), the value types
+  `Version`, `Rational`, `Utc`, `KeyPoint`, `TheoraGranule`, and
+  `DisplayCoord` stay exhaustive.
 - edition 2024, MSRV 1.95
 
 ## [0.1.9](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.8...v0.1.9) - 2026-10-04

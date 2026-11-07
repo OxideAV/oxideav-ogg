@@ -203,6 +203,7 @@ impl Page {
 
 /// One packet (or partial packet) carried inside a page.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PacketSegment {
     pub seg_range: std::ops::Range<usize>,
     pub data: std::ops::Range<usize>,

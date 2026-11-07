@@ -79,6 +79,7 @@ impl std::fmt::Display for DamageKind {
 /// `resync_count` / `duplicate_serial_count` counters. Retrieved via
 /// [`OggDemuxer::damage_events`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct DamageEvent {
     /// What happened.
     pub kind: DamageKind,

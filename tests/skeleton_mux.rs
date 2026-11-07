@@ -652,11 +652,10 @@ fn mux_indexed(
 /// Permissive gating for tests: every keyframe page becomes a keypoint
 /// (subject only to `max_keypoints`).
 fn permissive_cfg(max_keypoints: usize) -> oxideav_ogg::mux::AutoIndexConfig {
-    oxideav_ogg::mux::AutoIndexConfig {
-        max_keypoints,
-        min_keypoint_byte_gap: 0,
-        min_keypoint_time_gap_ms: 0,
-    }
+    oxideav_ogg::mux::AutoIndexConfig::default()
+        .with_max_keypoints(max_keypoints)
+        .with_min_keypoint_byte_gap(0)
+        .with_min_keypoint_time_gap_ms(0)
 }
 
 fn skel_with_bone() -> Skeleton {
@@ -731,11 +730,10 @@ fn auto_index_thins_keypoints_per_byte_and_time_gaps() {
     // accepts only the first candidate.
     let stream = vorbis_stream_fixture();
     let packets: Vec<(u32, i64, bool)> = (1..=6).map(|i| (0u32, 960 * i, true)).collect();
-    let cfg = oxideav_ogg::mux::AutoIndexConfig {
-        max_keypoints: 16,
-        min_keypoint_byte_gap: 1 << 20,
-        min_keypoint_time_gap_ms: 0,
-    };
+    let cfg = oxideav_ogg::mux::AutoIndexConfig::default()
+        .with_max_keypoints(16)
+        .with_min_keypoint_byte_gap(1 << 20)
+        .with_min_keypoint_time_gap_ms(0);
     let bytes = mux_indexed(vec![stream], skel_with_bone(), cfg, &packets);
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver).unwrap();
@@ -745,11 +743,10 @@ fn auto_index_thins_keypoints_per_byte_and_time_gaps() {
     // again only the first candidate survives.
     let stream = vorbis_stream_fixture();
     let packets: Vec<(u32, i64, bool)> = (1..=6).map(|i| (0u32, 960 * i, true)).collect();
-    let cfg = oxideav_ogg::mux::AutoIndexConfig {
-        max_keypoints: 16,
-        min_keypoint_byte_gap: 0,
-        min_keypoint_time_gap_ms: 1000,
-    };
+    let cfg = oxideav_ogg::mux::AutoIndexConfig::default()
+        .with_max_keypoints(16)
+        .with_min_keypoint_byte_gap(0)
+        .with_min_keypoint_time_gap_ms(1000);
     let bytes = mux_indexed(vec![stream], skel_with_bone(), cfg, &packets);
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let dmx = oxideav_ogg::demux::open_concrete(reader, &oxideav_core::NullCodecResolver).unwrap();
