@@ -508,6 +508,9 @@ struct LogicalStream {
     /// terminator passes or a fresh packet starts. While set, a
     /// `continued` page with nothing buffered is expected, not damage.
     discarding: bool,
+    /// Set when a pre-seek walk for this stream's outstanding header
+    /// packets ran out of budget or input; the walk is not repeated.
+    headers_abandoned: bool,
     /// True while every page of this stream since its BOS has been read
     /// in order (no seek in between), which is what makes
     /// `first_data_page_off` trustworthy when it is recorded.
@@ -2612,6 +2615,7 @@ impl OggDemuxer {
                 pending_valid: false,
                 bos_processed: false,
                 discarding: false,
+                headers_abandoned: false,
                 contiguous: true,
                 first_data_page_off: None,
                 theora_next_frame: None,
@@ -2983,7 +2987,10 @@ impl OggDemuxer {
             me.state_by_serial
                 .iter()
                 .filter(|(_, s)| {
-                    s.link_index == link && s.headers_remaining > 0 && s.bos_processed == started
+                    s.link_index == link
+                        && s.headers_remaining > 0
+                        && !s.headers_abandoned
+                        && s.bos_processed == started
                 })
                 .map(|(&serial, _)| serial)
                 .collect::<Vec<u32>>()
@@ -3005,13 +3012,13 @@ impl OggDemuxer {
                 }
             }
         }
-        let mut budget = HEADER_SECTION_MAX_PAGES;
-        while budget > 0
-            && self
-                .state_by_serial
+        let outstanding = |me: &Self| {
+            me.state_by_serial
                 .values()
-                .any(|s| s.link_index == link && s.headers_remaining > 0)
-        {
+                .any(|s| s.link_index == link && s.headers_remaining > 0 && !s.headers_abandoned)
+        };
+        let mut budget = HEADER_SECTION_MAX_PAGES;
+        while budget > 0 && outstanding(self) {
             budget -= 1;
             let (page_off, page) = match self.page_queue.pop_front() {
                 Some(p) => p,
@@ -3027,6 +3034,13 @@ impl OggDemuxer {
                 continue;
             }
             self.process_page(page, page_off, None)?;
+        }
+        // Headers that did not turn up within the budget never will on a
+        // later attempt either: do not pay for the walk again.
+        for state in self.state_by_serial.values_mut() {
+            if state.link_index == link && state.headers_remaining > 0 {
+                state.headers_abandoned = true;
+            }
         }
         Ok(())
     }
