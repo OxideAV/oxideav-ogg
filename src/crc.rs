@@ -11,17 +11,19 @@
 //! The CRC field itself lives at bytes 22..26 of an Ogg page header (RFC 3533
 //! §6 byte diagram).
 //!
-//! Round 192 (depth-mode profile) replaced the original scalar
-//! byte-at-a-time loop with a **slice-by-4** implementation: four
-//! pre-shifted tables `T0..T3` advance the CRC over four input bytes per
-//! iteration using a single XOR fan-in, then a scalar tail mops up the
-//! remainder. The single-byte step (and the slice-by-4 step) are derived
-//! from the same generator polynomial as the original byte table — there
-//! is no new mathematical constant; only the loop structure differs.
-//! `compute_page_checksum` additionally splits its input into three
-//! straight-line segments (`[..22]`, four zero bytes for the CRC field,
-//! `[26..]`) so the per-byte "is this index in the CRC field" range
-//! check the original loop performed is gone.
+//! The hot loop consumes **sixteen input bytes per step**. A byte that
+//! sits `k` positions before the end of a block still has `k` further
+//! byte-shifts ahead of it, so its contribution is the single-byte table
+//! advanced through `k` zero bytes; sixteen such tables (`RANKS[0]` …
+//! `RANKS[15]`, each derived from the generator polynomial at compile
+//! time by the recurrence in [`build_slice_table`]) turn the block into
+//! sixteen independent lookups XORed together. The lookups do not depend
+//! on one another, so the processor overlaps them; the serial dependency
+//! is one XOR tree per sixteen bytes instead of one table step per byte.
+//! A four-byte step and a scalar tail finish the remainder.
+//! `compute_page_checksum` splits its input into three straight-line
+//! segments (`[..22]`, four zero bytes for the CRC field, `[26..]`) so
+//! no per-byte "is this index in the CRC field" test is needed.
 
 /// CRC-32/Ogg lookup table T0 (the standard single-byte advancement
 /// table), generated at compile time.
@@ -49,14 +51,28 @@ const T0: [u32; 256] = {
     table
 };
 
-/// Slice-by-4 advancement table T1: equivalent to running T0 once on the
-/// indexed byte, then advancing one more zero byte through T0. In the
-/// slice-by-4 loop this folds in the byte that was three positions ago
-/// (i.e. one rank deeper than T0).
+/// `RANKS[k]` is the single-byte table advanced through `k` zero bytes
+/// (`RANKS[0]` is [`T0`] itself). Sixteen ranks serve the sixteen-byte
+/// step; the first four also serve the four-byte step.
+static RANKS: [[u32; 256]; 16] = {
+    let mut ranks = [T0; 16];
+    let mut k = 1;
+    while k < 16 {
+        ranks[k] = build_slice_table(ranks[k - 1]);
+        k += 1;
+    }
+    ranks
+};
+
+/// Rank-1 table (T0 advanced by one zero byte); kept by name for the
+/// recurrence tests.
+#[cfg(test)]
 const T1: [u32; 256] = build_slice_table(T0);
-/// Slice-by-4 advancement table T2: T0 advanced by two zero bytes.
+/// Rank-2 table.
+#[cfg(test)]
 const T2: [u32; 256] = build_slice_table(T1);
-/// Slice-by-4 advancement table T3: T0 advanced by three zero bytes.
+/// Rank-3 table.
+#[cfg(test)]
 const T3: [u32; 256] = build_slice_table(T2);
 
 /// Given a single-byte advancement table `prev`, return the table that
@@ -78,8 +94,7 @@ const fn build_slice_table(prev: [u32; 256]) -> [u32; 256] {
 /// Compute the CRC-32 over `bytes` using the Ogg parameters.
 ///
 /// Starts from CRC `0` (the per-page initial value RFC 3533 §6 field 7
-/// specifies). Internally dispatches to the slice-by-4 fast path for the
-/// `bytes.len() & !3` prefix and a scalar tail for the remaining 0–3 bytes.
+/// specifies). Sixteen bytes per step, then four, then a scalar tail.
 pub fn checksum(bytes: &[u8]) -> u32 {
     continue_checksum(0, bytes)
 }
@@ -97,24 +112,40 @@ pub fn checksum(bytes: &[u8]) -> u32 {
 /// check the original implementation paid for every input byte.
 pub fn continue_checksum(state: u32, bytes: &[u8]) -> u32 {
     let mut crc = state;
-    // Slice-by-4 main loop. For each block of 4 bytes the CRC advances
-    // by four positions using `T3 ^ T2 ^ T1 ^ T0`, where T0 mops up the
-    // most-recent byte and T3 the byte three slots back. The recurrence
-    // is derived from running the textbook scalar step four times on a
-    // virtual stream where the three "future" bytes are zero; XOR-ing
-    // the four-byte word into the running state at the start substitutes
-    // the real bytes back in.
-    let (chunks, tail) = bytes.as_chunks::<4>();
-    for chunk in chunks {
-        // The state's top 32 bits get XORed against the 4 input bytes
-        // big-endian (the textbook MSB-first loop pulls bytes out of the
-        // CRC's high byte first, so input rank 0 lines up with the high
-        // byte of the state).
-        let w = crc ^ u32::from_be_bytes(*chunk);
-        crc = T3[((w >> 24) & 0xFF) as usize]
-            ^ T2[((w >> 16) & 0xFF) as usize]
-            ^ T1[((w >> 8) & 0xFF) as usize]
-            ^ T0[(w & 0xFF) as usize];
+    // Sixteen bytes per step. The running state is XORed into the first
+    // four bytes of the block (the MSB-first recurrence pulls input
+    // through the state's high byte, so block byte 0 lines up with the
+    // state's top byte); after that every byte of the block is an
+    // independent lookup in the rank matching its distance from the
+    // block's end.
+    let (blocks, rest) = bytes.as_chunks::<16>();
+    for block in blocks {
+        let head = crc ^ u32::from_be_bytes([block[0], block[1], block[2], block[3]]);
+        crc = RANKS[15][(head >> 24) as usize]
+            ^ RANKS[14][((head >> 16) & 0xFF) as usize]
+            ^ RANKS[13][((head >> 8) & 0xFF) as usize]
+            ^ RANKS[12][(head & 0xFF) as usize]
+            ^ RANKS[11][block[4] as usize]
+            ^ RANKS[10][block[5] as usize]
+            ^ RANKS[9][block[6] as usize]
+            ^ RANKS[8][block[7] as usize]
+            ^ RANKS[7][block[8] as usize]
+            ^ RANKS[6][block[9] as usize]
+            ^ RANKS[5][block[10] as usize]
+            ^ RANKS[4][block[11] as usize]
+            ^ RANKS[3][block[12] as usize]
+            ^ RANKS[2][block[13] as usize]
+            ^ RANKS[1][block[14] as usize]
+            ^ RANKS[0][block[15] as usize];
+    }
+    // Four bytes per step for what is left of a partial block.
+    let (words, tail) = rest.as_chunks::<4>();
+    for word in words {
+        let w = crc ^ u32::from_be_bytes(*word);
+        crc = RANKS[3][(w >> 24) as usize]
+            ^ RANKS[2][((w >> 16) & 0xFF) as usize]
+            ^ RANKS[1][((w >> 8) & 0xFF) as usize]
+            ^ RANKS[0][(w & 0xFF) as usize];
     }
     // Scalar tail.
     for &b in tail {
@@ -154,7 +185,7 @@ fn advance_four_zero_bytes(state: u32) -> u32 {
 /// Returns `None` if the slice is too short to contain even the CRC
 /// field (i.e. fewer than 26 bytes).
 ///
-/// Implementation note (r192): split into three straight-line segments
+/// Implementation note: split into three straight-line segments
 /// (`[..22]`, four-zero CRC-field substitute, `[26..]`) so the per-byte
 /// "is this index in the CRC field?" range check the original
 /// implementation performed is gone. For a max-size 65 KiB page this
