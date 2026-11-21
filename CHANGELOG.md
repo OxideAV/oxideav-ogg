@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.9...v0.2.0) - 2026-11-21
+
+### Other
+
+- do not repeat a failed pre-seek header walk
+- collect completed packets in one pass
+- page size / duration policy, append-only output, bounded interleave
+- windowed whole-file index scan, bounded passing index
+- seek-free linear path, lazy duration, bounded reassembly, exact bounded seeks
+- sixteen input bytes per step
+- scheduled Fuzz workflow for the ten cargo-fuzz targets
+- API hygiene: non_exhaustive Skeleton records, mux config, reports
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - Scheduled Fuzz workflow (daily, the ten existing cargo-fuzz targets).
