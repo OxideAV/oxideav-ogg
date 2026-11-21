@@ -145,10 +145,19 @@ fn indexed_seek_to_zero_returns_earliest_page() {
     let mut demux = oxideav_ogg::demux::open_indexed(reader, &oxideav_core::NullCodecResolver)
         .expect("open with index");
 
+    // A seek never lands on a header page (replaying the BOS page would
+    // look like a second bitstream on the same serial): the earliest
+    // landing point is the stream's first content page.
     let landed = demux.seek_to(0, 0).expect("indexed seek to 0");
     assert_eq!(
-        landed, 0,
-        "seek to granule 0 should land on the BOS page (granule = 0), got {landed}"
+        landed, 960,
+        "seek to granule 0 should land on the first content page (granule 960), got {landed}"
+    );
+    let first = demux.next_packet().expect("packet after seek");
+    assert_eq!(
+        first.pts,
+        Some(960),
+        "first packet after the seek is content"
     );
 }
 

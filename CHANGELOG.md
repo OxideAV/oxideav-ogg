@@ -9,10 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Scheduled Fuzz workflow (daily, the ten existing cargo-fuzz targets).
+- Demuxer: `OggDemuxer::set_max_packet_bytes` / `max_packet_bytes` /
+  `oversized_packet_count`, `demux::DEFAULT_MAX_PACKET_BYTES` (64 MiB)
+  and `DamageKind::OversizedPacket` — a packet continued over an
+  endless run of pages is dropped at the cap instead of being buffered
+  without bound.
+- `examples/throughput.rs`: one-hour Vorbis-shaped and Opus-shaped mux /
+  open / demux / seek measurement with heap and I/O accounting.
 - `with_*` setters on `AutoIndexConfig`, `FisHead`, `FisBone`, `SkelIndex` and `Skeleton`.
 
 ### Changed
 
+- Demuxer reads through a single position-tracking window: `open` and
+  linear demux perform **no seek at all** (capture loss, checksum
+  failures and truncated tails are resolved inside the window), so
+  pipes and other unseekable sources demux exactly like files, and the
+  per-page position query, scratch allocations and double copy are
+  gone.
+- `open` no longer reads the end of the input. The duration is probed
+  on the first `duration_micros()` call, trusts only checksum-valid
+  pages, and stays `None` on a source that cannot seek.
+- `seek_to` rewritten: interpolated guess between bracketing granules,
+  step-back on overshoot, bisection as the fallback, short final walk.
+  It lands on the last *content* page at or before the target (never
+  on a header page — a seek to 0 used to replay the BOS page as a
+  duplicate bitstream), is correct on chained files without a prior
+  index scan, verifies the checksum of every page a probe locks onto,
+  and reports no hole / framing error for the landing itself. Opus
+  seeks land 80 ms (3840 samples) ahead of the target for decoder
+  convergence. One-hour file, cold seek: 62.9 → 3.4 reads (Vorbis),
+  58.4 → 3.3 reads (Opus).
+- A malformed identification header degrades that stream's parameters
+  instead of failing the whole container.
+- Page checksum: sixteen input bytes per step (sixteen compile-time
+  tables derived from the generator polynomial) instead of four.
 - API hygiene: the enums `skeleton::{RoleKind, DisplayHint,
   ContentTypeKind}` and `validate::Severity`, and the records
   `mux::AutoIndexConfig`, `skeleton::{FisHead, FisBone, SkelIndex,

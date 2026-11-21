@@ -109,6 +109,7 @@ pub mod framing;
 pub mod mux;
 pub mod page;
 pub mod skeleton;
+mod source;
 pub mod theora;
 pub mod validate;
 

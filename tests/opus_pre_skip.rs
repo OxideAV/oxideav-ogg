@@ -143,32 +143,33 @@ fn zero_pre_skip_is_transparent() {
 fn seek_lands_on_pcm_position_floor_not_pre_skip_early() {
     // pre_skip = 11971. Page i carries raw granule `11971 + 960*i`, so its
     // PCM sample position (RFC 7845 §4.3) is `960*i`. The user seeks by PCM
-    // position, so seeking to pts = 5000 samples must land on the page whose
-    // PCM position floors 5000 — page 5 (PCM 4800 ≤ 5000 < page 6's 5760) —
-    // and return that page's *raw* on-wire granule 11971 + 960*5 = 16771.
-    // A demuxer that compared the raw granule against the raw `pts` would
-    // instead floor 5000 directly and land ~pre_skip/48000 s = ~0.25 s early.
+    // position, and an Opus seek lands 80 ms (3840 samples) ahead of the
+    // target so the decoder has converged when it gets there: seeking to
+    // pts = 5000 searches for PCM position 5000 − 3840 = 1160, whose floor
+    // is page 1 (PCM 960 ≤ 1160 < page 2's 1920), and returns that page's
+    // *raw* on-wire granule 11971 + 960. A demuxer that compared the raw
+    // granule against the raw `pts` would land ~pre_skip/48000 s = ~0.25 s
+    // early instead (before the first page here).
     let pre_skip = 11_971i64;
     let blob = build_opus(0x0DDF_ACE4, pre_skip as u16, 20, 2);
     let reader: Box<dyn ReadSeek> = Box::new(Cursor::new(blob));
-    // Use the dense-index path (`build_seek_index`) so the exact floor lookup
-    // (`index_floor_by`) drives the result — the byte-bisection fallback is
-    // coarse on tiny synthetic files regardless of codec.
+    // Dense-index path (`build_seek_index`); `seek_exact.rs` covers the
+    // un-indexed search.
     let mut demux = oxideav_ogg::demux::open_concrete(reader, &NullCodecResolver)
         .expect("open concrete demuxer");
     demux.build_seek_index().expect("index");
 
     let target_pcm = 5_000i64;
     let landed = demux.seek_to(0, target_pcm).expect("seek_to ok");
-    let expected_raw = pre_skip + 960 * 5;
+    let expected_raw = pre_skip + 960;
     assert_eq!(
         landed, expected_raw,
-        "Opus seek should land on the PCM-position floor page (raw granule {expected_raw}), got {landed}",
+        "Opus seek should land on the pre-rolled PCM-position floor page (raw granule {expected_raw}), got {landed}",
     );
-    // The landed page's PCM position must be ≤ the target.
+    // The landed page's PCM position must leave at least 80 ms of pre-roll.
     assert!(
-        landed - pre_skip <= target_pcm,
-        "landed PCM position {} should be ≤ target {target_pcm}",
+        landed - pre_skip <= target_pcm - 3_840,
+        "landed PCM position {} should be ≤ target {target_pcm} − 3840",
         landed - pre_skip,
     );
 }
@@ -233,7 +234,8 @@ fn opus_seek_with_pre_skip_is_distinct_from_zero_pre_skip() {
     // Two otherwise-identical Opus streams differing only in pre-skip must
     // floor the same PCM-position target onto pages whose *raw* granules
     // differ by exactly the pre-skip — proving the seek axis is PCM
-    // position, not the raw granule. Target 5000 → page 5 (PCM 4800).
+    // position, not the raw granule. Target 5000, minus the 80 ms Opus
+    // pre-roll, is 1160 → page 1 (PCM 960).
     let target_pcm = 5_000i64;
 
     let blob_a = build_opus(0x0DDF_ACF1, 0, 20, 2);
@@ -249,10 +251,10 @@ fn opus_seek_with_pre_skip_is_distinct_from_zero_pre_skip() {
     demux_b.build_seek_index().unwrap();
     let landed_b = demux_b.seek_to(0, target_pcm).unwrap();
 
-    // Both land on the same PCM-position floor page (page 5), so the raw
+    // Both land on the same PCM-position floor page (page 1), so the raw
     // granules differ by exactly the pre-skip.
-    assert_eq!(landed_a, 960 * 5, "zero-pre-skip raw granule");
-    assert_eq!(landed_b, pre_skip_b + 960 * 5, "pre-skip raw granule");
+    assert_eq!(landed_a, 960, "zero-pre-skip raw granule");
+    assert_eq!(landed_b, pre_skip_b + 960, "pre-skip raw granule");
     assert_eq!(
         landed_b - landed_a,
         pre_skip_b,
