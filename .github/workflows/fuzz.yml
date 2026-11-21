@@ -1,0 +1,23 @@
+name: Fuzz
+
+# Daily run of the cargo-fuzz harnesses under fuzz/. The Ogg demuxer
+# is fed attacker-controlled bytes by design: page headers with forged
+# lacing tables, capture patterns buried in garbage, broken checksums,
+# sequence-number holes, duplicate serials, chained and grouped BOS
+# graphs, hostile Skeleton index packets and seek targets. Ten targets
+# share the budget (page_parse, demux_recapture, framing_layer,
+# granule_walk, seek_hostile, chain_graph, continued_edge,
+# mux_roundtrip, skeleton_parse, validate); every one must error or
+# parse, never panic, hang or balloon.
+
+on:
+  schedule:
+    - cron: "41 6 * * *"   # daily 06:41 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit
