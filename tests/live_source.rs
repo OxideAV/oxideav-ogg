@@ -379,3 +379,31 @@ fn garbage_dense_with_capture_patterns_is_crossed_in_linear_reads() {
         io.reads.load(Ordering::Relaxed)
     );
 }
+
+#[test]
+fn a_malformed_identification_header_does_not_fail_the_container() {
+    // Two multiplexed streams; the second one's Vorbis identification
+    // header is cut short. The file opens, both streams are listed, and
+    // the healthy stream's packets all arrive.
+    let pages = stream_pages(30);
+    let other = 0x0BAD_1D00u32;
+    let bad_bos = Page {
+        flags: flags::FIRST_PAGE,
+        granule_position: 0,
+        serial: other,
+        seq_no: 0,
+        lacing: lace(9),
+        data: b"\x01vorbis\0\0".to_vec(),
+    }
+    .to_bytes();
+    let mut bytes = pages[0].clone();
+    bytes.extend_from_slice(&bad_bos);
+    bytes.extend(pages[1..].concat());
+
+    let mut d = open(Box::new(std::io::Cursor::new(bytes)));
+    assert_eq!(d.streams().len(), 2);
+    assert_eq!(d.streams()[0].params.sample_rate, Some(48_000));
+    assert_eq!(d.streams()[1].params.sample_rate, None);
+    let got = drain(&mut d);
+    assert_eq!(got.len(), 60);
+}

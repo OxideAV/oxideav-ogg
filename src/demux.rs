@@ -35,6 +35,10 @@ const DURATION_PROBE_BYTES: u64 = 128 * 1024;
 /// run on an endless stream could otherwise make the demuxer buffer.
 pub const DEFAULT_MAX_PACKET_BYTES: usize = 64 * 1024 * 1024;
 
+/// Most entries per stream kept in the seek index from pages merely
+/// noted in passing (linear demux, seek probes): 1 MiB per stream.
+const PASSING_INDEX_ENTRIES: usize = 65_536;
+
 /// How far a single seek probe walks past pages that decide nothing
 /// (pages of other streams in the same chain link, pages on which no
 /// packet finishes) before giving up on its starting offset.
@@ -557,6 +561,8 @@ pub struct OggDemuxer {
     /// True once `build_seek_index` has run successfully, so we don't
     /// repeat the full-file scan on later calls.
     seek_index_built: bool,
+    /// True while the `build_seek_index` scan is recording pages.
+    index_scan_active: bool,
     /// Next chained-link index to assign on the next BOS-after-non-BOS.
     /// Initialised to 0; the very first BOS section all shares link 0,
     /// and the counter increments on each subsequent BOS that follows
@@ -760,6 +766,7 @@ impl OggDemuxer {
             duration_probed: Cell::new(false),
             seek_index: HashMap::new(),
             seek_index_built: false,
+            index_scan_active: false,
             next_link_index: 0,
             seen_nonbos_in_current_link: false,
             holes: 0,
@@ -869,10 +876,25 @@ impl OggDemuxer {
         if granule < 0 {
             return;
         }
+        let dense = self.seek_index_built || self.index_scan_active;
         let entries = self.seek_index.entry(serial).or_default();
         match entries.binary_search_by(|(g, o)| g.cmp(&granule).then_with(|| o.cmp(&offset))) {
             Ok(_) => {} // already present
             Err(pos) => entries.insert(pos, (granule, offset)),
+        }
+        // Pages noted in passing only seed later seeks, so the list may
+        // be thinned: on an endless stream it must not grow with the
+        // stream. Dropping every other entry (the first one stays — it
+        // is the stream's earliest known page) keeps old regions
+        // sparsely covered and recent ones densely. The explicit
+        // `build_seek_index` scan is exempt: its index is exhaustive by
+        // contract.
+        if !dense && entries.len() >= PASSING_INDEX_ENTRIES {
+            let mut keep = false;
+            entries.retain(|_| {
+                keep = !keep;
+                keep
+            });
         }
     }
 
@@ -907,6 +929,13 @@ impl OggDemuxer {
     /// [`Self::identify_codec`] for the resolution order. Private:
     /// only [`open_indexed`] can supply a borrow that is still alive.
     fn build_seek_index_with(&mut self, codecs: Option<&dyn CodecResolver>) -> Result<()> {
+        self.index_scan_active = true;
+        let outcome = self.scan_whole_file(codecs);
+        self.index_scan_active = false;
+        outcome
+    }
+
+    fn scan_whole_file(&mut self, codecs: Option<&dyn CodecResolver>) -> Result<()> {
         let saved_pos = self.input.get_mut().stream_position()?;
         let end = self.input.get_mut().total_len()?;
         if end == 0 {
@@ -934,64 +963,34 @@ impl OggDemuxer {
         // and `open_indexed` (build immediately after open) does not double-count
         // duplicates the subsequent `next_packet` walk re-observes.
         self.duplicate_serials = 0;
-        // Re-use a chunk buffer to find `OggS` captures cheaply.
-        const CHUNK: u64 = 64 * 1024;
+        // Walk page to page inside the source's read window: only the
+        // header and segment table of each page are examined.
         while cursor < end {
-            self.input.get_mut().seek(SeekFrom::Start(cursor))?;
-            let want = CHUNK.min(end - cursor) as usize;
-            let mut buf = vec![0u8; want];
-            let mut filled = 0usize;
-            while filled < buf.len() {
-                match self.input.get_mut().read(&mut buf[filled..]) {
-                    Ok(0) => break,
-                    Ok(n) => filled += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            buf.truncate(filled);
-            if buf.is_empty() {
+            let input = self.input.get_mut();
+            input.seek(SeekFrom::Start(cursor))?;
+            if input.peek(27 + 255)?.len() < 27 {
                 break;
             }
-
-            // Find the first OggS capture in the chunk.
-            let mut i = 0usize;
-            let mut advanced = false;
-            while i + 4 <= buf.len() {
-                if &buf[i..i + 4] != b"OggS" {
-                    i += 1;
-                    continue;
-                }
-                let page_off = cursor + i as u64;
-
-                // Re-seek to the candidate, read header + segment table.
-                self.input.get_mut().seek(SeekFrom::Start(page_off))?;
-                let mut hdr = [0u8; 27];
-                if self.input.get_mut().read(&mut hdr)? != 27 {
+            let window = input.buffered();
+            if window[0..4] != page::CAPTURE_PATTERN {
+                // Not a page: move to the next capture pattern (keeping a
+                // 3-byte tail so one straddling the window is not missed).
+                let skip = find_capture(window).unwrap_or(window.len() - 3);
+                cursor += skip.max(1) as u64;
+                continue;
+            }
+            {
+                let page_off = cursor;
+                let n_segs = window[26] as usize;
+                if window.len() < 27 + n_segs {
                     // Truncated tail — we're done.
-                    self.input.get_mut().seek(SeekFrom::Start(saved_pos))?;
-                    self.seek_index_built = true;
-                    return Ok(());
+                    break;
                 }
-                if hdr[0..4] != page::CAPTURE_PATTERN {
-                    // False positive inside some payload byte stream
-                    // (rare, but possible). Skip past this byte and
-                    // keep scanning.
-                    i += 1;
-                    continue;
-                }
+                let hdr: [u8; 27] = window[..27].try_into().expect("27 bytes");
+                let lacing = window[27..27 + n_segs].to_vec();
                 let flags_byte = hdr[5];
-                let granule = i64::from_le_bytes([
-                    hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13],
-                ]);
-                let serial = u32::from_le_bytes([hdr[14], hdr[15], hdr[16], hdr[17]]);
-                let n_segs = hdr[26] as usize;
-                let mut lacing = vec![0u8; n_segs];
-                if self.input.get_mut().read(&mut lacing)? != n_segs {
-                    self.input.get_mut().seek(SeekFrom::Start(saved_pos))?;
-                    self.seek_index_built = true;
-                    return Ok(());
-                }
+                let granule = i64::from_le_bytes(hdr[6..14].try_into().expect("8 bytes"));
+                let serial = u32::from_le_bytes(hdr[14..18].try_into().expect("4 bytes"));
                 let data_len: u64 = lacing.iter().map(|&v| v as u64).sum();
                 self.index_record(serial, granule, page_off);
 
@@ -1026,12 +1025,13 @@ impl OggDemuxer {
                         // packets must fit in a single page per the various
                         // codec mapping RFCs, so we only need this page's
                         // data, not any continuation.
-                        let mut data = vec![0u8; data_len as usize];
-                        if self.input.get_mut().read(&mut data)? != data_len as usize {
-                            self.input.get_mut().seek(SeekFrom::Start(saved_pos))?;
-                            self.seek_index_built = true;
-                            return Ok(());
+                        let page_len = 27 + n_segs + data_len as usize;
+                        let whole = self.input.get_mut().peek(page_len)?;
+                        if whole.len() < page_len {
+                            // Truncated tail — we're done.
+                            break;
                         }
+                        let data = whole[27 + n_segs..].to_vec();
                         let synth = Page {
                             flags: flags_byte,
                             granule_position: granule,
@@ -1055,20 +1055,8 @@ impl OggDemuxer {
                     self.seen_nonbos_in_current_link = true;
                 }
 
-                // Jump cursor past the entire page body and resume
-                // chunked OggS-hunting from there.
+                // On to the next page.
                 cursor = page_off + 27 + n_segs as u64 + data_len;
-                advanced = true;
-                break;
-            }
-            if !advanced {
-                // No OggS found in this chunk — advance past it (minus
-                // a 3-byte tail to catch captures straddling the
-                // boundary).
-                if buf.len() < 4 {
-                    break;
-                }
-                cursor += buf.len() as u64 - 3;
             }
         }
 

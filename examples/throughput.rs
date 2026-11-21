@@ -385,6 +385,27 @@ fn run(kind: &str) {
         open_io.2
     );
 
+    // Whole-file index scan: median of 5.
+    let mut times = Vec::new();
+    let mut entries = 0usize;
+    let mut scan_io = (0, 0, 0);
+    for _ in 0..5 {
+        let mut d = open(&file, &io);
+        let before = io.snapshot();
+        let t = Instant::now();
+        d.build_seek_index().unwrap();
+        times.push(t.elapsed().as_secs_f64());
+        let after = io.snapshot();
+        scan_io = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+        entries = d.seek_index_len();
+    }
+    println!(
+        "[{kind}] build_seek_index: {:.2} ms, {entries} entries, {} reads / {} seeks",
+        median(times) * 1e3,
+        scan_io.0,
+        scan_io.2
+    );
+
     // Linear demux: median of 5.
     let mut times = Vec::new();
     let mut got = 0usize;
