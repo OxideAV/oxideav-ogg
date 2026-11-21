@@ -1,8 +1,8 @@
 //! Muxer soft page-size target (`OggMuxer::set_page_target_bytes`):
 //! data packets written WITHOUT `unit_boundary` flags must still land
-//! on RFC-band pages when a target is set, the historical no-target
-//! default must be unchanged, and the resulting file must round-trip
-//! through the demuxer.
+//! on RFC-band pages when a target is set, removing both targets must
+//! give the 255-segment pagination, and the resulting file must
+//! round-trip through the demuxer.
 //!
 //! The policy matters beyond politeness: black-box testing of the
 //! staged Vorbis fixtures with an independent reference decoder
@@ -86,6 +86,9 @@ fn mux_without_boundaries(target: Option<usize>) -> Vec<u8> {
     let out: Box<dyn WriteSeek> = Box::new(shared.clone());
     let mut mux = oxideav_ogg::mux::open_concrete(out, std::slice::from_ref(&stream)).unwrap();
     mux.set_page_target_bytes(target);
+    // Size rule only: the duration rule has its own tests
+    // (`tests/mux_policy.rs`).
+    mux.set_page_target_duration(None);
     mux.write_header().unwrap();
     for i in 1..=100i64 {
         let mut pkt = Packet::new(0, stream.time_base, vec![(i & 0x7f) as u8 & 0xFE; 600]);
@@ -142,7 +145,7 @@ fn page_target_paginates_data_written_without_unit_boundaries() {
 }
 
 #[test]
-fn no_target_keeps_the_historical_mega_page_default() {
+fn no_target_fills_pages_to_the_segment_limit() {
     let bytes = mux_without_boundaries(None);
     let pages = parse_pages(&bytes).expect("pages parse");
     // Without a target the 600-byte packets accumulate to the

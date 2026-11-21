@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `DamageKind::OversizedPacket` — a packet continued over an
   endless run of pages is dropped at the cap instead of being buffered
   without bound.
+- Muxer: `OggMuxer::set_page_target_duration`,
+  `set_keep_source_page_boundaries`, `set_interleave_buffer_bytes`,
+  `page_target_bytes`, `page_target_duration`, `bytes_written`;
+  `mux::DEFAULT_PAGE_TARGET_BYTES`, `DEFAULT_PAGE_TARGET_DURATION`,
+  `DEFAULT_INTERLEAVE_BUFFER_BYTES`. A packet without a `pts` takes its
+  position from the previous packet plus its `duration` when it has
+  one.
+- `tests/blackbox_remux.rs`: real Ogg Opus / Vorbis / FLAC from a
+  black-box encoder, remuxed three ways, accepted without warnings by
+  `oggz-validate`, `ffprobe`, `opusinfo`, `ogginfo` and decoding to the
+  original samples.
 - `examples/throughput.rs`: one-hour Vorbis-shaped and Opus-shaped mux /
   open / demux / seek measurement with heap and I/O accounting.
 - `with_*` setters on `AutoIndexConfig`, `FisHead`, `FisBone`, `SkelIndex` and `Skeleton`.
@@ -38,8 +49,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index scan, verifies the checksum of every page a probe locks onto,
   and reports no hole / framing error for the landing itself. Opus
   seeks land 80 ms (3840 samples) ahead of the target for decoder
-  convergence. One-hour file, cold seek: 62.9 → 3.4 reads (Vorbis),
-  58.4 → 3.3 reads (Opus).
+  convergence. One-hour file, cold seek: 62.9 → 3.0 reads
+  (Vorbis-shaped), 58.4 → 3.0 reads (Opus-shaped).
+- Muxer page policy: content pages now close at **4096 body bytes or
+  one second of stream time** by default (they used to fill to 255
+  segments unless the caller flagged boundaries). The size and
+  duration rules never close a page on a packet whose end position is
+  unknown, so a page's granule position is always that of its last
+  packet. Callers that relied on the old pagination can clear both
+  targets.
+- Muxer output is append-only: the write position is tracked instead
+  of queried, so plain muxing never seeks the sink; the interleaver
+  holds back at most 4 MiB of finished pages.
+- Muxer builds each page with one allocation and no per-packet lacing
+  buffer: 3.0 → 5.6 M packets/s on the one-hour Vorbis-shaped stream.
+- `build_seek_index` walks page headers inside the read window instead
+  of reading a 64 KiB chunk per page; pages noted in passing are
+  thinned past 65 536 entries per stream.
 - A malformed identification header degrades that stream's parameters
   instead of failing the whole container.
 - Page checksum: sixteen input bytes per step (sixteen compile-time

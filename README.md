@@ -182,10 +182,54 @@ and Theora+Opus A/V files (see the `remux` / `merge` examples).
 
 ### Seeking
 
-`seek_to(stream_index, pts)` performs a bounded bisection over the
-file using granule-position timestamps on Ogg pages. Vorbis, FLAC
-and Speex land on the greatest page whose granule is at or below the
-target.
+`seek_to(stream_index, pts)` positions the demuxer on the **last
+content page of the stream that ends a packet at or before the
+target**. Demuxing resumes with that page, so its packets are the
+pre-roll and the stream's next page is the one whose packets cover the
+target. The return value is the landed page's granule position.
+
+How the page is found:
+
+1. Both sides of the target are bracketed by `(offset, key)` anchors:
+   pages already seen (linear demux, earlier seeks) and the stream's
+   final granule from the end-of-input probe.
+2. A byte offset is **interpolated** between the anchors and pulled
+   back 64 KiB; the probe locks onto the next capture pattern whose
+   page **checksum verifies** (a capture pattern inside a packet body
+   never steers a seek) and walks page headers from there.
+3. If the probe overshoots, the search steps back from the upper bound
+   with a growing stride; if interpolation makes poor progress twice
+   in a row the round falls back to plain bisection, which bounds the
+   rounds by log2 of the file size.
+4. Once the interval is under 128 KiB it is walked page by page.
+
+A seek never lands on a header page (the earliest landing point is the
+stream's first content page), the landing is not reported as a hole or
+a framing error even when the page opens with the tail of a packet
+that began before it, and header packets still outstanding for the
+stream's chain link are collected before the read position moves.
+Chained files need no prior index scan: a probe that meets a page of
+another chain link knows which side the wanted stream lies on.
+`tests/seek_exact.rs` checks every landing against a plain file walk
+on single-stream, multiplexed, chained, continued-packet and
+late-starting layouts.
+
+Cost on a synthetic one-hour stream (`examples/throughput.rs`, 200
+random cold seeks, each on a freshly opened demuxer, reads counted at
+the underlying source):
+
+| per seek | before | after |
+|----------|-------:|------:|
+| Vorbis-shaped, 46 KiB pages — reads (mean / worst) | 62.9 / 132 | 4.0 / 5 |
+| Vorbis-shaped, 46 KiB pages — bytes read (mean) | 2000 KiB | 321 KiB |
+| Opus-shaped, 39 KiB pages — reads (mean / worst) | 58.4 / 132 | 3.4 / 5 |
+| Vorbis-shaped, default 4 KiB pages — reads (mean / worst) | — | 3.0 / 3 |
+| Opus-shaped, default 4 KiB pages — reads (mean / worst) | — | 3.0 / 3 |
+
+One of those reads is the 128 KiB end-of-input probe, made once per
+demuxer; a second seek on the same demuxer does not repeat it.
+
+Vorbis, FLAC and Speex compare raw granules.
 
 **Opus** is the same axis with a per-stream bias. Its `pts` is a
 *PCM sample position* (playback time), but a page's on-wire granule
@@ -201,7 +245,11 @@ told to. The same bias is folded into the duration estimate (the
 last-page granule converts to `(granule − pre-skip) / 48000` seconds),
 so an Opus stream no longer over-reports its length by the pre-skip.
 The seek's returned granule is still the landed page's *raw* on-wire
-value.
+value. An Opus seek additionally searches **80 ms (3840 samples)
+ahead of the target**: the decoder needs that much decoded-and-discarded
+audio to converge, so the landing page ends at least 80 ms before the
+requested position. (Vorbis needs one packet of overlap, which landing
+on the page before the covering one always provides.)
 
 For Theora, the page's raw granule packs `(keyframe << shift) |
 frame_offset`, so the comparison axis is the absolute frame number
@@ -214,8 +262,7 @@ one-tick-per-frame time base. A stream whose ID header does not parse
 falls back to the per-stream Skeleton 4.0 `fisbone\0` (`granuleshift`
 and `granule_rate`, per `docs/container/ogg/ogg-skeleton-4.0.md`),
 rescaling the user's `pts` into frame-rate units via
-[`TimeBase::rescale`]. Either way the bisection — both its index-floor
-lookup and its forward `find_next_page_for_serial` scan — compares
+[`TimeBase::rescale`]. Either way the search compares
 mapped frame numbers against the target, and the returned granule is
 the actual on-wire value of the landed page, so a downstream Theora
 decoder can recover the keyframe-index / offset pair as usual. A
@@ -226,20 +273,63 @@ choice is to refuse rather than silently misinterpret the raw granule
 as a target. Codecs other than the five listed above continue to
 return `Error::Unsupported`.
 
-For workloads with many seeks (scrubbing, looped playback) call
-`oxideav_ogg::demux::open_indexed` instead of `open`. It does a
-one-shot full-file page-header scan up front (header + segment table
-only — payloads are skipped via relative seek) and records every
-`(granule, page_offset)` per logical stream. Each subsequent
-`seek_to` becomes an O(log n) binary-search lookup followed by a
-single seek, instead of an O(log n) bisection that re-reads page
-clusters on every call. The index is built into the concrete
-`OggDemuxer`; the boxed `Demuxer` returned by `open_indexed`
-benefits transparently. `open_concrete` is also available for
-callers that want to call `build_seek_index` / `seek_index_len`
-explicitly. Pages with granule `-1` (RFC 3533 §6 "no packets finish
-on this page") are excluded from the index because they carry no
-seek-target information.
+For workloads with many seeks (scrubbing, looped playback)
+`oxideav_ogg::demux::open_indexed` does a one-shot whole-file page
+walk up front (headers and segment tables only are examined) and
+records every `(granule, page_offset)` per logical stream; each
+subsequent `seek_to` is then a binary search and one reposition.
+`open_concrete` is available for callers that want to call
+`build_seek_index` / `seek_index_len` explicitly. Pages with granule
+`-1` (RFC 3533 §6 "no packets finish on this page") are excluded from
+the index because they carry no seek-target information. Without the
+scan, pages noted in passing still seed later seeks; that list is
+thinned past 65 536 entries per stream so it cannot grow with an
+endless stream.
+
+### Live, unseekable and damaged inputs
+
+The demuxer reads through one fixed window over its input
+(`src/source.rs`): a page is examined whole before a byte of it is
+consumed, so **`open` and linear demuxing never seek** — lost capture,
+a failed checksum and an input ending mid-page are all resolved inside
+the window. A source whose `seek` always fails (a pipe, a socket)
+demuxes exactly like a file (`tests/live_source.rs`).
+
+- **Duration** is not probed at `open`. The first
+  `duration_micros()` call reads the last 128 KiB of the input, trusts
+  only complete pages whose checksum verifies, and caches the answer;
+  on a source that cannot seek it stays `None`.
+- **Truncated files** end as a normal EOF with one
+  `DamageKind::TruncatedTail` event.
+- **Garbage between pages** is crossed by scanning for the capture
+  pattern and accepting the first candidate whose checksum verifies
+  (RFC 3533 §3, §6 fields 1 and 7). The scan costs one checksum over
+  the bytes each candidate's own header claims, so it is linear in the
+  garbage length (1 MiB of back-to-back forged page headers is crossed
+  at one read per 64 KiB and no seek).
+- **Holes** (a jump in `page_sequence_number`, §6 field 6) drop the
+  partial packet buffered before the gap — the two halves are never
+  glued — and are reported through `hole_count()` and the damage
+  ledger.
+- **Runaway packets**: a packet continued over an endless run of pages
+  is dropped whole once it passes `set_max_packet_bytes` (default
+  64 MiB, `DEFAULT_MAX_PACKET_BYTES`), reported once as
+  `DamageKind::OversizedPacket`, and demuxing continues with the next
+  packet.
+- **Chained streams** with different parameters appear as further
+  entries of `streams()` when their BOS pages arrive; a stream whose
+  identification header is malformed, or whose codec is unknown, is
+  still listed (bare parameters, `MediaType::Unknown`) and never fails
+  the container, so the other streams stay readable.
+- **Timestamps**: the last packet finishing on a page carries the
+  page's granule position as its `pts`; `-1` pages contribute none.
+  The final page's granule is delivered untouched, which is what
+  Vorbis and Opus decoders use for end trimming, and the Opus pre-skip
+  is exposed through `opus_pre_skip()`. Per-packet positions *inside*
+  a page (and with them the start offset of a stream whose first page
+  granule is not the sum of its packet durations) need each packet's
+  duration, which only the codec knows; the container leaves those
+  `pts` values `None`.
 
 #### Preroll-aware seek
 
@@ -377,20 +467,48 @@ through mux → demux (`tests/large_packet_mux.rs`).
 
 #### Page-size policy and player interop
 
-By default pages flush only on `unit_boundary` or at the 255-segment
-limit, so a caller that never sets `unit_boundary` gets pages of up
-to ~64 kB — legal, but far above the "usually 4-8 kB" band RFC 3533
-describes. The concrete muxer (`mux::open_concrete`) and the
-buffer-level writer (`framing::PageWriter::with_page_target`) both
-take an opt-in soft target instead:
+A content page is closed after a whole packet when any of these
+holds:
 
-```text
-mux.set_page_target_bytes(Some(4096));
-```
+| rule | default | setter (concrete `OggMuxer`) |
+|------|---------|------------------------------|
+| the packet is flagged `unit_boundary` (last packet of a page in the source container) | honoured | `set_keep_source_page_boundaries(false)` to repaginate |
+| the page body reached the size target | 4096 bytes | `set_page_target_bytes(Some(n))` / `None` |
+| the page spans the duration target of stream time | 1 s | `set_page_target_duration(Some(d))` / `None` |
+| the page is full (255 segments) | always | — |
 
-flushes a stream's page as soon as a packet completes at or past the
-target (a `unit_boundary` flag still forces an immediate boundary; a
-packet that overshoots the target still lands whole).
+Smaller pages mean lower latency for a live listener and denser seek
+points; larger pages mean less framing overhead (27 bytes plus one
+lacing value per packet, per page). The defaults give about 1 %
+overhead at ordinary bitrates and never more than a second of audio
+per page at low ones (an 8 kbit/s stream would otherwise need four
+seconds to fill 4096 bytes). With both targets removed, pages fill to
+the 255-segment limit.
+
+The size and duration rules only act on a packet whose end position is
+known (it has a `pts`, or a `duration` to add to its predecessor's
+position), so a page's granule position is always that of the last
+packet finishing on it (RFC 3533 §6 field 4). A remux of packets that
+carry a position only at their source page ends therefore merges
+source pages up to the targets but never splits one.
+
+Output is append-only: the muxer tracks its own write position and
+never seeks the sink unless a Skeleton has to be backfilled at the
+trailer, so a pipe or socket works. Pages of multiplexed streams are
+released in presentation-time order; a page waits only until every
+other stream has produced a page at or past its time, and never more
+than `set_interleave_buffer_bytes` (default 4 MiB) wait at once, so a
+stream that falls silent cannot make the muxer hold the rest of the
+file. For a single stream the muxer holds the page being built plus
+one finished page (so the trailer can set EOS on a real last page):
+about 23 KiB of heap for the one-hour test stream.
+
+`tests/mux_policy.rs` covers the policy, the BOS / EOS / `continued`
+flags and the streaming behaviour; `tests/blackbox_remux.rs` remuxes
+real Ogg Opus, Ogg Vorbis and Ogg FLAC files from a black-box encoder
+three ways and requires `oggz-validate`, `ffprobe`, `opusinfo` and
+`ogginfo` to accept each result without a warning and a black-box
+decoder to produce exactly the original samples.
 
 The policy is more than politeness. Black-box decoding of the staged
 Vorbis fixtures with an independent reference decoder showed that a
@@ -399,12 +517,12 @@ all sit on a **single page** — the first audio-bearing page is also
 the EOS page — comes back short by `blocksize0 / 2` samples (128
 samples on twelve of fifteen single-stream fixtures), while the same
 packet sequence split over two or more audio pages decodes to its
-full declared final-granule length. A page target (or per-packet
-`unit_boundary` anchoring, as `oxideav-vorbis` does) makes the
+full declared final-granule length. The page targets (or per-packet
+`unit_boundary` anchoring, as `oxideav-vorbis` does) make the
 degenerate single-audio-page layout impossible for any stream longer
-than the target; only sub-target streams still need a caller-forced
+than a target; only sub-target streams still need a caller-forced
 boundary before the final packet. `tests/page_size_target.rs` pins
-the banded pagination, the unchanged no-target default, and the
+the banded pagination, the target-free pagination, and the
 unit-boundary precedence (no nil pages).
 
 ### Whole-file round-trip: write an `.ogg`, then read it back
@@ -1559,6 +1677,9 @@ the always-on gate.
 
 ### Fuzzing
 
+The harness runs daily for 30 minutes through
+`.github/workflows/fuzz.yml`.
+
 A cargo-fuzz harness under `fuzz/` (no cross-decoder oracle — the
 clean-room wall holds at the spec and our own source; the oracles are
 panic-freedom plus this crate's own round-trip invariants) hammers
@@ -1684,10 +1805,12 @@ no `docs/` fixtures or external `.ogg` files are read. Scenarios:
   streaming through `crc::compute_page_checksum` over the borrowed page
   bytes (field at offset 22..26 treated as zero per RFC 3533 §6 field 7)
   rather than cloning the page into a scratch buffer. The checksum loop
-  is a slice-by-4 advancement (four input bytes per iteration through
-  four pre-shifted tables derived from the 0x04C11DB7 generator
-  polynomial); the table derivations are pinned in unit tests against a
-  verbatim scalar oracle on lengths 0..65 535.
+  advances sixteen input bytes per step through sixteen compile-time
+  tables derived from the 0x04C11DB7 generator polynomial (table `k` is
+  the single-byte table advanced through `k` zero bytes), with a
+  four-byte step and a scalar tail for the remainder; the derivations
+  are pinned in unit tests against a verbatim scalar oracle on lengths
+  0..65 535.
 - `page/lace/{short,exact_255,large}` — the segment-table builder,
   with the exact-multiple-of-255 zero-terminator branch covered.
 - `demux/walk/vorbis_12pkt` — open + drain a 12-packet synthetic
@@ -1695,9 +1818,42 @@ no `docs/` fixtures or external `.ogg` files are read. Scenarios:
 - `demux/build_index/vorbis_12pkt` — the page-header-only scan
   that powers O(log n) `seek_to`.
 
-Run with `cargo bench -p oxideav-ogg --bench framing`. Like the
-cargo-fuzz harness, this is an offline tool — the per-PR CI shim
-does not invoke `cargo bench`.
+Run with `cargo bench -p oxideav-ogg --bench framing`. This is an
+offline tool — the per-PR CI shim does not invoke `cargo bench`.
+
+#### One-hour throughput
+
+`cargo run --release --example throughput` synthesises a one-hour
+Vorbis-shaped stream (44.1 kHz, short / long block advances,
+174 103 packets, 60 MiB) and a one-hour Opus-shaped stream (48 kHz,
+20 ms packets, 180 000 packets, 28 MiB) in memory and measures the
+muxer and demuxer with a counting allocator and a counting reader.
+Medians of five runs (nine for `open`) on an Apple-silicon machine
+shared with other builds; "before" is the previous release's code on
+the same harness.
+
+| | Vorbis-shaped before | after | Opus-shaped before | after |
+|---|---:|---:|---:|---:|
+| mux, packets/s | 3.00 M | 5.57 M | 6.13 M | 10.7 M |
+| mux, heap beyond the output | 200 KiB | 23 KiB | 162 KiB | 15 KiB |
+| `open`, time | 24.4 µs | 5.9 µs | 12.0 µs | 2.2 µs |
+| `open`, I/O | 10 reads, 3 seeks | 1 read, 0 seeks | 7 reads, 3 seeks | 1 read, 0 seeks |
+| linear demux, packets/s | 3.07 M | 5.22 M | 6.24 M | 9.67 M |
+| linear demux, MiB/s | 1052 | 1798 | 956 | 1490 |
+| linear demux, I/O | 3860 reads, 3 seeks | 961 reads, 0 seeks | 2126 reads, 3 seeks | 445 reads, 0 seeks |
+| linear demux, peak heap | 218 KiB | 409 KiB | 167 KiB | 272 KiB |
+| cold seek, reads (mean) | 62.9 | 3.0 | 58.4 | 3.0 |
+
+The "after" columns use the muxer's new default pagination (4 KiB /
+1 s pages, 14 478 and 6 878 pages) where "before" wrote 255-packet
+pages of about 46 KiB (1 286 and 708 pages); the demuxer gain measured
+on identical 46 KiB-page files is the same within noise (1052 → 1785
+MiB/s). Linear demux is bounded by the page checksum; the remaining
+per-packet cost is the one allocation that becomes the packet's
+buffer. The demuxer's peak heap is higher than before: it now holds a
+128 KiB read window (which is what removes the seeks, the per-page
+scratch buffers and three quarters of the reads) and notes one seek
+anchor per page read, capped at 1 MiB per stream.
 
 ## License
 

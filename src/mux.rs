@@ -303,6 +303,10 @@ fn open_concrete_inner(
             });
         }
     }
+    let mut output = output;
+    // A position query, not a move; a sink that cannot answer is taken
+    // to start at 0.
+    let base = output.stream_position().unwrap_or(0);
     Ok(OggMuxer {
         output,
         streams: streams.to_vec(),
@@ -315,7 +319,13 @@ fn open_concrete_inner(
         used_serials,
         link_index: 0,
         content_started: false,
-        page_target: None,
+        page_target: Some(DEFAULT_PAGE_TARGET_BYTES),
+        page_duration: Some(DEFAULT_PAGE_TARGET_DURATION.as_secs_f64()),
+        keep_source_boundaries: true,
+        interleave_cap: DEFAULT_INTERLEAVE_BUFFER_BYTES,
+        queued_bytes: 0,
+        base,
+        written: 0,
     })
 }
 
@@ -404,6 +414,7 @@ fn build_link_writers(
                 queue: std::collections::VecDeque::new(),
                 newest_time: 0.0,
                 last_granule: 0,
+                running_granule: None,
                 time_base: s.time_base,
                 theora,
             },
@@ -487,7 +498,48 @@ pub struct OggMuxer {
     /// the historical behaviour: pages flush only on `unit_boundary`
     /// or at the 255-segment limit.
     page_target: Option<usize>,
+    /// Soft page-duration target in seconds of stream time (see
+    /// [`OggMuxer::set_page_target_duration`]).
+    page_duration: Option<f64>,
+    /// Whether a packet's `unit_boundary` flag closes the page (see
+    /// [`OggMuxer::set_keep_source_page_boundaries`]).
+    keep_source_boundaries: bool,
+    /// Most bytes of finalized pages the interleaver may hold back
+    /// waiting for another stream to catch up (see
+    /// [`OggMuxer::set_interleave_buffer_bytes`]).
+    interleave_cap: usize,
+    /// Bytes of finalized pages currently held in the per-stream queues.
+    queued_bytes: usize,
+    /// Absolute position of the sink when the muxer was opened; only
+    /// used to address the in-place Skeleton backfills.
+    base: u64,
+    /// Bytes appended to the sink so far. Tracked here so that plain
+    /// muxing never asks the sink for its position or seeks it — an
+    /// append-only sink (a pipe, a socket) works.
+    written: u64,
 }
+
+/// Default soft page-size target for content pages, in body bytes: the
+/// low end of the "usually 4-8 kB" band RFC 3533 describes. Framing
+/// overhead at this size is about 1 %.
+pub const DEFAULT_PAGE_TARGET_BYTES: usize = 4096;
+
+/// Default soft page-duration target: a content page is closed once it
+/// spans one second of stream time, which bounds both the latency a
+/// live listener sees and the distance between seek points on
+/// low-bitrate streams that would take many seconds to fill a page.
+pub const DEFAULT_PAGE_TARGET_DURATION: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Tolerance, in seconds, when comparing a page's time span with the
+/// duration target: spans are differences of binary fractions, and a
+/// page exactly on target must not be extended by one more packet
+/// because of a rounding residue. A nanosecond is far below one sample
+/// of any audio rate.
+const PAGE_SPAN_SLACK: f64 = 1e-9;
+
+/// Default bound on finalized pages held back for cross-stream time
+/// ordering: 4 MiB.
+pub const DEFAULT_INTERLEAVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Keyframe-index collector for one content stream — the WRITE-side
 /// counterpart of the demuxer's Skeleton 4.0 `index\0` fast-path seek.
@@ -632,6 +684,10 @@ struct StreamWriter {
     /// 'nil' pages ... simply a page header with position information
     /// and the eos flag set").
     last_granule: i64,
+    /// End position (granule) of the packet most recently appended, when
+    /// it is known: taken from the packet's `pts`, or from the previous
+    /// packet's position plus this packet's `duration`.
+    running_granule: Option<i64>,
     /// The stream's declared time base — converts a granule into the
     /// release-order presentation time for non-Theora streams.
     time_base: oxideav_core::TimeBase,
@@ -727,6 +783,13 @@ impl PageBuilder {
 }
 
 impl OggMuxer {
+    /// Append bytes to the sink.
+    fn emit(&mut self, bytes: &[u8]) -> Result<()> {
+        self.output.write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
     fn writer_for(&mut self, stream_index: u32) -> Result<&mut StreamWriter> {
         self.per_stream
             .get_mut(&stream_index)
@@ -798,8 +861,7 @@ impl OggMuxer {
         };
         sk.seq_no = sk.seq_no.wrapping_add(1);
         let bytes = page.to_bytes();
-        self.output.write_all(&bytes)?;
-        Ok(())
+        self.emit(&bytes)
     }
 
     /// Emit the Skeleton fishead BOS page. Must run before any content
@@ -863,7 +925,7 @@ impl OggMuxer {
                 data.resize(state.reserved_packet_len, 0);
                 data
             };
-            let offset = self.output.stream_position()?;
+            let offset = self.written;
             let seq_no = self
                 .skeleton
                 .as_ref()
@@ -900,7 +962,7 @@ impl OggMuxer {
             Some(sk) => sk.serial,
             None => return Ok(()),
         };
-        let end_pos = self.output.stream_position()?;
+        let end_pos = self.base + self.written;
         for i in 0..self.auto_index.len() {
             let (page_off, seq_no, data) = {
                 let state = &self.auto_index[i];
@@ -928,7 +990,7 @@ impl OggMuxer {
                 data,
             };
             let bytes = page.to_bytes();
-            self.output.seek(SeekFrom::Start(page_off))?;
+            self.output.seek(SeekFrom::Start(self.base + page_off))?;
             self.output.write_all(&bytes)?;
         }
         self.output.seek(SeekFrom::Start(end_pos))?;
@@ -954,30 +1016,36 @@ impl OggMuxer {
             page_flags |= flags::FIRST_PAGE;
             writer.bos_emitted = true;
         }
-        let page = Page {
-            flags: page_flags,
-            granule_position: writer.buffered.granule_position,
-            serial: writer.serial,
-            seq_no: writer.seq_no,
-            lacing: std::mem::take(&mut writer.buffered.lacing),
-            data: std::mem::take(&mut writer.buffered.data),
-        };
+        let granule = writer.buffered.granule_position;
+        // Serialize straight out of the builder (one allocation per
+        // page, the builder keeps its capacity for the next one).
+        let bytes = serialize_page(
+            page_flags,
+            granule,
+            writer.serial,
+            writer.seq_no,
+            &writer.buffered.lacing,
+            &writer.buffered.data,
+        );
         writer.seq_no = writer.seq_no.wrapping_add(1);
-        writer.buffered.starts_continued = page.lacing.last().copied() == Some(255);
+        writer.buffered.starts_continued = writer.buffered.lacing.last().copied() == Some(255);
+        writer.buffered.lacing.clear();
+        writer.buffered.data.clear();
         writer.buffered.granule_position = -1;
         let first_keyframe_pts = writer.buffered.first_keyframe_pts.take();
 
         // Presentation-time equivalent of the page's granule, clamped
         // monotone: a `-1` "no packet finishes here" page inherits the
         // previous page's time (it must stay glued behind it anyway).
-        let time_secs = writer.page_time(page.granule_position);
+        let time_secs = writer.page_time(granule);
         writer.newest_time = writer.newest_time.max(time_secs);
-        if page.granule_position >= 0 {
-            writer.last_granule = page.granule_position;
+        if granule >= 0 {
+            writer.last_granule = granule;
         }
         let time_secs = writer.newest_time;
+        self.queued_bytes += bytes.len();
         writer.queue.push_back(PendingPage {
-            bytes: page.to_bytes(),
+            bytes,
             first_keyframe_pts,
             time_secs,
         });
@@ -1021,16 +1089,20 @@ impl OggMuxer {
             let Some((idx, t)) = best else {
                 return Ok(());
             };
-            let settled = self.stream_order.iter().all(|&o| {
-                if o == idx {
-                    return true;
-                }
-                let w = &self.per_stream[&o];
-                // A stream that has not begun (no BOS yet) cannot hold
-                // pages and is not consulted; a started stream vouches
-                // for `t` once its newest finalized page reaches it.
-                !w.bos_emitted || w.newest_time >= t
-            });
+            // Past the interleave bound the earliest candidate goes out
+            // regardless: a stream that has fallen silent must not make
+            // the muxer buffer the rest of the file.
+            let settled = self.queued_bytes > self.interleave_cap
+                || self.stream_order.iter().all(|&o| {
+                    if o == idx {
+                        return true;
+                    }
+                    let w = &self.per_stream[&o];
+                    // A stream that has not begun (no BOS yet) cannot hold
+                    // pages and is not consulted; a started stream vouches
+                    // for `t` once its newest finalized page reaches it.
+                    !w.bos_emitted || w.newest_time >= t
+                });
             if !settled {
                 return Ok(());
             }
@@ -1080,8 +1152,9 @@ impl OggMuxer {
     /// offset as a Skeleton 4.0 keypoint candidate when the page starts
     /// a keyframe-flagged packet and the stream is being auto-indexed.
     fn write_pending_page(&mut self, stream_index: u32, pending: PendingPage) -> Result<()> {
-        let offset = self.output.stream_position()?;
-        self.output.write_all(&pending.bytes)?;
+        let offset = self.written;
+        self.queued_bytes -= pending.bytes.len();
+        self.emit(&pending.bytes)?;
         if let Some(pts) = pending.first_keyframe_pts
             && let Some(state) = self
                 .auto_index
@@ -1142,10 +1215,10 @@ impl OggMuxer {
             }
             (sk.serial, head.clone(), sk.content_byte_offset_measured)
         };
-        let end_pos = self.output.stream_position()?;
+        let end_pos = self.base + self.written;
         let mut changed = false;
-        if head.segment_length.unwrap_or(0) == 0 && end_pos != 0 {
-            head.segment_length = Some(end_pos);
+        if head.segment_length.unwrap_or(0) == 0 && self.written != 0 {
+            head.segment_length = Some(self.written);
             changed = true;
         }
         if head.content_byte_offset.unwrap_or(0) == 0
@@ -1170,7 +1243,7 @@ impl OggMuxer {
         // The fishead BOS is always the very first page of the physical
         // stream (it is the first thing write_header emits when a
         // Skeleton is attached), so the patch target offset is 0.
-        self.output.seek(SeekFrom::Start(0))?;
+        self.output.seek(SeekFrom::Start(self.base))?;
         self.output.write_all(&bytes)?;
         self.output.seek(SeekFrom::Start(end_pos))?;
         if let Some(sk) = self.skeleton.as_mut() {
@@ -1231,7 +1304,7 @@ impl Muxer for OggMuxer {
             writer.bos_emitted = true;
             writer.headers_remaining -= 1;
             let bytes = page.to_bytes();
-            self.output.write_all(&bytes)?;
+            self.emit(&bytes)?;
         }
         // Step 2: remaining content-codec header packets — normal
         // write_packet flow.
@@ -1267,7 +1340,7 @@ impl Muxer for OggMuxer {
             // the current position is the offset of the first non-header
             // page — the 4.0 fishead's *Content byte offset* value,
             // backfilled at trailer time.
-            let pos = self.output.stream_position()?;
+            let pos = self.written;
             self.skeleton
                 .as_mut()
                 .expect("skeleton writer present")
@@ -1281,14 +1354,15 @@ impl Muxer for OggMuxer {
             return Err(Error::other("Ogg muxer: write_header not called"));
         }
         let stream_index = packet.stream_index;
-        let lacing_for_packet = lace(packet.data.len());
+        // Lacing values this packet needs: one 255 per full 255 bytes,
+        // then the remainder (0 for an exact multiple) as terminator.
+        let segments = packet.data.len() / 255 + 1;
 
         let (is_header, needs_boundary_flush) = {
             let writer = self.writer_for(stream_index)?;
             (
                 writer.headers_remaining > 0,
-                writer.buffered.lacing.len() + lacing_for_packet.len() > 255
-                    && !writer.buffered.is_empty(),
+                writer.buffered.lacing.len() + segments > 255 && !writer.buffered.is_empty(),
             )
         };
 
@@ -1310,11 +1384,14 @@ impl Muxer for OggMuxer {
             self.flush_page(stream_index, false)?;
         }
 
-        if lacing_for_packet.len() > 255 {
+        if segments > 255 {
+            let lacing_for_packet = lace(packet.data.len());
             self.append_packet_spanning(stream_index, &lacing_for_packet, &packet.data)?;
         } else {
             let writer = self.writer_for(stream_index)?;
-            writer.buffered.lacing.extend_from_slice(&lacing_for_packet);
+            let lacing = &mut writer.buffered.lacing;
+            lacing.resize(lacing.len() + segments - 1, 255);
+            lacing.push((packet.data.len() % 255) as u8);
             writer.buffered.data.extend_from_slice(&packet.data);
         }
 
@@ -1353,11 +1430,25 @@ impl Muxer for OggMuxer {
             let granule = th.gran.pack(frame, th.last_kf)?;
             th.next_frame = frame + 1;
             writer.buffered.granule_position = granule;
+            writer.running_granule = Some(granule);
             Some(frame)
         } else if let Some(pts) = packet.pts {
             writer.buffered.granule_position = pts;
+            writer.running_granule = Some(pts);
             Some(pts)
+        } else if let (Some(prev), Some(duration)) = (writer.running_granule, packet.duration) {
+            // No end position of its own, but a duration to add to the
+            // previous packet's.
+            let granule = prev.saturating_add(duration);
+            writer.buffered.granule_position = granule;
+            writer.running_granule = Some(granule);
+            Some(granule)
         } else {
+            // The end position of this packet is unknown; the page must
+            // not be closed on it by choice (see the boundary policy
+            // below), because the granule position it would carry
+            // belongs to an earlier packet.
+            writer.running_granule = None;
             None
         };
         if let Some(pts) = effective_pts {
@@ -1387,21 +1478,34 @@ impl Muxer for OggMuxer {
         // real content preceding the next BOS.
         self.content_started = true;
 
-        if packet.flags.unit_boundary {
-            self.flush_page(stream_index, true)?;
-        } else if let Some(target) = self.page_target {
-            // Soft page-size policy (see set_page_target_bytes): flush
-            // once the buffered body reaches the target. Skipped when
-            // the caller already forced a boundary above — the builder
-            // is empty then, and a second forced flush would emit a
-            // spurious nil page.
-            let needs_flush = {
-                let writer = self.writer_for(stream_index)?;
-                writer.buffered.data.len() >= target
+        // Page boundary policy (see `set_page_target_bytes`,
+        // `set_page_target_duration`, `set_keep_source_page_boundaries`):
+        // close the page when the source container did, or once the
+        // page is large enough, or once it spans enough stream time —
+        // whichever comes first. The size and duration rules only act
+        // on a packet whose end position is known, so the page's granule
+        // position is always that of the last packet finishing on it
+        // (RFC 3533 §6 field 4); a remux of packets that carry a position
+        // only at their source page ends therefore merges source pages
+        // up to the targets but never splits one.
+        let close_page = {
+            let (page_target, page_duration) = (self.page_target, self.page_duration);
+            let keep = self.keep_source_boundaries;
+            let writer = self.writer_for(stream_index)?;
+            let end_known = writer.running_granule.is_some();
+            let granule = writer.buffered.granule_position;
+            let spanned = if end_known && granule >= 0 {
+                writer.page_time(granule) - writer.newest_time
+            } else {
+                0.0
             };
-            if needs_flush {
-                self.flush_page(stream_index, false)?;
-            }
+            (packet.flags.unit_boundary && keep)
+                || end_known
+                    && (page_target.is_some_and(|target| writer.buffered.data.len() >= target)
+                        || page_duration.is_some_and(|secs| spanned + PAGE_SPAN_SLACK >= secs))
+        };
+        if close_page {
+            self.flush_page(stream_index, false)?;
         }
 
         Ok(())
@@ -1471,8 +1575,11 @@ impl OggMuxer {
                 };
                 writer.seq_no = writer.seq_no.wrapping_add(1);
                 let time_secs = writer.newest_time;
+                let bytes = page.to_bytes();
+                self.queued_bytes += bytes.len();
+                let writer = self.writer_for(idx)?;
                 writer.queue.push_back(PendingPage {
-                    bytes: page.to_bytes(),
+                    bytes,
                     first_keyframe_pts: None,
                     time_secs,
                 });
@@ -1585,7 +1692,7 @@ impl OggMuxer {
             writer.bos_emitted = true;
             writer.headers_remaining -= 1;
             let bytes = page.to_bytes();
-            self.output.write_all(&bytes)?;
+            self.emit(&bytes)?;
         }
         // Remaining content-codec header packets — normal write_packet flow.
         for (idx, tb, packets) in &header_queues {
@@ -1623,10 +1730,12 @@ impl OggMuxer {
     /// is a good general-purpose value. A `unit_boundary` flag still
     /// forces an immediate boundary regardless of the target.
     ///
-    /// `None` (the default) preserves the historical pagination: pages
-    /// flush only on `unit_boundary` or at the 255-segment limit —
-    /// which for a short stream can put *every* audio packet on a
-    /// single page. Beyond RFC politeness, avoiding that layout
+    /// The default is [`DEFAULT_PAGE_TARGET_BYTES`]. `None` removes
+    /// the size bound; with the duration bound removed as well
+    /// ([`OggMuxer::set_page_target_duration`]) pages flush only on
+    /// `unit_boundary` or at the 255-segment limit — which for a short
+    /// stream can put *every* audio packet on a single page. Beyond
+    /// RFC politeness, avoiding that layout
     /// measurably improves player interop: black-box testing against
     /// an independent reference decoder showed an Ogg/Vorbis stream
     /// whose first audio-bearing
@@ -1637,10 +1746,89 @@ impl OggMuxer {
     ///
     /// Only reachable on the concrete [`OggMuxer`] (via
     /// [`open_concrete`]); the boxed [`oxideav_core::Muxer`] from
-    /// [`open`] keeps the default.
+    /// [`open`] keeps the defaults.
     pub fn set_page_target_bytes(&mut self, target: Option<usize>) {
         self.page_target = target;
     }
+
+    /// Set (or clear) the soft page-duration target for content pages:
+    /// a stream's page is closed as soon as the packets on it span this
+    /// much stream time (measured from the end of the stream's previous
+    /// page to the granule position of the newest packet). Shorter
+    /// pages mean lower latency for a live listener and denser seek
+    /// points, at the price of more framing overhead (27 bytes plus one
+    /// lacing value per packet, per page); longer pages the reverse.
+    ///
+    /// The default is [`DEFAULT_PAGE_TARGET_DURATION`] (one second).
+    /// `None` removes the time bound. Packets that carry no `pts` do
+    /// not advance the page's time span.
+    pub fn set_page_target_duration(&mut self, target: Option<std::time::Duration>) {
+        self.page_duration = target.map(|d| d.as_secs_f64());
+    }
+
+    /// The current soft page-size target in body bytes, if any.
+    pub fn page_target_bytes(&self) -> Option<usize> {
+        self.page_target
+    }
+
+    /// The current soft page-duration target, if any.
+    pub fn page_target_duration(&self) -> Option<std::time::Duration> {
+        self.page_duration.map(std::time::Duration::from_secs_f64)
+    }
+
+    /// Whether a packet flagged `unit_boundary` closes its page
+    /// (default `true`). The flag marks the last packet of a framing
+    /// unit in the source container, so honouring it reproduces the
+    /// source's page layout on a remux. Turn it off to repaginate
+    /// purely by the size and duration targets — for instance when the
+    /// source flags every packet and one page per packet is not wanted.
+    pub fn set_keep_source_page_boundaries(&mut self, keep: bool) {
+        self.keep_source_boundaries = keep;
+    }
+
+    /// Bound, in bytes, on finalized pages held back so that pages of
+    /// different streams reach the output in presentation-time order
+    /// (default [`DEFAULT_INTERLEAVE_BUFFER_BYTES`]). A page waits only
+    /// until every other stream has produced a page at or past its
+    /// time; once more than this many bytes are waiting — one stream
+    /// has stopped producing — the earliest pages are written anyway,
+    /// so memory stays bounded however lopsided the input.
+    pub fn set_interleave_buffer_bytes(&mut self, bytes: usize) {
+        self.interleave_cap = bytes;
+    }
+
+    /// Bytes appended to the output so far.
+    pub fn bytes_written(&self) -> u64 {
+        self.written
+    }
+}
+
+/// Serialize one page: 27-byte header, segment table, body, with the
+/// checksum computed over the whole (RFC 3533 §6). `lacing` holds at
+/// most 255 values and sums to `data.len()` by construction.
+fn serialize_page(
+    page_flags: u8,
+    granule: i64,
+    serial: u32,
+    seq_no: u32,
+    lacing: &[u8],
+    data: &[u8],
+) -> Vec<u8> {
+    debug_assert!(lacing.len() <= 255);
+    let mut buf = Vec::with_capacity(27 + lacing.len() + data.len());
+    buf.extend_from_slice(&page::CAPTURE_PATTERN);
+    buf.push(0);
+    buf.push(page_flags);
+    buf.extend_from_slice(&granule.to_le_bytes());
+    buf.extend_from_slice(&serial.to_le_bytes());
+    buf.extend_from_slice(&seq_no.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 4]);
+    buf.push(lacing.len() as u8);
+    buf.extend_from_slice(lacing);
+    buf.extend_from_slice(data);
+    let crc = crate::crc::checksum(&buf);
+    buf[22..26].copy_from_slice(&crc.to_le_bytes());
+    buf
 }
 
 // Keep imports honest for downstream consumers.
