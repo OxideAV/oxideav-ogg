@@ -3499,7 +3499,7 @@ impl OggDemuxer {
         // `pending_valid` tracks whether the bytes accumulating in `pending`
         // form the contiguous tail of a real packet (vs. an orphaned
         // continuation fragment whose head was lost to a hole).
-        let mut completed: Vec<(Vec<u8>, bool)> = Vec::new();
+        let mut completed: Vec<Vec<u8>> = Vec::with_capacity(segs.len());
         for (i, seg) in segs.iter().enumerate() {
             let payload = &page.data[seg.data.clone()];
             if i == 0 && was_continued {
@@ -3548,8 +3548,13 @@ impl OggDemuxer {
             }
             if seg.terminated {
                 stream.discarding = false;
-                let valid = stream.pending_valid;
-                completed.push((std::mem::take(&mut stream.pending), valid));
+                // A packet assembled from an orphaned continuation
+                // fragment (head lost to a hole) is garbage: drop it.
+                if stream.pending_valid {
+                    completed.push(std::mem::take(&mut stream.pending));
+                } else {
+                    stream.pending.clear();
+                }
                 // The next packet (if any) on this page starts fresh.
                 stream.pending_valid = false;
             }
@@ -3561,13 +3566,6 @@ impl OggDemuxer {
         // continuation fragment was cleared above, leaving `pending` empty
         // and `pending_valid` false, so its missing-head tail is never
         // mistaken for a resumable packet.
-        // Drop completed packets that were assembled from orphaned
-        // continuation fragments (head lost to a hole) — they're garbage.
-        let completed: Vec<Vec<u8>> = completed
-            .into_iter()
-            .filter_map(|(data, valid)| if valid { Some(data) } else { None })
-            .collect();
-
         let last_idx = completed.len().checked_sub(1);
         let mut headers_just_completed = false;
         // Theora per-packet frame indexing, for streams whose ID header
